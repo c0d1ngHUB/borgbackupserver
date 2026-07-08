@@ -53,7 +53,10 @@ class UpdateService
 
     public function isUpdateAvailable(): bool
     {
-        $this->checkIfStale();
+        // Homelab/LAN pilot patch: do not perform outbound GitHub checks during
+        // normal page rendering. In this environment unreachable GitHub/DNS can
+        // block every authenticated admin route for ~20 seconds. Manual update
+        // checks still use checkForUpdate() from Settings/Upgrade.
         $latest = $this->getSetting('latest_version', '');
         if (empty($latest)) return false;
         return version_compare($latest, $this->getCurrentVersion(), '>');
@@ -80,7 +83,7 @@ class UpdateService
             'http' => [
                 'method' => 'GET',
                 'header' => "User-Agent: BorgBackupServer/" . $this->getCurrentVersion() . "\r\n",
-                'timeout' => 10,
+                'timeout' => 2,
             ],
         ]);
 
@@ -88,6 +91,10 @@ class UpdateService
         $json = @file_get_contents($url, false, $ctx);
 
         if ($json === false) {
+            // Avoid making every authenticated admin page block on GitHub when
+            // outbound DNS/HTTPS is unavailable. Retry on the next normal
+            // stale interval instead of on every request.
+            $this->setSetting('last_update_check', date('Y-m-d H:i:s'));
             return ['error' => 'Could not reach GitHub API'];
         }
 
