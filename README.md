@@ -5,14 +5,14 @@
 
 A self-hosted web application for centrally managing [BorgBackup](https://borgbackup.readthedocs.io/) across multiple endpoints (Linux, Mac and Windows). A lightweight agent polls the server for tasks over HTTPS, backs up over SSH to the server, and reports progress back. No inbound connections to endpoints from the server — this works behind firewalls and NAT from where the server is providing easy provisioning. Includes a setup wizard for simple installation or a Docker image to start up in 30 seconds.
 
-**View Demo **
+**View Demo**
 The developer has made a system for provisioning Demos at no cost here: [Borg Backup Server](https://www.borgbackupserver.com/)
 
 ## Features
 
 - **Agent-based architecture** — endpoints check-in with the server for tasks, the server doesn't need ssh access to the agent
 - **SSH with append-only security** — agents can only backup or restore, can't delete or prune
-- **FULL Encryption** - Software keeps everything encrypted at rest for enhanced security
+- **Encrypted Borg repositories** — backup encryption is configured per repository; protect databases, metadata, and host storage separately
 - **Setup wizard** — browser-based installer configures database, admin account, and storage quicky
 - **Real-time progress** — live progress bars during backups with detailed logging
 - **File-level restore** — catalog data is saved in ClickHouse DB for fast search and file-tree without having to lock the borg repo
@@ -53,6 +53,16 @@ See the **[full documentation on the Wiki](https://github.com/marcpope/borgbacku
 
 ## Docker
 
+This fork ships the upstream deployment recipe. The default Compose service pulls
+`marcpope/borgbackupserver:latest`; it does not build code from this checkout.
+For a clone, copy [`.env.example`](.env.example) to `.env`, set `APP_URL` to the
+address reachable by agents, and run `docker compose config --quiet` before
+starting. Optional UID/GID and `ADMIN_PASS` entries also need their matching
+`environment` lines enabled in [`docker-compose.yml`](docker-compose.yml).
+Compose's `.env` is separate from the application's
+[`config/.env.example`](config/.env.example).
+
+
 Pre-built images are published to [Docker Hub](https://hub.docker.com/r/marcpope/borgbackupserver) on every release:
 
 ```bash
@@ -74,7 +84,7 @@ Open `http://localhost:8080` and log in. See the **[Docker Installation guide](h
 
 ## Documentation
 
-All documentation lives on the **[GitHub Wiki](https://github.com/marcpope/borgbackupserver/wiki)**:
+User guides live on the **[GitHub Wiki](https://github.com/marcpope/borgbackupserver/wiki)**:
 
 - [System Requirements](https://github.com/marcpope/borgbackupserver/wiki/System-Requirements)
 - [Installation](https://github.com/marcpope/borgbackupserver/wiki/Installation)
@@ -87,7 +97,7 @@ All documentation lives on the **[GitHub Wiki](https://github.com/marcpope/borgb
 - [Settings](https://github.com/marcpope/borgbackupserver/wiki/Settings)
 - [CLI Reference](https://github.com/marcpope/borgbackupserver/wiki/CLI-Reference)
 - [Troubleshooting](https://github.com/marcpope/borgbackupserver/wiki/Troubleshooting)
-- [Contributing](docs/CONTRIBUTING.md)
+- [Contributing](CONTRIBUTING.md)
 
 ---
 
