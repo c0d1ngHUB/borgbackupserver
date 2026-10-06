@@ -1,0 +1,37 @@
+name: Dependency security
+
+on:
+  pull_request:
+    paths:
+      - 'composer.json'
+      - 'composer.lock'
+      - 'tests/commonmark-*'
+      - '.github/workflows/dependency-security.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'composer.json'
+      - 'composer.lock'
+      - 'tests/commonmark-*'
+      - '.github/workflows/dependency-security.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  commonmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: curl, mbstring
+          tools: composer:v2
+          coverage: none
+      - run: composer validate --strict --no-check-publish
+      - run: composer install --no-interaction --no-scripts --no-plugins --prefer-dist --no-dev
+      - run: composer check-platform-reqs
+      - run: composer audit --locked --no-dev
+      - run: php -d memory_limit=512M tests/commonmark-security.php

@@ -1,0 +1,11 @@
+{
+  "code-block": "<pre><code class=\"language-sh\">composer install --no-dev\n</code></pre>\n",
+  "empty": "",
+  "escaped-table-pipe": "<table>\n<thead>\n<tr>\n<th>Inhalt</th>\n<th>Status</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>a|b</td>\n<td>ok</td>\n</tr>\n</tbody>\n</table>\n",
+  "headings": "<h1>Release</h1>\n<h2>Änderungen</h2>\n<p><strong>Sicher</strong> und <em>schnell</em>.</p>\n",
+  "links": "<p><a href=\"https://example.invalid/releases\">Release</a> und <code>code</code>.</p>\n",
+  "lists": "<ul>\n<li>Fix A</li>\n<li>Fix B</li>\n</ul>\n<ol>\n<li>Install</li>\n<li>Verify</li>\n</ol>\n",
+  "table": "<table>\n<thead>\n<tr>\n<th>Paket</th>\n<th>Version</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>CommonMark</td>\n<td>2.10.2</td>\n</tr>\n</tbody>\n</table>\n",
+  "task-list": "<ul>\n<li><input checked=\"\" disabled=\"\" type=\"checkbox\"> Geprüft</li>\n<li><input disabled=\"\" type=\"checkbox\"> Offen</li>\n</ul>\n",
+  "unicode-table": "<table>\n<thead>\n<tr>\n<th>Änderung</th>\n<th>Status</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>Größe</td>\n<td>grün</td>\n</tr>\n</tbody>\n</table>\n"
+}
