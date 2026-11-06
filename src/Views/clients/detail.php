@@ -1,23 +1,18 @@
 <?php
 $tab = $_GET['tab'] ?? 'status';
+// The tab shown as "Plans" is ?tab=schedules; accept ?tab=plans too, and
+// fall back to Status for anything unknown rather than an empty pane.
+if ($tab === 'plans') $tab = 'schedules';
+if (!in_array($tab, ['status', 'plugins', 'repos', 'schedules', 'restore', 'install', 'delete'], true)) $tab = 'status';
 
-// Detect server's agent version from the bundled bbs-agent.py
-$serverAgentVersion = null;
-$agentFile = dirname(__DIR__, 3) . '/agent/bbs-agent.py';
-if (file_exists($agentFile)) {
-    $handle = fopen($agentFile, 'r');
-    if ($handle) {
-        // Only read first 50 lines to find AGENT_VERSION
-        for ($i = 0; $i < 50 && ($line = fgets($handle)) !== false; $i++) {
-            if (preg_match('/^AGENT_VERSION\s*=\s*["\']([^"\']+)["\']/m', $line, $m)) {
-                $serverAgentVersion = $m[1];
-                break;
-            }
-        }
-        fclose($handle);
-    }
-}
-$agentNeedsUpdate = $serverAgentVersion && $agent['agent_version'] && $agent['agent_version'] !== $serverAgentVersion;
+// The agent version bundled with this server, and whether THIS agent is behind
+// it. Only a strictly older agent is offered an update: a newer one (a
+// container image ahead of the server's) would otherwise be walked backwards
+// by an "upgrade" (#387). Agents that manage their own updates never are.
+$updSvc = new \BBS\Services\UpdateService();
+$serverAgentVersion = $updSvc->getBundledAgentVersion();
+$agentNeedsUpdate = !empty($agent['auto_update_enabled'])
+    && $updSvc->isAgentOutdated($agent['agent_version'] ?? null, $serverAgentVersion);
 ?>
 
 <!-- Client Header -->
@@ -38,11 +33,27 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                         <i class="bi bi-display me-2 text-primary"></i><?= htmlspecialchars($agent['name']) ?>
                     </h3>
                     <span class="badge bg-<?= $statusClass ?>" id="agent-status-badge"><?= ucfirst($agent['status']) ?></span>
+                    <?php if (!empty($profileDefaults['profile_name'])): ?>
+                        <span class="badge bg-body-secondary text-body border fw-normal"
+                              title="Client profile — sets how patient BBS is when this client drops out mid-backup, and what a new backup plan starts from. Change it under Edit Client.">
+                            <i class="bi bi-diagram-3 me-1"></i><?= htmlspecialchars($profileDefaults['profile_name']) ?>
+                        </span>
+                    <?php endif; ?>
                     <button class="btn btn-sm btn-outline-secondary border-0" data-bs-toggle="modal" data-bs-target="#editClientModal" title="Edit client">
                         <i class="bi bi-pencil"></i>
                     </button>
+                    <button class="btn btn-sm btn-outline-secondary border-0" onclick="openNotes('client', <?= $agent['id'] ?>, <?= htmlspecialchars(json_encode($agent['name'])) ?>, this)"
+                            data-notes="<?= htmlspecialchars($agent['notes'] ?? '') ?>" data-notes-meta="<?= !empty($agent['notes_updated_at']) ? htmlspecialchars(\BBS\Core\TimeHelper::format($agent['notes_updated_at'], 'M j, g:i A') . (!empty($usersById[$agent['notes_updated_by']] ?? null) ? ' by ' . $usersById[$agent['notes_updated_by']] : '')) : '' ?>" title="<?= !empty($agent['notes']) ? 'View notes' : 'Add a note' ?>">
+                        <i class="bi bi-journal-text<?= !empty($agent['notes']) ? ' text-warning' : '' ?>"></i>
+                    </button>
                 </div>
                 <div class="text-muted d-flex flex-wrap gap-3 align-items-center" style="font-size:.8rem;">
+                    <?php if (!empty($agent['location'])): ?>
+                        <span><i class="bi bi-geo-alt me-1"></i><?= htmlspecialchars($agent['location']) ?></span>
+                    <?php endif; ?>
+                    <?php if (isset($agent['offline_alerts']) && empty($agent['offline_alerts'])): ?>
+                        <span title="No alert is sent when this client goes offline"><i class="bi bi-bell-slash me-1"></i>Offline alerts off</span>
+                    <?php endif; ?>
                     <?php if ($agent['hostname']): ?>
                         <span><i class="bi bi-signpost me-1"></i><?= htmlspecialchars($agent['hostname']) ?></span>
                         <?php if ($agent['ip_address'] ?? null): ?>
@@ -52,9 +63,10 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                     <?php if ($agent['os_info']): ?>
                         <span class="d-none d-md-inline"><i class="bi bi-cpu me-1"></i><?= htmlspecialchars($agent['os_info']) ?></span>
                     <?php endif; ?>
+                    <?php $canUpdateClient = ($this->isAdmin() || (int) ($agent['user_id'] ?? 0) === (int) ($_SESSION['user_id'] ?? 0)); ?>
                     <span id="agent-version-wrapper" class="d-inline">
                     <?php if ($agent['agent_version']): ?>
-                        <?php if ($agentNeedsUpdate): ?>
+                        <?php if ($agentNeedsUpdate && $canUpdateClient): ?>
                             <form method="POST" action="/clients/<?= $agent['id'] ?>/update-agent" class="d-inline">
                                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                                 <button type="submit" class="btn btn-link text-warning p-0 text-decoration-none" style="font-size: inherit;" title="Update agent to v<?= htmlspecialchars($serverAgentVersion) ?>" data-confirm="Queue an agent update to v<?= htmlspecialchars($serverAgentVersion) ?>?">
@@ -65,14 +77,20 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                             <i class="bi bi-box me-1"></i>Agent v<?= htmlspecialchars($agent['agent_version']) ?>
                         <?php endif; ?>
                     <?php endif; ?>
-                    </span><?php if ($agent['borg_version']): ?>
+                    </span><?php if (!empty($agent['snapshot_capable'])): $hdrSnap = json_decode($agent['snapshot_support'] ?? '{}', true); ?>
+                        <span title="Backups can run from filesystem snapshots on this client"><i class="bi bi-camera me-1"></i>Snapshots: <?= htmlspecialchars(implode(', ', array_map('strtoupper', $hdrSnap['methods'] ?? []))) ?></span>
+                    <?php endif; ?><?php if ($agent['borg_version']): ?>
                         <span>
+                            <?php if ($canUpdateClient): ?>
                             <form method="POST" action="/clients/<?= $agent['id'] ?>/update-borg" class="d-inline">
                                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                                 <button type="submit" class="btn btn-link text-muted p-0 text-decoration-none" style="font-size: inherit;" title="Update Borg on this client" data-confirm="Queue a borg update on this client?">
                                     <i class="bi bi-archive me-1"></i>Borg <?= htmlspecialchars($agent['borg_version']) ?>
                                 </button>
                             </form>
+                            <?php else: ?>
+                            <i class="bi bi-archive me-1"></i>Borg <?= htmlspecialchars($agent['borg_version']) ?>
+                            <?php endif; ?>
                         </span>
                     <?php endif; ?>
                 </div>
@@ -90,8 +108,11 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
             $seenAgo = 'Never';
         }
         $lastBackupLabel = $lastJob ? \BBS\Core\TimeHelper::format($lastJob['completed_at'], 'M j g:ia') : '--';
-        $lastBackupIcon = $lastJob ? ($lastJob['status'] === 'completed' ? 'check-circle-fill' : 'x-circle-fill') : 'dash-circle';
-        $lastBackupColor = $lastJob ? ($lastJob['status'] === 'completed' ? 'success' : 'danger') : 'secondary';
+        $lastBackupWarn = $lastJob && $lastJob['status'] === 'completed' && !empty($lastJob['had_warnings']);
+        $lastBackupIcon = !$lastJob ? 'dash-circle'
+            : ($lastBackupWarn ? 'exclamation-triangle-fill' : ($lastJob['status'] === 'completed' ? 'check-circle-fill' : 'x-circle-fill'));
+        $lastBackupColor = !$lastJob ? 'secondary'
+            : ($lastBackupWarn ? 'warning' : ($lastJob['status'] === 'completed' ? 'success' : 'danger'));
         ?>
         <div class="row g-2 border-top pt-3">
             <div class="col-6 col-sm-4 col-lg-2">
@@ -177,6 +198,27 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                             <label class="form-label fw-semibold small">Client Name</label>
                             <input type="text" class="form-control form-control-sm" name="name" value="<?= htmlspecialchars($agent['name']) ?>" required>
                         </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-semibold small">Location</label>
+                            <input type="text" class="form-control form-control-sm" name="location" maxlength="100" value="<?= htmlspecialchars($agent['location'] ?? '') ?>" placeholder="e.g. Frankfurt DC, rack 4">
+                        </div>
+                        <?php if ($this->isAdmin() && !empty($clientProfiles)): ?>
+                        <div class="mb-3">
+                            <label class="form-label fw-semibold small">Client Profile</label>
+                            <select name="client_profile_id" class="form-select form-select-sm">
+                                <?php foreach ($clientProfiles as $cp): ?>
+                                <option value="<?= (int) $cp['id'] ?>" <?= (int) ($agent['client_profile_id'] ?? 0) === (int) $cp['id'] ? 'selected' : '' ?>>
+                                    <?= htmlspecialchars($cp['name']) ?>
+                                </option>
+                                <?php endforeach; ?>
+                            </select>
+                            <div class="form-text">
+                                Sets how patient BBS is with this client when it drops out mid-backup, and what its
+                                next new backup plan is filled in with. Moving it here does not rewrite the plans it
+                                already has &mdash; that is what <a href="/settings?tab=profiles">Apply to Clients</a> does.
+                            </div>
+                        </div>
+                        <?php endif; ?>
                         <?php if ($this->isAdmin() && !empty($users)): ?>
                         <div>
                             <label class="form-label fw-semibold small">Owner</label>
@@ -189,6 +231,12 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                         </div>
                         <?php endif; ?>
                         <?php if ($this->isAdmin()): ?>
+                        <div class="form-check mt-3">
+                            <input type="hidden" name="offline_alerts" value="0">
+                            <input class="form-check-input" type="checkbox" name="offline_alerts" id="offlineAlerts" value="1" <?= !isset($agent['offline_alerts']) || !empty($agent['offline_alerts']) ? 'checked' : '' ?>>
+                            <label class="form-check-label fw-semibold small" for="offlineAlerts">Alert when offline</label>
+                            <div class="form-text">Turn off for laptops and desktops that are switched off by design. Backups and missed-backup alerts are not affected.</div>
+                        </div>
                         <hr class="my-3">
                         <p class="text-muted small mb-2">For agents connecting from outside your network. Leave empty to use global settings.</p>
                         <div class="mb-3">
@@ -199,6 +247,39 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                         <div>
                             <label class="form-label fw-semibold small">SSH Port Override</label>
                             <input type="number" class="form-control form-control-sm" name="ssh_port_override" value="<?= htmlspecialchars($agent['ssh_port_override'] ?? '') ?>" placeholder="e.g. 22222" min="1" max="65535">
+                        </div>
+                        <hr class="my-3">
+                        <div class="form-check mb-2">
+                            <input type="hidden" name="wol_enabled" value="0">
+                            <input class="form-check-input" type="checkbox" name="wol_enabled" id="wolEnabled" value="1" <?= !empty($agent['wol_enabled']) ? 'checked' : '' ?>>
+                            <label class="form-check-label fw-semibold small" for="wolEnabled">Wake-on-LAN</label>
+                            <div class="form-text">Wake this client with a magic packet when a backup is due. Only works when the BBS server is on the same network as the client.</div>
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label fw-semibold small">MAC Address</label>
+                            <input type="text" class="form-control form-control-sm" name="wol_mac"
+                                   value="<?= htmlspecialchars($agent['wol_mac'] ?: ($agent['mac_address'] ?? '')) ?>"
+                                   placeholder="aa:bb:cc:dd:ee:ff" pattern="[0-9a-fA-F:.\-]{12,17}">
+                            <?php if (empty($agent['wol_mac']) && !empty($agent['mac_address'])): ?>
+                            <div class="form-text">Detected from the agent.</div>
+                            <?php elseif (empty($agent['wol_mac']) && empty($agent['mac_address'])): ?>
+                            <div class="form-text">Auto-fills once the agent checks in while awake, or enter it manually.</div>
+                            <?php endif; ?>
+                        </div>
+                        <div class="row g-2">
+                            <div class="col-7">
+                                <label class="form-label fw-semibold small">Broadcast Address</label>
+                                <input type="text" class="form-control form-control-sm" name="wol_broadcast"
+                                       value="<?= htmlspecialchars($agent['wol_broadcast'] ?? '') ?>"
+                                       placeholder="<?= htmlspecialchars(\BBS\Services\WakeOnLanService::defaultBroadcast($agent['ip_address'] ?? null) ?? 'e.g. 192.168.1.255') ?>">
+                            </div>
+                            <div class="col-5">
+                                <label class="form-label fw-semibold small">Wake Timeout</label>
+                                <div class="input-group input-group-sm">
+                                    <input type="number" class="form-control" name="wol_timeout_minutes" value="<?= (int) ($agent['wol_timeout_minutes'] ?? 5) ?>" min="1" max="60">
+                                    <span class="input-group-text">min</span>
+                                </div>
+                            </div>
                         </div>
                         <?php endif; ?>
                     </div>
@@ -243,6 +324,9 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
     // Install and Delete: admins, or the client's owner — owners manage
     // the full lifecycle of their own clients (#337)
     $isOwnerOrAdmin = $this->isAdmin() || (int) ($agent['user_id'] ?? 0) === (int) ($_SESSION['user_id'] ?? 0);
+    // Creation controls only for users who may complete them (discussion #525)
+    $canManageRepos = $this->hasPermission(\BBS\Services\PermissionService::MANAGE_REPOS, (int) $agent['id']);
+    $canManagePlans = $this->hasPermission(\BBS\Services\PermissionService::MANAGE_PLANS, (int) $agent['id']);
     ?>
     <?php if ($isOwnerOrAdmin): ?>
     <li class="nav-item">
@@ -297,7 +381,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
             <div class="card border-0 shadow-sm h-100 metric-card-blue">
                 <div class="card-body d-flex align-items-center position-relative">
                     <?php if ($nextBackup && $nextBackup['plan_id']): ?>
-                    <div class="dropdown position-absolute top-0 end-0 mt-2 me-2" style="z-index:2147483647;">
+                    <div class="dropdown position-absolute top-0 end-0 mt-2 me-2" style="z-index:2;">
                         <button class="btn btn-sm btn-link text-muted p-1 border-0" type="button" data-bs-toggle="dropdown" data-bs-strategy="fixed">
                             <i class="bi bi-three-dots-vertical"></i>
                         </button>
@@ -317,6 +401,13 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                             </li>
                             <?php endif; ?>
                             <li><a class="dropdown-item" href="?tab=schedules"><i class="bi bi-pencil text-primary me-2"></i>Edit</a></li>
+                            <li><hr class="dropdown-divider"></li>
+                            <li>
+                                <form method="POST" action="/plans/<?= $nextBackup['plan_id'] ?>/delete" data-confirm="Delete this backup plan and its schedule?" data-confirm-danger>
+                                    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                                    <button type="submit" class="dropdown-item text-danger"><i class="bi bi-trash me-2"></i>Delete</button>
+                                </form>
+                            </li>
                         </ul>
                     </div>
                     <?php elseif ($pausedCount > 0): ?>
@@ -414,10 +505,14 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                         <div style="position: relative; height: 180px;">
                             <canvas id="storageChart"></canvas>
                         </div>
+                        <?php // Same palette as the doughnut and the poll's re-render, so the
+                              // dots are coloured on first paint rather than grey until the
+                              // first status poll ~30s later (#504).
+                              $storageDotColors = ['#0d6efd', '#198754', '#ffc107', '#0dcaf0', '#6f42c1', '#fd7e14', '#d63384', '#20c997']; ?>
                         <div class="mt-3" id="storage-legend">
-                            <?php foreach ($repositories as $repo): ?>
+                            <?php foreach ($repositories as $i => $repo): ?>
                             <div class="d-flex justify-content-between small mb-1">
-                                <span><i class="bi bi-circle-fill me-1" style="font-size: 0.5rem; vertical-align: middle;"></i> <?= htmlspecialchars($repo['name']) ?></span>
+                                <span><i class="bi bi-circle-fill me-1" style="font-size: 0.5rem; vertical-align: middle; color: <?= $storageDotColors[$i % count($storageDotColors)] ?>;"></i> <?= htmlspecialchars($repo['name']) ?></span>
                                 <span class="fw-semibold">
                                     <?php
                                     $s = $repo['size_bytes'];
@@ -434,10 +529,90 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
         </div>
     </div>
 
-    <!-- Row 3: Recent Activity (table) -->
-    <div class="card border-0 shadow-sm">
-        <div class="card-header fw-semibold">
-            <i class="bi bi-clock-history me-1"></i> Recent Activity
+    <!-- Row 3: Schedules summary (left) + Recent Activity (right) -->
+    <?php
+    // Compact plugin-icon renderer for the schedule summary
+    $pluginIconHtml = function (string $slug): string {
+        $logos = [
+            'mysql_dump' => ['/images/mysql.png', 'MySQL'],
+            'pg_dump'    => ['/images/postgresql.svg', 'PostgreSQL'],
+            'mongo_dump' => ['/images/mongodb.svg', 'MongoDB'],
+            'mssql_dump' => ['/images/mssql.svg', 'SQL Server'],
+            'interworx'  => ['/images/interworx-icon.png', 'InterWorx'],
+        ];
+        if (isset($logos[$slug])) {
+            [$src, $name] = $logos[$slug];
+            return '<img src="' . $src . '" alt="' . $name . '" title="' . $name . '" style="width:22px;height:22px;object-fit:contain;">';
+        }
+        if ($slug === 'shell_hook') {
+            return '<span title="Script Hook" class="d-inline-flex align-items-center justify-content-center rounded" style="width:22px;height:22px;background:rgba(13,110,253,0.12);"><i class="bi bi-code-slash text-primary" style="font-size:0.8rem;"></i></span>';
+        }
+        if ($slug === 's3_sync') {
+            return '<span title="Offsite Sync" class="d-inline-flex align-items-center justify-content-center rounded" style="width:22px;height:22px;background:#ff6b6b;"><i class="bi bi-cloud-arrow-up text-white" style="font-size:0.75rem;"></i></span>';
+        }
+        return '<i class="bi bi-puzzle text-secondary" title="' . htmlspecialchars($slug) . '"></i>';
+    };
+    ?>
+    <div class="row g-4">
+    <!-- Left: Schedules summary -->
+    <div class="col-lg-6">
+    <div class="card border-0 shadow-sm h-100">
+        <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
+            <span><i class="bi bi-calendar-week me-1"></i> Schedules</span>
+            <a href="?tab=schedules" class="small text-decoration-none">Manage &rarr;</a>
+        </div>
+        <div class="card-body p-0">
+            <?php if (empty($plans)): ?>
+            <div class="p-4 text-muted text-center">No backup plans yet. <a href="?tab=schedules">Add one &rarr;</a></div>
+            <?php else: ?>
+            <div class="list-group list-group-flush">
+                <?php foreach ($plans as $plan):
+                    $freq = $plan['frequency'] ?? 'manual';
+                    $isActive = $plan['schedule_enabled'] ?? false;
+                    $isManual = $freq === 'manual' || empty($plan['schedule_id']);
+                    $sched = ucfirst(str_replace(['10min','15min','30min'], ['Every 10 min','Every 15 min','Every 30 min'], $freq));
+                    if (!empty($plan['times']) && in_array($freq, ['daily','weekly','monthly'])) $sched .= ' @ ' . htmlspecialchars($plan['times']);
+                    if ($freq === 'weekly' && isset($plan['day_of_week'])) { $sched = \BBS\Services\SchedulerService::daysOfWeekLabel($plan['day_of_week']) . ' @ ' . htmlspecialchars($plan['times'] ?? '00:00'); }
+                    if ($freq === 'monthly' && isset($plan['day_of_month'])) { $dom = $plan['day_of_month']; $sched = 'Monthly on ' . ($dom === 'last' ? 'last day' : $dom) . ' @ ' . htmlspecialchars($plan['times'] ?? '00:00'); }
+                    if ($isManual) $sched = 'Manual (no schedule)';
+                    $isRemote = ($plan['repo_storage_type'] ?? 'local') === 'remote_ssh';
+                    $slugs = $planPlugins[(int) $plan['id']] ?? [];
+                    $statusColor = $isActive ? 'success' : ($isManual ? 'secondary' : 'warning');
+                ?>
+                <div class="list-group-item py-3" style="cursor:pointer;" onclick="window.location='?tab=schedules'">
+                    <div class="d-flex align-items-start justify-content-between gap-2">
+                        <div style="min-width:0;">
+                            <div class="fw-semibold text-truncate">
+                                <i class="bi bi-circle-fill text-<?= $statusColor ?> me-1" style="font-size:0.5rem;vertical-align:middle;" title="<?= $isActive ? 'Active' : ($isManual ? 'Manual' : 'Paused') ?>"></i>
+                                <?= htmlspecialchars($plan['name']) ?>
+                            </div>
+                            <div class="small text-muted text-truncate mt-1">
+                                <i class="bi bi-hdd-stack me-1"></i><?= htmlspecialchars($plan['repo_name'] ?? '&mdash;') ?><?php if ($isRemote): ?> <span class="badge bg-secondary-subtle text-secondary-emphasis" style="font-size:0.6rem;">Remote</span><?php endif; ?>
+                            </div>
+                            <div class="small text-muted mt-1"><i class="bi bi-clock me-1"></i><?= $sched ?></div>
+                            <?php if ($isActive && !empty($plan['next_run'])): ?>
+                            <div class="small text-info mt-1"><i class="bi bi-arrow-right-circle me-1"></i>Next: <?= \BBS\Core\TimeHelper::format($plan['next_run'], 'M j, g:ia') ?></div>
+                            <?php endif; ?>
+                        </div>
+                        <?php if (!empty($slugs)): ?>
+                        <div class="d-flex align-items-center gap-1 flex-shrink-0" style="flex-wrap:wrap;justify-content:flex-end;max-width:110px;">
+                            <?php foreach ($slugs as $slug) echo $pluginIconHtml($slug); ?>
+                        </div>
+                        <?php endif; ?>
+                    </div>
+                </div>
+                <?php endforeach; ?>
+            </div>
+            <?php endif; ?>
+        </div>
+    </div>
+    </div>
+    <!-- Right: Recent Activity -->
+    <div class="col-lg-6">
+    <div class="card border-0 shadow-sm h-100">
+        <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
+            <span><i class="bi bi-clock-history me-1"></i> Recent Activity</span>
+            <a href="/log?client=<?= (int) $agent['id'] ?>" class="small text-decoration-none">More Activity &rarr;</a>
         </div>
         <div class="card-body p-0">
             <?php if (empty($recentJobs)): ?>
@@ -455,7 +630,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                         </tr>
                     </thead>
                     <tbody>
-                    <?php foreach (array_slice($recentJobs, 0, 20) as $job):
+                    <?php foreach (array_slice($recentJobs, 0, 10) as $job):
                         $jIcon = match($job['status']) {
                             'completed' => 'check-circle-fill text-success',
                             'failed' => 'x-circle-fill text-danger',
@@ -469,12 +644,16 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                         if ($job['status'] === 'failed' && !empty($job['error_log'])) {
                             $iconTitle = mb_substr($job['error_log'], 0, 500);
                         }
+                        if ($job['status'] === 'completed' && !empty($job['had_warnings'])) {
+                            $jIcon = 'exclamation-triangle-fill text-warning';
+                            $iconTitle = 'Completed with warnings: ' . mb_substr($job['error_log'] ?? '', 0, 500);
+                        }
                     ?>
                         <tr style="cursor: pointer;" onclick="window.location='/queue/<?= (int) $job['id'] ?>'">
                             <td class="text-center"<?= $iconTitle ? ' title="' . htmlspecialchars($iconTitle) . '"' : '' ?>>
                                 <i class="bi bi-<?= $jIcon ?>"></i>
                             </td>
-                            <td><?= ucfirst($job['task_type']) ?></td>
+                            <td><?= htmlspecialchars(\BBS\Core\JobType::label($job['task_type'])) ?></td>
                             <td class="text-truncate" style="max-width:240px;" title="<?= htmlspecialchars($job['repo_name'] ?? '') ?>">
                                 <?= htmlspecialchars($job['repo_name'] ?? '—') ?>
                             </td>
@@ -488,6 +667,8 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
             <?php endif; ?>
         </div>
     </div>
+    </div><!-- /col Recent Activity -->
+    </div><!-- /row Schedules + Recent Activity -->
 
     <?php if (!empty($durationChart)): ?>
     <script src="/assets/chartjs/chart.umd.min.js"></script>
@@ -505,8 +686,9 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
             datasets: [{
                 label: 'Duration (seconds)',
                 data: durData.map(d => d.duration_seconds),
-                backgroundColor: durData.map(d => d.status === 'completed' ? 'rgba(25, 135, 84, 0.7)' : 'rgba(220, 53, 69, 0.7)'),
-                borderColor: durData.map(d => d.status === 'completed' ? 'rgb(25, 135, 84)' : 'rgb(220, 53, 69)'),
+                // had_warnings arrives as "0"/"1" — compare, don't test truthiness.
+                backgroundColor: durData.map(d => d.status !== 'completed' ? 'rgba(220, 53, 69, 0.7)' : (d.had_warnings == 1 ? 'rgba(255, 193, 7, 0.7)' : 'rgba(25, 135, 84, 0.7)')),
+                borderColor: durData.map(d => d.status !== 'completed' ? 'rgb(220, 53, 69)' : (d.had_warnings == 1 ? 'rgb(255, 193, 7)' : 'rgb(25, 135, 84)')),
                 borderWidth: 1,
                 borderRadius: 3,
             }]
@@ -913,6 +1095,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
         btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> Verifying...';
 
         var formData = new URLSearchParams();
+        formData.append('csrf_token', '<?= $this->csrfToken() ?>');
         formData.append('agent_id', '<?= $agent['id'] ?>');
         formData.append('name', document.getElementById('importName').value);
         formData.append('passphrase', document.getElementById('importPassphrase').value);
@@ -981,11 +1164,14 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
         <div class="col-md-6 col-lg-4">
             <div class="card border-0 shadow-sm h-100 repo-card position-relative" style="cursor: pointer; overflow: visible;" onclick="window.location='/clients/<?= $agent['id'] ?>/repo/<?= $repo['id'] ?>'">
                 <!-- Maintenance menu in upper right -->
-                <div class="position-absolute dropdown" style="top: 6px; right: 6px; z-index: 10;" onclick="event.stopPropagation()">
+                <div class="position-absolute dropdown" style="top: 6px; right: 6px; z-index: 2;" onclick="event.stopPropagation()">
                     <button class="btn btn-sm btn-link text-muted p-1" type="button" data-bs-toggle="dropdown" data-bs-strategy="fixed" aria-expanded="false" title="Actions">
                         <i class="bi bi-three-dots-vertical"></i>
                     </button>
                     <ul class="dropdown-menu dropdown-menu-end">
+                        <li>
+                            <button type="button" class="dropdown-item" onclick="openNotes('repo', <?= $repo['id'] ?>, <?= htmlspecialchars(json_encode($repo['name'])) ?>, this)" data-notes="<?= htmlspecialchars($repo['notes'] ?? '') ?>" data-notes-meta="<?= !empty($repo['notes_updated_at']) ? htmlspecialchars(\BBS\Core\TimeHelper::format($repo['notes_updated_at'], 'M j, g:i A') . (!empty($usersById[$repo['notes_updated_by']] ?? null) ? ' by ' . $usersById[$repo['notes_updated_by']] : '')) : '' ?>"><i class="bi bi-journal-text me-2"></i>Notes<?= !empty($repo['notes']) ? ' <i class="bi bi-circle-fill text-warning" style="font-size:.4rem;vertical-align:middle;"></i>' : '' ?></button>
+                        </li>
                         <li>
                             <form method="POST" action="/repositories/<?= $repo['id'] ?>/maintenance">
                                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
@@ -993,6 +1179,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                 <button type="submit" class="dropdown-item"><i class="bi bi-shield-check me-2 text-primary"></i>Check</button>
                             </form>
                         </li>
+                        <?php if (empty($repo['read_only'])): ?>
                         <li>
                             <form method="POST" action="/repositories/<?= $repo['id'] ?>/maintenance">
                                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
@@ -1007,6 +1194,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                 <button type="submit" class="dropdown-item"><i class="bi bi-bandaid me-2 text-warning"></i>Repair</button>
                             </form>
                         </li>
+                        <?php endif; ?>
                         <li>
                             <form method="POST" action="/repositories/<?= $repo['id'] ?>/maintenance" data-confirm="BREAK LOCK on repository &quot;<?= htmlspecialchars($repo['name']) ?>&quot;?&#10;&#10;This forcibly removes stale locks. Only use if you're CERTAIN no backup operations are running." data-confirm-danger>
                                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
@@ -1018,13 +1206,8 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                         <li>
                             <?php if ($deleteBlocked): ?>
                                 <span class="dropdown-item disabled text-muted" data-bs-toggle="tooltip" title="<?= htmlspecialchars($blockReason) ?>"><i class="bi bi-trash me-2"></i>Delete</span>
-                            <?php elseif (isset($s3SyncByRepo[$repo['id']])): ?>
-                                <button type="button" class="dropdown-item text-danger" data-bs-toggle="modal" data-bs-target="#deleteRepoModal<?= $repo['id'] ?>"><i class="bi bi-trash me-2"></i>Delete</button>
                             <?php else: ?>
-                                <form method="POST" action="/repositories/<?= $repo['id'] ?>/delete" data-confirm="PERMANENTLY delete repository &quot;<?= htmlspecialchars($repo['name']) ?>&quot;, all its archives, and the data on disk?&#10;&#10;This action is NOT reversible." data-confirm-danger>
-                                    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-                                    <button type="submit" class="dropdown-item text-danger"><i class="bi bi-trash me-2"></i>Delete</button>
-                                </form>
+                                <button type="button" class="dropdown-item text-danger" data-bs-toggle="modal" data-bs-target="#deleteRepoModal<?= $repo['id'] ?>"><i class="bi bi-trash me-2"></i>Delete</button>
                             <?php endif; ?>
                         </li>
                     </ul>
@@ -1037,7 +1220,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                             <span class="schedule-id"><?= $isRemoteRepo ? 'Remote' : 'Local' ?></span>
                         </div>
                         <div class="flex-grow-1 min-width-0">
-                            <h6 class="mb-1 fw-bold"><?= htmlspecialchars($repo['name']) ?></h6>
+                            <h6 class="mb-1 fw-bold"><?= htmlspecialchars($repo['name']) ?><?php if (!empty($repo['read_only'])): ?> <span class="badge text-bg-warning ms-1" style="font-size:.65em;vertical-align:middle" title="Restored from an offsite sync: browse, restore and download only"><i class="bi bi-lock me-1"></i>Read-only copy</span><?php endif; ?><?php if (!empty($repo['notes'])): ?> <i class="bi bi-journal-text text-warning small" title="<?= htmlspecialchars(mb_substr($repo['notes'], 0, 200)) ?>"></i><?php endif; ?></h6>
                             <div class="small text-muted">
                                 <i class="bi bi-hdd me-1"></i><?= $sizeLabel ?>
                             </div>
@@ -1048,11 +1231,12 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                     </div>
                 </div>
                 <div class="repo-status-bar">
-                    <?= $sizeLabel ?> &middot; <?= $repo['archive_count'] ?> archives<?php if (isset($s3SyncByRepo[$repo['id']])): ?> &middot; <i class="bi bi-cloud text-info" title="Replicated to S3<?= !empty($s3SyncByRepo[$repo['id']]['last_sync']) ? ' (last: ' . \BBS\Core\TimeHelper::ago($s3SyncByRepo[$repo['id']]['last_sync']) . ')' : '' ?>"></i> S3 Sync<?= ($s3SyncByRepo[$repo['id']]['destinations'] ?? 1) > 1 ? ' &times;' . $s3SyncByRepo[$repo['id']]['destinations'] : '' ?><?php endif; ?>
+                    <?= $sizeLabel ?> &middot; <?= $repo['archive_count'] ?> archives<?php if (isset($s3SyncByRepo[$repo['id']])): ?> &middot; <i class="bi bi-cloud text-info" title="Copied offsite<?= !empty($s3SyncByRepo[$repo['id']]['last_sync']) ? ' (last: ' . \BBS\Core\TimeHelper::ago($s3SyncByRepo[$repo['id']]['last_sync']) . ')' : '' ?>"></i> Offsite<?= ($s3SyncByRepo[$repo['id']]['destinations'] ?? 1) > 1 ? ' &times;' . $s3SyncByRepo[$repo['id']]['destinations'] : '' ?><?php endif; ?>
                 </div>
             </div>
         </div>
         <?php endforeach; ?>
+        <?php if ($canManageRepos): ?>
         <div class="col-md-6 col-lg-4">
             <div class="card border-0 shadow-sm h-100 card-dashed" onclick="showCreateRepo()">
                 <div class="card-body d-flex flex-column align-items-center justify-content-center text-muted p-4">
@@ -1069,11 +1253,12 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                 </div>
             </div>
         </div>
+        <?php endif; ?>
     </div>
 
     <!-- Delete Repo Modals (for repos with S3 sync) -->
     <?php foreach ($repositories as $repo): ?>
-    <?php if (isset($s3SyncByRepo[$repo['id']])): ?>
+    <?php $isRemoteRepo = ($repo['storage_type'] ?? 'local') === 'remote_ssh'; ?>
     <div class="modal fade" id="deleteRepoModal<?= $repo['id'] ?>" tabindex="-1" aria-hidden="true">
         <div class="modal-dialog">
             <div class="modal-content">
@@ -1084,25 +1269,41 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                 <form method="POST" action="/repositories/<?= $repo['id'] ?>/delete">
                     <div class="modal-body">
                         <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-                        <p>PERMANENTLY delete repository <strong>"<?= htmlspecialchars($repo['name']) ?>"</strong>, all its archives, and the data on disk?</p>
-                        <p class="text-danger fw-bold">This action is NOT reversible.</p>
+                        <?php if ($isRemoteRepo): ?>
+                            <p>Remove repository <strong>"<?= htmlspecialchars($repo['name']) ?>"</strong> and its archive catalog from BBS?</p>
+                            <div class="alert alert-info d-flex align-items-start mb-0">
+                                <i class="bi bi-info-circle-fill me-2 mt-1"></i>
+                                <div>The borg data on the remote host is <strong>not</strong> deleted — only the registration in BBS is removed. You can re-attach it later (on any client) via <em>Import existing</em>.</div>
+                            </div>
+                        <?php else: ?>
+                            <p>PERMANENTLY delete repository <strong>"<?= htmlspecialchars($repo['name']) ?>"</strong>, all its archives, and the data on disk?</p>
+                            <p class="text-danger fw-bold">This action is NOT reversible.</p>
+                            <div class="form-check mt-3 p-3 bg-body-secondary rounded">
+                                <input class="form-check-input" type="checkbox" name="keep_data" id="keepData_<?= $repo['id'] ?>" value="1">
+                                <label class="form-check-label" for="keepData_<?= $repo['id'] ?>">
+                                    <i class="bi bi-hdd text-warning me-1"></i>Keep repository data on disk (unlink only)
+                                </label>
+                                <div class="form-text">The borg repository stays in storage and can be re-attached to any client later via Repositories &rarr; Scan &amp; Adopt.</div>
+                            </div>
+                        <?php endif; ?>
+                        <?php if (isset($s3SyncByRepo[$repo['id']])): ?>
                         <div class="form-check mt-3 p-3 bg-body-secondary rounded">
                             <input class="form-check-input" type="checkbox" name="delete_from_s3" id="deleteFromS3_<?= $repo['id'] ?>" value="1">
                             <label class="form-check-label" for="deleteFromS3_<?= $repo['id'] ?>">
-                                <i class="bi bi-cloud text-info me-1"></i>Also delete from S3 offsite storage<?= ($s3SyncByRepo[$repo['id']]['destinations'] ?? 1) > 1 ? ' (all ' . $s3SyncByRepo[$repo['id']]['destinations'] . ' destinations)' : '' ?>
+                                <i class="bi bi-cloud text-info me-1"></i>Also delete the offsite copy<?= ($s3SyncByRepo[$repo['id']]['destinations'] ?? 1) > 1 ? ' (all ' . $s3SyncByRepo[$repo['id']]['destinations'] . ' destinations)' : '' ?>
                             </label>
-                            <div class="form-text">If unchecked, the S3 copy will remain and can be restored later.</div>
+                            <div class="form-text">If unchecked, the offsite copy stays and can be restored later.</div>
                         </div>
+                        <?php endif; ?>
                     </div>
                     <div class="modal-footer border-0">
                         <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                        <button type="submit" class="btn btn-danger"><i class="bi bi-trash me-1"></i>Delete Repository</button>
+                        <button type="submit" class="btn btn-danger"><i class="bi bi-trash me-1"></i><?= $isRemoteRepo ? 'Remove Repository' : 'Delete Repository' ?></button>
                     </div>
                 </form>
             </div>
         </div>
     </div>
-    <?php endif; ?>
     <?php endforeach; ?>
 
     <?php endif; ?>
@@ -1113,10 +1314,14 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                 <i class="bi bi-archive" style="font-size:2rem;"></i>
                 <div class="mt-2 fw-semibold">Create a Repository to get started</div>
                 <small class="mt-1 text-center" style="max-width:400px;">A repository is a virtual disk where your backup data is stored on the backup server.</small>
+                <?php if ($canManageRepos): ?>
                 <div class="mt-3 d-flex gap-2">
                     <span class="btn btn-sm btn-outline-primary" style="cursor:pointer;" onclick="showCreateRepo()"><i class="bi bi-plus-circle me-1"></i>Add Repository</span>
                     <span class="btn btn-sm btn-outline-secondary" style="cursor:pointer;" onclick="showImportRepo()"><i class="bi bi-box-arrow-in-down me-1"></i>Import Existing</span>
                 </div>
+                <?php else: ?>
+                <small class="mt-3 text-center">You don't have permission to add repositories to this client.</small>
+                <?php endif; ?>
             </div>
         </div>
     </div>
@@ -1137,7 +1342,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                 <div class="row mb-3">
                     <label class="col-md-3 col-form-label fw-semibold">Description</label>
                     <div class="col-md-6">
-                        <input type="text" class="form-control" name="name" required maxlength="20" placeholder="RepoName">
+                        <input type="text" class="form-control" name="name" required maxlength="100" placeholder="RepoName">
                     </div>
                     <div class="col-md-3 form-text pt-2">Descriptive name for the repo. (Max 20 characters)</div>
                 </div>
@@ -1298,7 +1503,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                 <div class="row mb-3">
                     <label class="col-md-3 col-form-label fw-semibold">Name</label>
                     <div class="col-md-6">
-                        <input type="text" class="form-control" id="importName" maxlength="20" placeholder="RepoName">
+                        <input type="text" class="form-control" id="importName" maxlength="100" placeholder="RepoName">
                     </div>
                     <div class="col-md-3 form-text pt-2">Must match the directory name of the existing repo.</div>
                 </div>
@@ -1421,7 +1626,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                 <div class="row mb-3">
                     <label class="col-md-3 col-form-label fw-semibold">Name</label>
                     <div class="col-md-6">
-                        <input type="text" class="form-control" id="adoptName" maxlength="20">
+                        <input type="text" class="form-control" id="adoptName" maxlength="100">
                     </div>
                     <div class="col-md-3 form-text pt-2">The repository's name in BBS — also its folder name after the move.</div>
                 </div>
@@ -1487,7 +1692,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
         </div>
         <div class="card-body">
             <p class="text-muted small mb-3">
-                These repositories exist in your S3 offsite storage but are not currently on this server.
+                These repositories have an offsite copy but are not on this server.
                 You can restore them to recover data or re-enable backups.
             </p>
             <div class="row g-3">
@@ -1502,11 +1707,11 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                 <div class="flex-grow-1 min-width-0">
                                     <h6 class="mb-1 fw-bold"><?= htmlspecialchars($orphanName) ?></h6>
                                     <div class="small text-muted">
-                                        <i class="bi bi-cloud me-1"></i>S3 Only
+                                        <i class="bi bi-cloud me-1"></i>Offsite copy only
                                     </div>
                                 </div>
                             </div>
-                            <form method="POST" action="/clients/<?= $agent['id'] ?>/restore-orphan" class="mt-2" data-confirm="Restore repository &quot;<?= htmlspecialchars($orphanName) ?>&quot; from S3?&#10;&#10;This will create the repository and download data from S3.">
+                            <form method="POST" action="/clients/<?= $agent['id'] ?>/restore-orphan" class="mt-2" data-confirm="Restore repository &quot;<?= htmlspecialchars($orphanName) ?>&quot; from its offsite copy?&#10;&#10;This will create the repository and copy the data back.">
                                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                                 <input type="hidden" name="repo_name" value="<?= htmlspecialchars($orphanName) ?>">
                                 <input type="hidden" name="plugin_config_id" value="<?= $orphanConfigId ?>">
@@ -1536,9 +1741,188 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
     </div>
     <?php
     $enabledPluginsList = array_filter($agentPlugins, fn($p) => !empty($p['agent_enabled']));
+
+    // Plugin configs selectable per plan: named configs of enabled, non-S3
+    // plugins (S3 offsite sync is repo-level, not per-plan).
+    $enabledPluginIds = array_map(fn($p) => $p['id'], $enabledPluginsList);
+    $planPluginConfigCards = array_values(array_filter(
+        $pluginConfigs,
+        fn($c) => in_array($c['plugin_id'], $enabledPluginIds) && ($c['slug'] ?? '') !== 's3_sync'
+    ));
+
+    // Render the horizontal list of plugin-config cards with a checkbox each.
+    // $checkedIds = config ids currently attached to the plan.
+    // "Stream database dumps" sits under the cards and shows only while a
+    // MySQL or PostgreSQL config is ticked; it means nothing for the others.
+    // Windows agents cannot stream, so it is not offered there.
+    $renderStreamOption = function (?array $plan) use ($agent) {
+        if (stripos($agent['os_info'] ?? '', 'Windows') !== false) {
+            return;
+        }
+        $id = 'streamDb' . ($plan ? (int) $plan['id'] : 'New');
+        ?>
+        <div class="ppc-stream mt-2" style="display:none;">
+            <?php if ($plan): ?><input type="hidden" name="stream_db_dumps_present" value="1"><?php endif; ?>
+            <div class="form-check">
+                <input class="form-check-input" type="checkbox" name="stream_db_dumps" id="<?= $id ?>" value="1" <?= !empty($plan['stream_db_dumps']) ? 'checked' : '' ?>>
+                <label class="form-check-label" for="<?= $id ?>">Stream database dumps into the archive</label>
+            </div>
+            <div class="form-text">MySQL and PostgreSQL dumps go straight to borg instead of to this client's disk first, so a dump larger than the free space still works. Each database is read for as long as borg takes to store it, which is usually longer than a dump to local disk. Not used with snapshots.</div>
+        </div>
+        <?php
+    };
+
+    $renderPluginCards = function (array $checkedIds) use ($planPluginConfigCards) {
+        $typeLabels = [
+            'mysql_dump' => 'MySQL', 'pg_dump' => 'PostgreSQL', 'mongo_dump' => 'MongoDB', 'mssql_dump' => 'SQL Server',
+            'interworx' => 'InterWorx', 'shell_hook' => 'Script',
+        ];
+        $logos = [
+            'mysql_dump' => '/images/mysql.png', 'pg_dump' => '/images/postgresql.svg',
+            'mongo_dump' => '/images/mongodb.svg', 'mssql_dump' => '/images/mssql.svg', 'interworx' => '/images/interworx-icon.png',
+        ];
+        // Selected configs come first, in the order they run, so the sequence
+        // is visible before anyone drags anything. Everything else follows.
+        $checkedOrder = array_values(array_map('intval', $checkedIds));
+        $cards = $planPluginConfigCards;
+        usort($cards, function ($a, $b) use ($checkedOrder) {
+            $pa = array_search((int) $a['id'], $checkedOrder, true);
+            $pb = array_search((int) $b['id'], $checkedOrder, true);
+            if ($pa === false && $pb === false) return 0;
+            if ($pa === false) return 1;
+            if ($pb === false) return -1;
+            return $pa <=> $pb;
+        });
+
+        echo '<div class="d-flex flex-wrap gap-2 ppc-sortable">';
+        foreach ($cards as $c) {
+            $slug = $c['slug'] ?? '';
+            $checked = in_array((int) $c['id'], array_map('intval', $checkedIds), true);
+            $cid = 'ppc_' . $c['id'] . '_' . mt_rand(1000, 9999);
+            $iconHtml = isset($logos[$slug])
+                ? '<img src="' . $logos[$slug] . '" alt="" style="width:24px;height:24px;object-fit:contain;">'
+                : ($slug === 'shell_hook'
+                    ? '<span class="d-inline-flex align-items-center justify-content-center rounded" style="width:24px;height:24px;background:rgba(13,110,253,0.12);"><i class="bi bi-code-slash text-primary"></i></span>'
+                    : '<i class="bi bi-puzzle text-secondary" style="font-size:1.3rem;"></i>');
+            $type = $typeLabels[$slug] ?? ucfirst(str_replace('_', ' ', $slug));
+            ?>
+            <label class="border rounded p-2 position-relative d-flex align-items-center gap-2 ppc-card <?= $checked ? 'border-primary bg-primary-subtle' : '' ?>" style="width:190px;cursor:pointer;" for="<?= $cid ?>" draggable="true">
+                <input class="form-check-input position-absolute" type="checkbox" name="plan_plugin_configs[]" value="<?= (int) $c['id'] ?>" data-slug="<?= htmlspecialchars($slug) ?>" id="<?= $cid ?>" <?= $checked ? 'checked' : '' ?> style="top:6px;right:6px;margin:0;">
+                <span class="ppc-step badge rounded-pill bg-primary position-absolute" style="top:-7px;left:-7px;font-size:0.65rem;display:none;">1</span>
+                <i class="bi bi-grip-vertical text-muted" style="cursor:grab;font-size:0.9rem;" title="Drag to change the order they run in"></i>
+                <?= $iconHtml ?>
+                <span class="min-width-0" style="min-width:0;">
+                    <span class="d-block fw-semibold text-truncate small" style="max-width:96px;"><?= htmlspecialchars($c['name']) ?></span>
+                    <span class="d-block text-muted" style="font-size:0.7rem;"><?= htmlspecialchars($type) ?></span>
+                </span>
+            </label>
+            <?php
+        }
+        echo '</div>';
+    };
     ?>
 
     <script>
+    // Plugin cards: order is the order they run in, and the checkboxes submit
+    // in DOM order — so dragging a card is the whole feature, no hidden field
+    // needed. Numbers show only on selected cards, since an unselected one has
+    // no place in the sequence.
+    (function () {
+        function renumber(list) {
+            var step = 0;
+            list.querySelectorAll('.ppc-card').forEach(function (card) {
+                var box = card.querySelector('input[type=checkbox]');
+                var badge = card.querySelector('.ppc-step');
+                if (box && box.checked) {
+                    step++;
+                    badge.textContent = step;
+                    badge.style.display = '';
+                } else {
+                    badge.style.display = 'none';
+                }
+            });
+        }
+
+        function cardAfter(list, x, y) {
+            // Nearest card whose centre is past the pointer, scanning the row
+            // the pointer is in — a wrapped flex grid has no single axis.
+            var best = null, bestDist = Number.POSITIVE_INFINITY;
+            list.querySelectorAll('.ppc-card:not(.ppc-dragging)').forEach(function (card) {
+                var r = card.getBoundingClientRect();
+                if (y < r.top || y > r.bottom) return;
+                var d = r.left + r.width / 2 - x;
+                if (d > 0 && d < bestDist) { bestDist = d; best = card; }
+            });
+            return best;
+        }
+
+        function syncStream(list) {
+            var box = list.parentNode.querySelector('.ppc-stream');
+            if (!box) return;
+            var db = list.querySelector('input[data-slug="mysql_dump"]:checked, input[data-slug="pg_dump"]:checked');
+            box.style.display = db ? '' : 'none';
+        }
+
+        function wire(list) {
+            if (list.dataset.ppcWired) return;
+            list.dataset.ppcWired = '1';
+            var dragging = null;
+
+            list.addEventListener('dragstart', function (e) {
+                var card = e.target.closest('.ppc-card');
+                if (!card) return;
+                dragging = card;
+                card.classList.add('ppc-dragging');
+                card.style.opacity = '0.4';
+                e.dataTransfer.effectAllowed = 'move';
+                // Firefox will not start a drag without data set
+                e.dataTransfer.setData('text/plain', '');
+            });
+
+            list.addEventListener('dragend', function () {
+                if (!dragging) return;
+                dragging.classList.remove('ppc-dragging');
+                dragging.style.opacity = '';
+                dragging = null;
+                renumber(list);
+            });
+
+            list.addEventListener('dragover', function (e) {
+                if (!dragging) return;
+                e.preventDefault();
+                var after = cardAfter(list, e.clientX, e.clientY);
+                if (after === dragging) return;
+                if (after) { list.insertBefore(dragging, after); }
+                else { list.appendChild(dragging); }
+            });
+
+            // Checking a card changes the sequence, so the numbers follow.
+            list.addEventListener('change', function (e) {
+                if (e.target.type !== 'checkbox') return;
+                var card = e.target.closest('.ppc-card');
+                if (card) {
+                    card.classList.toggle('border-primary', e.target.checked);
+                    card.classList.toggle('bg-primary-subtle', e.target.checked);
+                }
+                renumber(list);
+                syncStream(list);
+            });
+
+            renumber(list);
+            syncStream(list);
+        }
+
+        function wireAll() { document.querySelectorAll('.ppc-sortable').forEach(wire); }
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', wireAll);
+        } else {
+            wireAll();
+        }
+        // Plan forms are revealed rather than loaded, so pick up any that were
+        // hidden when the page first settled.
+        document.addEventListener('click', function () { setTimeout(wireAll, 50); });
+    })();
+
     function showCreatePlan() {
         var grid = document.getElementById('schedule-cards-grid');
         var solo = document.getElementById('add-plan-card-solo');
@@ -1581,8 +1965,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                 $schedSummary .= ' @ ' . htmlspecialchars($plan['times']);
             }
             if ($freq === 'weekly' && isset($plan['day_of_week'])) {
-                $dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-                $schedSummary = ($dayNames[$plan['day_of_week']] ?? '') . 's @ ' . htmlspecialchars($plan['times'] ?? '00:00');
+                $schedSummary = \BBS\Services\SchedulerService::daysOfWeekLabel($plan['day_of_week']) . ' @ ' . htmlspecialchars($plan['times'] ?? '00:00');
             }
             if ($freq === 'monthly' && isset($plan['day_of_month'])) {
                 $dom = $plan['day_of_month'];
@@ -1595,15 +1978,24 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
         <div class="col-md-6 col-lg-4">
             <div class="card border-0 shadow-sm h-100 schedule-card" style="overflow: visible;">
                 <div class="card-body p-3 position-relative">
-                    <div class="dropdown position-absolute" style="top:8px;right:8px;z-index:2147483647;">
+                    <div class="dropdown position-absolute" style="top:8px;right:8px;z-index:2;">
                         <button class="btn btn-sm btn-link text-muted p-1 border-0" type="button" data-bs-toggle="dropdown" data-bs-strategy="fixed" aria-expanded="false">
                             <i class="bi bi-three-dots-vertical"></i>
                         </button>
                         <ul class="dropdown-menu dropdown-menu-end" style="z-index:2147483647;">
                             <li>
+                                <button type="button" class="dropdown-item" onclick="openNotes('plan', <?= $plan['id'] ?>, <?= htmlspecialchars(json_encode($plan['name'])) ?>, this)" data-notes="<?= htmlspecialchars($plan['notes'] ?? '') ?>" data-notes-meta="<?= !empty($plan['notes_updated_at']) ? htmlspecialchars(\BBS\Core\TimeHelper::format($plan['notes_updated_at'], 'M j, g:i A') . (!empty($usersById[$plan['notes_updated_by']] ?? null) ? ' by ' . $usersById[$plan['notes_updated_by']] : '')) : '' ?>"><i class="bi bi-journal-text me-2"></i>Notes<?= !empty($plan['notes']) ? ' <i class="bi bi-circle-fill text-warning" style="font-size:.4rem;vertical-align:middle;"></i>' : '' ?></button>
+                            </li>
+                            <li>
                                 <form method="POST" action="/plans/<?= $plan['id'] ?>/trigger">
                                     <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                                     <button type="submit" class="dropdown-item"><i class="bi bi-play-fill text-success me-2"></i>Run Now</button>
+                                </form>
+                            </li>
+                            <li>
+                                <form method="POST" action="/plans/<?= $plan['id'] ?>/dry-run">
+                                    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                                    <button type="submit" class="dropdown-item" title="Test what would be backed up — applies all exclude patterns, writes nothing to the repository"><i class="bi bi-eyeglasses text-info me-2"></i>Dry Run</button>
                                 </form>
                             </li>
                             <?php if ($plan['schedule_id']): ?>
@@ -1640,7 +2032,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                             <span class="schedule-id">#<?= $plan['id'] ?></span>
                         </div>
                         <div class="flex-grow-1 min-width-0">
-                            <h6 class="mb-1 fw-bold"><?= htmlspecialchars($plan['name']) ?></h6>
+                            <h6 class="mb-1 fw-bold"><?= htmlspecialchars($plan['name']) ?><?php if (!empty($plan['notes'])): ?> <i class="bi bi-journal-text text-warning small" title="<?= htmlspecialchars(mb_substr($plan['notes'], 0, 200)) ?>"></i><?php endif; ?></h6>
                             <div class="small text-muted">
                                 <i class="bi bi-clock me-1"></i><?= $schedSummary ?>
                             </div>
@@ -1656,7 +2048,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
             </div>
         </div>
         <?php endforeach; ?>
-        <?php if (!empty($repositories)): ?>
+        <?php if (!empty($repositories) && $canManagePlans): ?>
         <div class="col-md-6 col-lg-4">
             <div class="card border-0 shadow-sm h-100 schedule-card card-dashed" id="add-plan-card" onclick="showCreatePlan()">
                 <div class="card-body d-flex flex-column align-items-center justify-content-center text-muted p-4">
@@ -1668,7 +2060,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
         <?php endif; ?>
     </div>
     <?php endif; ?>
-    <?php if (empty($plans) && !empty($repositories)): ?>
+    <?php if (empty($plans) && !empty($repositories) && $canManagePlans): ?>
     <div id="add-plan-card-solo" style="cursor:pointer;" onclick="showCreatePlan()">
         <div class="card border-0 shadow-sm mb-4 card-dashed">
             <div class="card-body d-flex flex-column align-items-center justify-content-center text-muted p-4">
@@ -1716,7 +2108,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                     <?php
                     $editFreq = $plan['frequency'] ?? 'daily';
                     $editTimes = $plan['times'] ?? '';
-                    $editDow = $plan['day_of_week'] ?? 1;
+                    $editDays = \BBS\Services\SchedulerService::parseDaysOfWeek($plan['day_of_week'] ?? '') ?: [1];
                     $editDom = $plan['day_of_month'] ?? '1';
                     // Parse times to get selected hours and minute offset
                     $editTimeList = array_filter(array_map('trim', explode(',', $editTimes)));
@@ -1741,6 +2133,8 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                 <option value="weekly" <?= $editFreq === 'weekly' ? 'selected' : '' ?>>Weekly</option>
                                 <option value="monthly" <?= $editFreq === 'monthly' ? 'selected' : '' ?>>Monthly</option>
                             </select>
+                            <?php $editTz = $plan['schedule_timezone'] ?: 'UTC'; $viewerTzNote = $_SESSION['timezone'] ?? ''; ?>
+                            <div class="form-text schedule-tz-note">Times are in <strong><?= htmlspecialchars($editTz) ?></strong><?= $viewerTzNote && $viewerTzNote !== $editTz ? ' (the client profile\'s zone; the calendar shows them in yours, ' . htmlspecialchars($viewerTzNote) . ')' : '' ?>.</div>
                         </div>
                     </div>
 
@@ -1793,15 +2187,15 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                     </div>
 
                     <div class="row mb-3 schedule-weekly-row <?= $editFreq !== 'weekly' ? 'd-none' : '' ?>">
-                        <label class="col-md-3 col-form-label fw-semibold"><i class="bi bi-calendar-week me-1"></i> Day & Time</label>
+                        <label class="col-md-3 col-form-label fw-semibold"><i class="bi bi-calendar-week me-1"></i> Days & Time</label>
                         <div class="col-md-9">
                             <div class="btn-group btn-group-sm mb-2 schedule-day-btns">
                                 <?php $dayLabels = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']; ?>
                                 <?php foreach ($dayLabels as $di => $dl): ?>
-                                <button type="button" class="btn <?= (int)$editDow === $di ? 'btn-primary active' : 'btn-outline-primary' ?> day-btn" data-day="<?= $di ?>"><?= $dl ?></button>
+                                <button type="button" class="btn <?= in_array($di, $editDays, true) ? 'btn-primary active' : 'btn-outline-primary' ?> day-btn" data-day="<?= $di ?>"><?= $dl ?></button>
                                 <?php endforeach; ?>
                             </div>
-                            <input type="hidden" name="day_of_week" class="schedule-dow-hidden" value="<?= (int)$editDow ?>">
+                            <input type="hidden" name="day_of_week" class="schedule-dow-hidden" value="<?= implode(',', $editDays) ?>">
                             <div class="input-group" style="max-width:300px">
                                 <span class="input-group-text">@ time of day</span>
                                 <input type="time" class="form-control schedule-time-input" value="<?= htmlspecialchars(trim(explode(',', $editTimes ?: '00:00')[0])) ?>">
@@ -1836,7 +2230,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                         <label class="col-md-3 col-form-label fw-semibold">Repository</label>
                         <div class="col-md-6">
                             <select class="form-select" name="repository_id">
-                                <?php foreach ($repositories as $repo): ?>
+                                <?php foreach ($repositories as $repo): if (!empty($repo['read_only'])) continue; ?>
                                 <option value="<?= $repo['id'] ?>" <?= $repo['id'] == $plan['repository_id'] ? 'selected' : '' ?>><?= htmlspecialchars($repo['name']) ?> (#<?= $repo['id'] ?>)</option>
                                 <?php endforeach; ?>
                             </select>
@@ -1926,6 +2320,21 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                         <input class="form-check-input edit-borg-opt" type="checkbox" id="editOptNoAcl<?= $plan['id'] ?>" <?= str_contains($editOpts, '--noacls') ? 'checked' : '' ?>>
                                         <label class="form-check-label" for="editOptNoAcl<?= $plan['id'] ?>">Skip ACLs</label>
                                     </div>
+                                    <?php $snapCapable = !empty($agent['snapshot_capable']); $snapReason = json_decode($agent['snapshot_support'] ?? '{}', true)['reason'] ?? 'the agent has not reported its filesystem yet'; ?>
+                                    <input type="hidden" name="snapshot_present" value="1">
+                                    <div class="form-check" title="<?= $snapCapable ? 'The agent takes a snapshot of each source volume, backs up from it, then removes it. Volumes it cannot snapshot are backed up live.' : 'Not available on this client: ' . htmlspecialchars($snapReason) ?>">
+                                        <input class="form-check-input" type="checkbox" name="snapshot" id="editOptSnapshot<?= $plan['id'] ?>" value="1" <?= !empty($plan['snapshot']) ? 'checked' : '' ?> <?= $snapCapable || !empty($plan['snapshot']) ? '' : 'disabled' ?>>
+                                        <label class="form-check-label" for="editOptSnapshot<?= $plan['id'] ?>">Back up from a snapshot <i class="bi bi-info-circle text-muted small"></i></label>
+                                    </div>
+                                    <div class="d-flex align-items-center gap-2 mt-2" title="How much CPU and disk the backup may take from other work on the client. Low runs borg with nice 10 and best-effort I/O; Idle runs it only when nothing else wants the CPU or disk. Linux and macOS; Windows ignores it.">
+                                        <label class="form-label mb-0 small" for="editOptPriority<?= $plan['id'] ?>">Priority</label>
+                                        <select class="form-select form-select-sm w-auto" name="priority" id="editOptPriority<?= $plan['id'] ?>">
+                                            <?php foreach (['normal' => 'Normal', 'low' => 'Low', 'idle' => 'Idle'] as $pv => $pl): ?>
+                                            <option value="<?= $pv ?>" <?= ($plan['priority'] ?? 'normal') === $pv ? 'selected' : '' ?>><?= $pl ?></option>
+                                            <?php endforeach; ?>
+                                        </select>
+                                        <i class="bi bi-info-circle text-muted small"></i>
+                                    </div>
                                 </div>
                             </div>
                             <div class="mt-2">
@@ -1951,7 +2360,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                 <input type="text" class="form-control form-control-sm font-monospace edit-adv-field" name="advanced_options"
                                        value="<?= htmlspecialchars($customOpts) ?>"
                                        placeholder="e.g. --pattern +home/*/docs/** --pattern -home/**">
-                                <div class="form-text">Checkboxes above add/remove flags here. You can also type custom borg options.</div>
+                                <div class="form-text">Checkboxes above add/remove flags here. You can also type other <code>borg create</code> options such as <code>--pattern</code>, <code>--exclude-if-present</code> or <code>--chunker-params</code>. Options that make borg run a program are not accepted.</div>
                             </div>
                         </div>
                     </div>
@@ -1960,55 +2369,46 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                         <label class="col-md-3 col-form-label fw-semibold">Prune Retention</label>
                         <div class="col-md-9">
                             <div class="row g-2">
-                                <div class="col"><label class="form-label small text-muted">Minutes</label><input type="number" class="form-control" name="prune_minutes" value="<?= $plan['prune_minutes'] ?>" min="0"></div>
-                                <div class="col"><label class="form-label small text-muted">Hours</label><input type="number" class="form-control" name="prune_hours" value="<?= $plan['prune_hours'] ?>" min="0"></div>
-                                <div class="col"><label class="form-label small text-muted">Days</label><input type="number" class="form-control" name="prune_days" value="<?= $plan['prune_days'] ?>" min="0"></div>
-                                <div class="col"><label class="form-label small text-muted">Weeks</label><input type="number" class="form-control" name="prune_weeks" value="<?= $plan['prune_weeks'] ?>" min="0"></div>
-                                <div class="col"><label class="form-label small text-muted">Months</label><input type="number" class="form-control" name="prune_months" value="<?= $plan['prune_months'] ?>" min="0"></div>
-                                <div class="col"><label class="form-label small text-muted">Years</label><input type="number" class="form-control" name="prune_years" value="<?= $plan['prune_years'] ?>" min="0"></div>
+                                <div class="col"><label class="form-label small text-muted">Minutes</label><input type="number" class="form-control" name="prune_minutes" value="<?= $plan['prune_minutes'] ?>" min="-1" title="Number to keep. 0 disables this rule; -1 keeps them all."></div>
+                                <div class="col"><label class="form-label small text-muted">Hours</label><input type="number" class="form-control" name="prune_hours" value="<?= $plan['prune_hours'] ?>" min="-1" title="Number to keep. 0 disables this rule; -1 keeps them all."></div>
+                                <div class="col"><label class="form-label small text-muted">Days</label><input type="number" class="form-control" name="prune_days" value="<?= $plan['prune_days'] ?>" min="-1" title="Number to keep. 0 disables this rule; -1 keeps them all."></div>
+                                <div class="col"><label class="form-label small text-muted">Weeks</label><input type="number" class="form-control" name="prune_weeks" value="<?= $plan['prune_weeks'] ?>" min="-1" title="Number to keep. 0 disables this rule; -1 keeps them all."></div>
+                                <div class="col"><label class="form-label small text-muted">Months</label><input type="number" class="form-control" name="prune_months" value="<?= $plan['prune_months'] ?>" min="-1" title="Number to keep. 0 disables this rule; -1 keeps them all."></div>
+                                <div class="col"><label class="form-label small text-muted">Years</label><input type="number" class="form-control" name="prune_years" value="<?= $plan['prune_years'] ?>" min="-1" title="Number to keep. 0 disables this rule; -1 keeps them all."></div>
                             </div>
                             <div class="form-text">How many archives to keep for each time period.</div>
                         </div>
                     </div>
 
                     <!-- Plugins (edit) -->
-                    <?php
-                    if (!empty($enabledPluginsList) && !empty($pluginConfigs)):
-                        $existingPlanPlugins = $pluginManager->getPlanPlugins($plan['id']);
+                    <?php if (!empty($planPluginConfigCards)):
+                        $checkedIds = array_map(fn($epp) => (int) $epp['plugin_config_id'], $pluginManager->getPlanPlugins($plan['id']));
                     ?>
                     <div class="row mb-3">
                         <label class="col-md-3 col-form-label fw-semibold">Plugins</label>
                         <div class="col-md-9">
-                            <?php foreach ($enabledPluginsList as $plugin):
-                                if (($plugin['slug'] ?? '') === 's3_sync') continue;
-                                $configs = array_filter($pluginConfigs, fn($c) => $c['plugin_id'] == $plugin['id']);
-                                if (empty($configs)) continue;
-                                $currentConfigId = null;
-                                foreach ($existingPlanPlugins as $epp) {
-                                    if ($epp['plugin_id'] == $plugin['id']) $currentConfigId = $epp['plugin_config_id'] ?? null;
-                                }
-                            ?>
-                            <div class="mb-2">
-                                <label class="form-label small fw-semibold"><?= htmlspecialchars($plugin['name']) ?></label>
-                                <select name="plugin_config[<?= $plugin['id'] ?>]" class="form-select form-select-sm">
-                                    <option value="">-- None --</option>
-                                    <?php foreach ($configs as $pcfg): ?>
-                                    <option value="<?= $pcfg['id'] ?>" <?= $pcfg['id'] == $currentConfigId ? 'selected' : '' ?>><?= htmlspecialchars($pcfg['name']) ?></option>
-                                    <?php endforeach; ?>
-                                </select>
-                            </div>
-                            <?php endforeach; ?>
-                            <small class="text-muted"><a href="?tab=plugins">Manage plugin configurations</a></small>
+                            <div class="form-text mb-2">Run these before each backup &mdash; check any number, including two of the same engine. They run left to right; drag a card to change the order.</div>
+                            <?php $renderPluginCards($checkedIds); ?>
+                            <?php $renderStreamOption($plan); ?>
+                            <small class="text-muted d-block mt-2"><a href="?tab=plugins">Manage plugin configurations</a></small>
                         </div>
                     </div>
                     <?php endif; ?>
 
                     <div class="row">
-                        <div class="col-md-6 offset-md-3">
+                        <div class="col-md-9 offset-md-3 d-flex align-items-center">
                             <button type="submit" class="btn btn-primary"><i class="bi bi-check-lg me-1"></i> Save Changes</button>
                             <button type="button" class="btn btn-outline-secondary ms-2" data-bs-toggle="collapse" data-bs-target="#edit-plan-<?= $plan['id'] ?>">Cancel</button>
+                            <!-- Deleting posts to its own form (declared just below,
+                                 since forms can't nest) via the form= attribute. The
+                                 plan menu has a Delete too, but this is where people
+                                 look once they already have the plan open (#390). -->
+                            <button type="submit" form="delete-plan-<?= $plan['id'] ?>" class="btn btn-outline-danger ms-auto"><i class="bi bi-trash me-1"></i> Delete Plan</button>
                         </div>
                     </div>
+                </form>
+                <form id="delete-plan-<?= $plan['id'] ?>" method="POST" action="/plans/<?= $plan['id'] ?>/delete" data-confirm="Delete this backup plan and its schedule?" data-confirm-danger>
+                    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                 </form>
             </div>
         </div>
@@ -2061,10 +2461,13 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                             <option value="15min">Every 15 Minutes</option>
                             <option value="30min">Every 30 Minutes</option>
                             <option value="hourly">Every Hour</option>
-                            <option value="daily" selected>Every Day</option>
-                            <option value="weekly">Weekly</option>
-                            <option value="monthly">Monthly</option>
+                            <?php $pf = $profileDefaults['frequency'] ?? 'daily'; ?>
+                            <option value="daily" <?= $pf === 'daily' ? 'selected' : '' ?>>Every Day</option>
+                            <option value="weekly" <?= $pf === 'weekly' ? 'selected' : '' ?>>Weekly</option>
+                            <option value="monthly" <?= $pf === 'monthly' ? 'selected' : '' ?>>Monthly</option>
                         </select>
+                        <?php $newTz = $planTimezone ?? 'UTC'; $viewerTzNote = $_SESSION['timezone'] ?? ''; ?>
+                        <div class="form-text schedule-tz-note">Times are in <strong><?= htmlspecialchars($newTz) ?></strong><?= $viewerTzNote && $viewerTzNote !== $newTz ? ' (the client profile\'s zone; the calendar shows them in yours, ' . htmlspecialchars($viewerTzNote) . ')' : '' ?>.</div>
                     </div>
                 </div>
 
@@ -2112,12 +2515,12 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                             <input type="number" class="form-control schedule-minute-offset" min="0" max="59" value="0">
                             <span class="input-group-text">min past the hour</span>
                         </div>
-                        <input type="hidden" name="times" class="schedule-times-hidden" value="01:00">
+                        <input type="hidden" name="times" class="schedule-times-hidden" value="<?= htmlspecialchars($profileDefaults['times'] ?? '01:00') ?>">
                     </div>
                 </div>
 
                 <div class="row mb-3 schedule-weekly-row d-none">
-                    <label class="col-md-3 col-form-label fw-semibold"><i class="bi bi-calendar-week me-1"></i> Day & Time</label>
+                    <label class="col-md-3 col-form-label fw-semibold"><i class="bi bi-calendar-week me-1"></i> Days & Time</label>
                     <div class="col-md-9">
                         <div class="btn-group btn-group-sm mb-2 schedule-day-btns">
                             <button type="button" class="btn btn-outline-primary day-btn" data-day="0">Sun</button>
@@ -2163,7 +2566,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                     <label class="col-md-3 col-form-label fw-semibold">Repository</label>
                     <div class="col-md-6">
                         <select class="form-select" name="repository_id" required>
-                            <?php foreach ($repositories as $repo): ?>
+                            <?php foreach ($repositories as $repo): if (!empty($repo['read_only'])) continue; ?>
                             <option value="<?= $repo['id'] ?>"><?= htmlspecialchars($repo['name']) ?> (#<?= $repo['id'] ?>)</option>
                             <?php endforeach; ?>
                         </select>
@@ -2178,7 +2581,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                         <select class="form-select" id="templateSelect">
                             <option value="">None (manual configuration)</option>
                             <?php foreach ($templates as $tpl): ?>
-                            <option value="<?= $tpl['id'] ?>"><?= htmlspecialchars($tpl['name']) ?> — <?= htmlspecialchars($tpl['description'] ?? '') ?></option>
+                            <option value="<?= $tpl['id'] ?>" <?= (int) ($profileDefaults['template_id'] ?? 0) === (int) $tpl['id'] ? 'selected' : '' ?>><?= htmlspecialchars($tpl['name']) ?> — <?= htmlspecialchars($tpl['description'] ?? '') ?></option>
                             <?php endforeach; ?>
                         </select>
                     </div>
@@ -2191,7 +2594,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                     <label class="col-md-3 col-form-label fw-semibold">Backup Directories</label>
                     <div class="col-md-6">
                         <?php if ($isWindows): ?>
-                        <textarea class="form-control" name="directories" id="directoriesInput" rows="3" required placeholder="C:\Users&#10;C:\Projects&#10;C:\inetpub\wwwroot"></textarea>
+                        <textarea class="form-control" name="directories" id="directoriesInput" rows="3" required placeholder="C:\Users&#10;C:\Projects&#10;C:\inetpub\wwwroot"><?= htmlspecialchars($profileDefaults['directories'] ?? '') ?></textarea>
                         <div class="mt-2 d-flex flex-wrap align-items-center gap-1">
                             <?php $agentOnline = ($agent['status'] ?? '') === 'online'; ?>
                             <?php if ($agentOnline): ?>
@@ -2210,7 +2613,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                             <button type="button" class="btn btn-sm btn-outline-secondary dir-btn" data-dir="C:\ProgramData">C:\ProgramData</button>
                         </div>
                         <?php else: ?>
-                        <textarea class="form-control" name="directories" id="directoriesInput" rows="3" required placeholder="/home&#10;/etc&#10;/var/www"></textarea>
+                        <textarea class="form-control" name="directories" id="directoriesInput" rows="3" required placeholder="/home&#10;/etc&#10;/var/www"><?= htmlspecialchars($profileDefaults['directories'] ?? '') ?></textarea>
                         <div class="mt-2 d-flex flex-wrap align-items-center gap-1">
                             <?php $agentOnline = ($agent['status'] ?? '') === 'online'; ?>
                             <?php if ($agentOnline): ?>
@@ -2238,7 +2641,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                 <div class="row mb-3">
                     <label class="col-md-3 col-form-label fw-semibold">Exclude Patterns</label>
                     <div class="col-md-6">
-                        <textarea class="form-control" name="excludes" id="excludesInput" rows="3" placeholder="*.tmp&#10;*.log&#10;*.cache&#10;/home/*/tmp"></textarea>
+                        <textarea class="form-control" name="excludes" id="excludesInput" rows="3" placeholder="*.tmp&#10;*.log&#10;*.cache&#10;/home/*/tmp"><?= htmlspecialchars($profileDefaults['excludes'] ?? '') ?></textarea>
                     </div>
                     <div class="col-md-3 form-text pt-2">
                         One pattern per line.<br>
@@ -2283,6 +2686,20 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                     <input class="form-check-input borg-opt" type="checkbox" name="opt_no_acls" id="optNoAcls" value="1">
                                     <label class="form-check-label" for="optNoAcls">Skip ACLs</label>
                                 </div>
+                                <?php $snapCapable = !empty($agent['snapshot_capable']); $snapMethods = $snapCapable ? implode(', ', array_map('strtoupper', json_decode($agent['snapshot_support'] ?? '{}', true)['methods'] ?? [])) : ''; $snapReason = json_decode($agent['snapshot_support'] ?? '{}', true)['reason'] ?? 'the agent has not reported its filesystem yet'; ?>
+                                <div class="form-check" title="<?= $snapCapable ? 'The agent takes a snapshot of each source volume (' . htmlspecialchars($snapMethods) . '), backs up from it, then removes it. Volumes it cannot snapshot are backed up live.' : 'Not available on this client: ' . htmlspecialchars($snapReason) ?>">
+                                    <input class="form-check-input" type="checkbox" name="snapshot" id="optSnapshot" value="1" <?= $snapCapable ? '' : 'disabled' ?>>
+                                    <label class="form-check-label" for="optSnapshot">Back up from a snapshot <i class="bi bi-info-circle text-muted small"></i></label>
+                                </div>
+                                <div class="d-flex align-items-center gap-2 mt-2" title="How much CPU and disk the backup may take from other work on the client. Low runs borg with nice 10 and best-effort I/O; Idle runs it only when nothing else wants the CPU or disk. Linux and macOS; Windows ignores it.">
+                                    <label class="form-label mb-0 small" for="optPriority">Priority</label>
+                                    <select class="form-select form-select-sm w-auto" name="priority" id="optPriority">
+                                        <option value="normal">Normal</option>
+                                        <option value="low">Low</option>
+                                        <option value="idle">Idle</option>
+                                    </select>
+                                    <i class="bi bi-info-circle text-muted small"></i>
+                                </div>
                             </div>
                         </div>
                         <div class="mt-2">
@@ -2298,7 +2715,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                             <label class="form-label small text-muted">Advanced Borg Options</label>
                             <input type="text" class="form-control form-control-sm font-monospace" name="advanced_options" id="advancedOptionsField"
                                    placeholder="e.g. --pattern +home/*/docs/** --pattern -home/**">
-                            <div class="form-text">Checkboxes above add/remove flags here. You can also type custom borg options.</div>
+                            <div class="form-text">Checkboxes above add/remove flags here. You can also type other <code>borg create</code> options such as <code>--pattern</code>, <code>--exclude-if-present</code> or <code>--chunker-params</code>. Options that make borg run a program are not accepted.</div>
                         </div>
                     </div>
                 </div>
@@ -2309,27 +2726,27 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                         <div class="row g-2">
                             <div class="col">
                                 <label class="form-label small text-muted">Minutes</label>
-                                <input type="number" class="form-control" name="prune_minutes" value="0" min="0">
+                                <input type="number" class="form-control" name="prune_minutes" value="<?= htmlspecialchars((string) ($profileDefaults['prune_minutes'] ?? 0)) ?>" min="-1" title="Number to keep. 0 disables this rule; -1 keeps them all.">
                             </div>
                             <div class="col">
                                 <label class="form-label small text-muted">Hours</label>
-                                <input type="number" class="form-control" name="prune_hours" value="0" min="0">
+                                <input type="number" class="form-control" name="prune_hours" value="<?= htmlspecialchars((string) ($profileDefaults['prune_hours'] ?? 0)) ?>" min="-1" title="Number to keep. 0 disables this rule; -1 keeps them all.">
                             </div>
                             <div class="col">
                                 <label class="form-label small text-muted">Days</label>
-                                <input type="number" class="form-control" name="prune_days" value="7" min="0">
+                                <input type="number" class="form-control" name="prune_days" value="<?= htmlspecialchars((string) ($profileDefaults['prune_days'] ?? 7)) ?>" min="-1" title="Number to keep. 0 disables this rule; -1 keeps them all.">
                             </div>
                             <div class="col">
                                 <label class="form-label small text-muted">Weeks</label>
-                                <input type="number" class="form-control" name="prune_weeks" value="4" min="0">
+                                <input type="number" class="form-control" name="prune_weeks" value="<?= htmlspecialchars((string) ($profileDefaults['prune_weeks'] ?? 4)) ?>" min="-1" title="Number to keep. 0 disables this rule; -1 keeps them all.">
                             </div>
                             <div class="col">
                                 <label class="form-label small text-muted">Months</label>
-                                <input type="number" class="form-control" name="prune_months" value="6" min="0">
+                                <input type="number" class="form-control" name="prune_months" value="<?= htmlspecialchars((string) ($profileDefaults['prune_months'] ?? 6)) ?>" min="-1" title="Number to keep. 0 disables this rule; -1 keeps them all.">
                             </div>
                             <div class="col">
                                 <label class="form-label small text-muted">Years</label>
-                                <input type="number" class="form-control" name="prune_years" value="0" min="0">
+                                <input type="number" class="form-control" name="prune_years" value="<?= htmlspecialchars((string) ($profileDefaults['prune_years'] ?? 0)) ?>" min="-1" title="Number to keep. 0 disables this rule; -1 keeps them all.">
                             </div>
                         </div>
                         <div class="form-text">How many archives to keep for each time period.</div>
@@ -2337,26 +2754,14 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                 </div>
 
                 <!-- Plugins -->
-                <?php if (!empty($enabledPluginsList) && !empty($pluginConfigs)): ?>
+                <?php if (!empty($planPluginConfigCards)): ?>
                 <div class="row mb-3">
                     <label class="col-md-3 col-form-label fw-semibold">Plugins</label>
                     <div class="col-md-9">
-                        <?php foreach ($enabledPluginsList as $plugin):
-                            if (($plugin['slug'] ?? '') === 's3_sync') continue;
-                            $configs = array_filter($pluginConfigs, fn($c) => $c['plugin_id'] == $plugin['id']);
-                            if (empty($configs)) continue;
-                        ?>
-                        <div class="mb-2">
-                            <label class="form-label small fw-semibold"><?= htmlspecialchars($plugin['name']) ?></label>
-                            <select name="plugin_config[<?= $plugin['id'] ?>]" class="form-select form-select-sm">
-                                <option value="">-- None --</option>
-                                <?php foreach ($configs as $pcfg): ?>
-                                <option value="<?= $pcfg['id'] ?>"><?= htmlspecialchars($pcfg['name']) ?></option>
-                                <?php endforeach; ?>
-                            </select>
-                        </div>
-                        <?php endforeach; ?>
-                        <small class="text-muted"><a href="?tab=plugins">Manage plugin configurations</a></small>
+                        <div class="form-text mb-2">Run these before each backup &mdash; check any number, including two of the same engine. They run left to right; drag a card to change the order.</div>
+                        <?php $renderPluginCards([]); ?>
+                        <?php $renderStreamOption(null); ?>
+                        <small class="text-muted d-block mt-2"><a href="?tab=plugins">Manage plugin configurations</a></small>
                     </div>
                 </div>
                 <?php endif; ?>
@@ -2436,18 +2841,18 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
             syncHourly();
         }
 
-        // Day-of-week toggle (single select)
+        // Day-of-week toggles (weekly, several days allowed, at least one stays on)
         container.querySelectorAll('.schedule-day-btns .day-btn').forEach(btn => {
             btn.addEventListener('click', function(e) {
                 e.preventDefault();
-                this.parentElement.querySelectorAll('.btn').forEach(b => {
-                    b.classList.remove('active', 'btn-primary');
-                    b.classList.add('btn-outline-primary');
-                });
-                this.classList.add('active', 'btn-primary');
-                this.classList.remove('btn-outline-primary');
+                this.blur();
+                const group = this.parentElement;
+                if (this.classList.contains('active') && group.querySelectorAll('.day-btn.active').length === 1) return;
+                this.classList.toggle('active');
+                this.classList.toggle('btn-primary');
+                this.classList.toggle('btn-outline-primary');
                 const hidden = container.querySelector('.schedule-dow-hidden');
-                if (hidden) hidden.value = this.dataset.day;
+                if (hidden) hidden.value = [...group.querySelectorAll('.day-btn.active')].map(b => b.dataset.day).join(',');
             });
         });
 
@@ -2727,6 +3132,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
         'mysql_dump' => '/images/mysql.png',
         'pg_dump' => '/images/postgresql.svg',
         'mongo_dump' => '/images/mongodb.svg',
+        'mssql_dump' => '/images/mssql.svg',
         'interworx' => '/images/interworx-icon.png',
     ];
     $randomPass = substr(str_shuffle('abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'), 0, 20);
@@ -2792,6 +3198,10 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                 if (!empty($cfgData['host'])) $summaryParts[] = $cfgData['host'] . (!empty($cfgData['port']) && $cfgData['port'] != $defaultPort ? ':' . $cfgData['port'] : '');
                 if (!empty($cfgData['user'])) $summaryParts[] = 'user: ' . $cfgData['user'];
                 if (!empty($cfgData['databases'])) $summaryParts[] = 'db: ' . $cfgData['databases'];
+                if ($plugin['slug'] === 's3_sync') {
+                    $offsiteDescribe = $offsiteDescribe ?? new \BBS\Services\S3SyncService();
+                    $summaryParts[] = $offsiteDescribe->describeDestination($cfgData)['label'];
+                }
             ?>
             <div class="border rounded p-3 mb-2" style="cursor:pointer;" onclick="var el=document.getElementById('editConfig<?= $cfg['id'] ?>');if(!el.classList.contains('show')){new bootstrap.Collapse(el).show();}">
                 <div class="d-flex justify-content-between align-items-center">
@@ -2802,6 +3212,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                         <?php endif; ?>
                     </div>
                     <div class="d-flex align-items-center gap-1" onclick="event.stopPropagation();">
+                        <button type="button" class="btn btn-sm btn-outline-secondary border-0" onclick="openNotes('plugin', <?= $cfg['id'] ?>, <?= htmlspecialchars(json_encode($cfg['name'])) ?>, this)" data-notes="<?= htmlspecialchars($cfg['notes'] ?? '') ?>" data-notes-meta="<?= !empty($cfg['notes_updated_at']) ? htmlspecialchars(\BBS\Core\TimeHelper::format($cfg['notes_updated_at'], 'M j, g:i A') . (!empty($usersById[$cfg['notes_updated_by']] ?? null) ? ' by ' . $usersById[$cfg['notes_updated_by']] : '')) : '' ?>" title="<?= !empty($cfg['notes']) ? 'View notes' : 'Add a note' ?>"><i class="bi bi-journal-text<?= !empty($cfg['notes']) ? ' text-warning' : '' ?>"></i></button>
                         <button type="button" class="btn btn-sm btn-outline-primary border-0" onclick="testPluginConfig(<?= $agent['id'] ?>, <?= $cfg['id'] ?>)" title="Test"><i class="bi bi-lightning"></i></button>
                         <button type="button" class="btn btn-sm btn-outline-secondary border-0" onclick="new bootstrap.Collapse(document.getElementById('editConfig<?= $cfg['id'] ?>')).toggle();" title="Edit"><i class="bi bi-pencil"></i></button>
                         <form method="POST" action="/clients/<?= $agent['id'] ?>/plugin-configs/<?= $cfg['id'] ?>/delete" class="d-inline" data-confirm="Delete this configuration?" data-confirm-danger>
@@ -2811,7 +3222,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                     </div>
                 </div>
                 <div id="test-result-<?= $cfg['id'] ?>" class="mt-1"></div>
-                <?php if ($plugin['slug'] === 's3_sync' && ($cfgData['credential_source'] ?? 'global') === 'global' && empty($globalS3Configured)): ?>
+                <?php if ($plugin['slug'] === 's3_sync' && ($cfgData['target_type'] ?? 's3') === 's3' && ($cfgData['credential_source'] ?? 'global') === 'global' && empty($globalS3Configured)): ?>
                 <div class="alert alert-warning small mb-0 mt-2"><i class="bi bi-exclamation-triangle me-1"></i> Global S3 settings are not configured. <a href="/settings#s3">Configure in Settings</a></div>
                 <?php endif; ?>
 
@@ -2847,11 +3258,45 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                 <div class="col"><label class="form-label small fw-semibold mb-1">Extra Options</label><input type="text" class="form-control form-control-sm" name="plugin_config[extra_options]" value="<?= htmlspecialchars($ev['extra_options'] ?? '') ?>"></div>
                             </div>
                         <?php elseif ($plugin['slug'] === 's3_sync'): ?>
-                            <?php $ev = $cfgData; $credSrc = $ev['credential_source'] ?? 'global'; ?>
+                            <?php $ev = $cfgData; $credSrc = $ev['credential_source'] ?? 'global'; $tgt = $ev['target_type'] ?? 's3'; ?>
                             <?php if (\BBS\Core\Config::isHosted()): ?>
+                            <input type="hidden" name="plugin_config[target_type]" value="s3">
                             <input type="hidden" name="plugin_config[credential_source]" value="global">
                             <div class="alert alert-info py-2 small mb-2"><i class="bi bi-info-circle me-1"></i>S3 destination is managed by the platform.</div>
                             <?php else: ?>
+                            <div class="mb-2">
+                                <label class="form-label small fw-semibold mb-1">Destination</label>
+                                <select class="form-select form-select-sm sync-target-select" name="plugin_config[target_type]" id="editTarget<?= $cfg['id'] ?>" title="Where the copy goes. An S3-compatible bucket, a host over SSH (SFTP; rsync.net, a Hetzner Storage Box, any Linux box), or a second disk registered as a storage location.">
+                                    <?php foreach (['s3' => 'S3-compatible storage', 'sftp' => 'SSH host (SFTP)', 'local' => 'Local disk (a storage location)'] as $tv => $tl): ?>
+                                    <option value="<?= $tv ?>" <?= ($tgt) === $tv ? 'selected' : '' ?>><?= $tl ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div class="sync-block sync-block-sftp mb-2">
+                                <label class="form-label small fw-semibold mb-1">SSH host</label>
+                                <?php $sshChoices = $pluginManager->offsiteTargetChoices()['remote_ssh']; ?>
+                                <?php if ($sshChoices): ?>
+                                <select class="form-select form-select-sm" name="plugin_config[remote_ssh_config_id]">
+                                    <?php foreach ($sshChoices as $sid => $slabel): ?>
+                                    <option value="<?= $sid ?>" <?= (string) ($ev['remote_ssh_config_id'] ?? '') === (string) $sid ? 'selected' : '' ?>><?= htmlspecialchars($slabel) ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                                <div class="form-text small">The copy goes to <code>bbs-sync/&lt;client&gt;/&lt;repo&gt;</code> under the host's base path. BorgBase is borg-only and not listed.</div>
+                                <?php else: ?>
+                                <div class="form-text small">No SSH host yet. Add one under <a href="/storage-locations">Storage &rarr; Remote SSH</a>; any host with SFTP works, borg is not required there.</div>
+                                <?php endif; ?>
+                            </div>
+                            <div class="sync-block sync-block-local mb-2">
+                                <label class="form-label small fw-semibold mb-1">Storage location</label>
+                                <?php $locChoices = $pluginManager->offsiteTargetChoices()['storage_locations']; ?>
+                                <select class="form-select form-select-sm" name="plugin_config[storage_location_id]">
+                                    <?php foreach ($locChoices as $lid => $llabel): ?>
+                                    <option value="<?= $lid ?>" <?= (string) ($ev['storage_location_id'] ?? '') === (string) $lid ? 'selected' : '' ?>><?= htmlspecialchars($llabel) ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                                <div class="form-text small">The copy goes to <code>bbs-sync/&lt;client&gt;/&lt;repo&gt;</code> on that location. Pick a different disk from the one the repository lives on.</div>
+                            </div>
+                            <div class="sync-block sync-block-s3">
                             <div class="mb-2">
                                 <div class="form-check form-check-inline"><input class="form-check-input s3-cred-radio" type="radio" name="plugin_config[credential_source]" value="global" id="editS3Global<?= $cfg['id'] ?>" <?= $credSrc === 'global' ? 'checked' : '' ?> data-target="editS3Custom<?= $cfg['id'] ?>"><label class="form-check-label small" for="editS3Global<?= $cfg['id'] ?>">Use Global S3 Settings</label></div>
                                 <div class="form-check form-check-inline"><input class="form-check-input s3-cred-radio" type="radio" name="plugin_config[credential_source]" value="custom" id="editS3CustomRadio<?= $cfg['id'] ?>" <?= $credSrc === 'custom' ? 'checked' : '' ?> data-target="editS3Custom<?= $cfg['id'] ?>"><label class="form-check-label small" for="editS3CustomRadio<?= $cfg['id'] ?>">Custom Credentials</label></div>
@@ -2867,24 +3312,46 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                     <div class="col-6"><label class="form-label small fw-semibold mb-1">Secret Key</label><input type="text" class="form-control form-control-sm" name="plugin_config[secret_key]" placeholder="(unchanged if empty)"></div>
                                 </div>
                             </div>
+                            </div>
                             <?php endif; ?>
                             <div class="row g-2 mb-2">
-                                <div class="col-6"><label class="form-label small fw-semibold mb-1">Path Prefix</label><input type="text" class="form-control form-control-sm" name="plugin_config[path_prefix]" value="<?= htmlspecialchars($ev['path_prefix'] ?? '') ?>"><div class="form-text small">Optional subfolder in bucket</div></div>
+                                <div class="col-6"><label class="form-label small fw-semibold mb-1">Path Prefix</label><input type="text" class="form-control form-control-sm" name="plugin_config[path_prefix]" value="<?= htmlspecialchars($ev['path_prefix'] ?? '') ?>"><div class="form-text small">Optional subfolder on the destination. Default: none for S3, <code>bbs-sync</code> for SSH and local.</div></div>
                                 <div class="col-6"><label class="form-label small fw-semibold mb-1">Bandwidth Limit</label><input type="text" class="form-control form-control-sm" name="plugin_config[bandwidth_limit]" value="<?= htmlspecialchars($ev['bandwidth_limit'] ?? '') ?>"><div class="form-text small">e.g. 50M</div></div>
                             </div>
                         <?php elseif ($plugin['slug'] === 'shell_hook'): ?>
                             <?php $ev = $cfgData; ?>
-                            <div class="row g-2 mb-2">
-                                <div class="col-6"><label class="form-label small fw-semibold mb-1">Pre-backup Script</label><input type="text" class="form-control form-control-sm" name="plugin_config[pre_script]" value="<?= htmlspecialchars($ev['pre_script'] ?? '') ?>"><div class="form-text small">Absolute path to script</div></div>
-                                <div class="col-6"><label class="form-label small fw-semibold mb-1">Post-backup Script</label><input type="text" class="form-control form-control-sm" name="plugin_config[post_script]" value="<?= htmlspecialchars($ev['post_script'] ?? '') ?>"><div class="form-text small">Absolute path to script</div></div>
+                            <?php $evTiming = $ev['post_script_timing'] ?? 'backup'; ?>
+                            <div class="mb-3">
+                                <label class="form-label small fw-semibold mb-1">Pre-backup Script</label>
+                                <input type="text" class="form-control form-control-sm" name="plugin_config[pre_script]" placeholder="/opt/hooks/pre-backup.sh" value="<?= htmlspecialchars($ev['pre_script'] ?? '') ?>">
+                                <div class="form-text small">Runs on the client before borg starts. Leave empty to skip.</div>
                             </div>
-                            <div class="row g-2 mb-2">
-                                <div class="col-auto"><div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[abort_on_failure]" value="1" id="editCfg<?= $cfg['id'] ?>_abort" <?= ($ev['abort_on_failure'] ?? true) ? 'checked' : '' ?>><label class="form-check-label small" for="editCfg<?= $cfg['id'] ?>_abort">Abort backup on failure</label></div></div>
-                                <div class="col"><label class="form-label small fw-semibold mb-1">Timeout (seconds)</label><input type="number" class="form-control form-control-sm" name="plugin_config[timeout]" value="<?= htmlspecialchars($ev['timeout'] ?? 300) ?>"></div>
+                            <div class="mb-3">
+                                <label class="form-label small fw-semibold mb-1">Post-backup Script</label>
+                                <input type="text" class="form-control form-control-sm" name="plugin_config[post_script]" placeholder="/opt/hooks/post-backup.sh" value="<?= htmlspecialchars($ev['post_script'] ?? '') ?>">
+                                <div class="row g-2 mt-1 align-items-center">
+                                    <div class="col-auto"><span class="form-text small mb-0">Run it</span></div>
+                                    <div class="col-auto">
+                                        <select class="form-select form-select-sm" name="plugin_config[post_script_timing]" style="width:auto;">
+                                            <option value="backup" <?= $evTiming !== 'repo_jobs' ? 'selected' : '' ?>>as soon as the backup finishes</option>
+                                            <option value="repo_jobs" <?= $evTiming === 'repo_jobs' ? 'selected' : '' ?>>after prune and offsite sync finish</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="form-text small">Prune and offsite sync run on the BBS server after the client has sent its data, so the first option fires while that work is still going. Pick the second if the script does something the repository can't survive mid-prune — powering down its storage host, say. The client must still be online when it's sent.</div>
+                            </div>
+                            <div class="row g-3 mb-2 align-items-end">
+                                <div class="col-sm-4">
+                                    <label class="form-label small fw-semibold mb-1">Timeout (seconds)</label>
+                                    <input type="number" class="form-control form-control-sm" name="plugin_config[timeout]" value="<?= htmlspecialchars($ev['timeout'] ?? 300) ?>">
+                                </div>
+                                <div class="col-sm-8">
+                                    <div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[abort_on_failure]" value="1" id="editCfg<?= $cfg['id'] ?>_abort" <?= ($ev['abort_on_failure'] ?? true) ? 'checked' : '' ?>><label class="form-check-label small" for="editCfg<?= $cfg['id'] ?>_abort">Abort the backup if the pre-script fails</label></div>
+                                </div>
                             </div>
                             <div class="mb-2">
                                 <div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[expose_passphrase]" value="1" id="editCfg<?= $cfg['id'] ?>_expose" <?= !empty($ev['expose_passphrase']) ? 'checked' : '' ?>><label class="form-check-label small" for="editCfg<?= $cfg['id'] ?>_expose">Expose repository passphrase to script <span class="text-muted">(advanced)</span></label></div>
-                                <div class="form-text small">Exposes <code>BORG_PASSCOMMAND</code> and <code>BORG_REPO</code> so the script can run <code>borg create --content-from-command</code> directly. Credentials are passed via a mode-0600 temp file (not env vars), but only enable this for scripts you've reviewed — see the wiki for details.</div>
+                                <div class="form-text small">Exposes <code>BORG_PASSCOMMAND</code> and <code>BORG_REPO</code> so the script can run <code>borg create --content-from-command</code> directly. Credentials go through a mode-0600 temp file rather than env vars — only enable it for scripts you've reviewed.</div>
                             </div>
                         <?php else: ?>
                             <?php foreach ($schema as $field => $def):
@@ -2895,10 +3362,13 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                 if ($showWhen) {
                                     $swField = array_key_first($showWhen);
                                     $swValue = $showWhen[$swField];
-                                    $showWhenAttr = ' class="plugin-show-when" data-show-field="' . htmlspecialchars($swField) . '" data-show-value="' . htmlspecialchars($swValue) . '"';
+                                    // NOTE: must merge into the div's class attribute — a second
+                                    // class="" attribute is ignored by HTML parsers, which left
+                                    // these fields permanently visible in the edit form.
+                                    $showWhenAttr = ' data-show-field="' . htmlspecialchars($swField) . '" data-show-value="' . htmlspecialchars($swValue) . '"';
                                 }
                             ?>
-                            <div class="mb-2"<?= $showWhenAttr ?>>
+                            <div class="mb-2<?= $showWhen ? ' plugin-show-when' : '' ?>"<?= $showWhenAttr ?>>
                                 <?php if ($def['type'] === 'checkbox'): ?>
                                     <div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[<?= $field ?>]" value="1" id="editCfg<?= $cfg['id'] ?>_<?= $field ?>" <?= $val ? 'checked' : '' ?>><label class="form-check-label small" for="editCfg<?= $cfg['id'] ?>_<?= $field ?>"><?= htmlspecialchars($def['label']) ?></label></div>
                                 <?php elseif ($def['type'] === 'select'): ?>
@@ -2909,8 +3379,19 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                         <?php endforeach; ?>
                                     </select>
                                 <?php else: ?>
+                                    <?php if (!empty($def['picker'])): ?><div class="db-picker-wrap" data-agent-id="<?= (int) $agent['id'] ?>" data-config-id="<?= (int) $cfg['id'] ?>" data-csrf="<?= htmlspecialchars($this->csrfToken()) ?>"><?php endif; ?>
                                     <label class="form-label small fw-semibold mb-1"><?= htmlspecialchars($def['label']) ?></label>
                                     <input type="<?= $def['type'] === 'number' ? 'number' : 'text' ?>" class="form-control form-control-sm" name="plugin_config[<?= $field ?>]" value="<?= !empty($def['sensitive']) ? '' : htmlspecialchars($val) ?>" <?= !empty($def['sensitive']) ? 'placeholder="(unchanged if empty)"' : '' ?>>
+                                    <?php if (!empty($def['picker'])): ?>
+                                        <button type="button" class="btn btn-sm btn-outline-primary mt-2 db-picker-detect"><i class="bi bi-search me-1"></i>Detect databases</button>
+                                        <span class="text-muted small ms-1">uses the saved connection settings</span>
+                                        <div class="db-picker-status"></div>
+                                        <div class="db-picker-panel border rounded p-2 mt-2" hidden>
+                                            <div class="form-check border-bottom pb-1 mb-1"><input class="form-check-input db-picker-all" type="checkbox" id="dbpAll<?= (int) $cfg['id'] ?>"><label class="form-check-label small fw-semibold" for="dbpAll<?= (int) $cfg['id'] ?>">All databases <code>*</code> <span class="text-muted fw-normal">(including databases created later)</span></label></div>
+                                            <div class="db-picker-list" style="max-height:220px;overflow:auto;"></div>
+                                        </div>
+                                        </div>
+                                    <?php endif; ?>
                                 <?php endif; ?>
                                 <?php if (!empty($def['help'])): ?><div class="form-text small"><?= htmlspecialchars($def['help']) ?></div><?php endif; ?>
                             </div>
@@ -2963,15 +3444,49 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                     </div>
                                     <div class="mb-2"><label class="form-label small fw-semibold mb-1">Dump Directory</label><input type="text" class="form-control form-control-sm" name="plugin_config[dump_dir]" value="<?= $plugin['slug'] === 'pg_dump' ? '/home/bbs/pgdump' : '/home/bbs/mysql' ?>"></div>
                                     <div class="row g-2 mb-2">
-                                        <div class="col-auto"><div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[compress]" value="1" id="newCfg<?= $plugin['id'] ?>_compress" checked><label class="form-check-label small" for="newCfg<?= $plugin['id'] ?>_compress">Compress</label></div></div>
+                                        <div class="col-auto"><div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[compress]" value="1" id="newCfg<?= $plugin['id'] ?>_compress"><label class="form-check-label small" for="newCfg<?= $plugin['id'] ?>_compress" title="Off: plain dumps, which borg compresses and deduplicates against the previous night's. On: smaller on this client's disk, but the repository stores most of a gzipped dump again every night.">Compress (gzip) <i class="bi bi-info-circle text-muted small"></i></label></div></div>
                                         <div class="col-auto"><div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[cleanup_after]" value="1" id="newCfg<?= $plugin['id'] ?>_cleanup" checked><label class="form-check-label small" for="newCfg<?= $plugin['id'] ?>_cleanup">Cleanup after backup</label></div></div>
                                         <div class="col"><label class="form-label small fw-semibold mb-1">Extra Options</label><input type="text" class="form-control form-control-sm" name="plugin_config[extra_options]" value="<?= $plugin['slug'] === 'pg_dump' ? '--no-owner --no-privileges' : '--single-transaction --quick --routines --triggers --events' ?>"></div>
                                     </div>
                                 <?php elseif ($plugin['slug'] === 's3_sync'): ?>
                                     <?php if (\BBS\Core\Config::isHosted()): ?>
+                                    <input type="hidden" name="plugin_config[target_type]" value="s3">
                                     <input type="hidden" name="plugin_config[credential_source]" value="global">
                                     <div class="alert alert-info py-2 small mb-2"><i class="bi bi-info-circle me-1"></i>S3 destination is managed by the platform.</div>
                                     <?php else: ?>
+                                    <div class="mb-2">
+                                <label class="form-label small fw-semibold mb-1">Destination</label>
+                                <select class="form-select form-select-sm sync-target-select" name="plugin_config[target_type]" id="newTarget<?= $plugin['id'] ?>" title="Where the copy goes. An S3-compatible bucket, a host over SSH (SFTP; rsync.net, a Hetzner Storage Box, any Linux box), or a second disk registered as a storage location.">
+                                    <?php foreach (['s3' => 'S3-compatible storage', 'sftp' => 'SSH host (SFTP)', 'local' => 'Local disk (a storage location)'] as $tv => $tl): ?>
+                                    <option value="<?= $tv ?>" <?= ('s3') === $tv ? 'selected' : '' ?>><?= $tl ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                                    <div class="sync-block sync-block-sftp mb-2">
+                                <label class="form-label small fw-semibold mb-1">SSH host</label>
+                                <?php $sshChoices = $pluginManager->offsiteTargetChoices()['remote_ssh']; ?>
+                                <?php if ($sshChoices): ?>
+                                <select class="form-select form-select-sm" name="plugin_config[remote_ssh_config_id]">
+                                    <?php foreach ($sshChoices as $sid => $slabel): ?>
+                                    <option value="<?= $sid ?>" <?= (string) ('') === (string) $sid ? 'selected' : '' ?>><?= htmlspecialchars($slabel) ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                                <div class="form-text small">The copy goes to <code>bbs-sync/&lt;client&gt;/&lt;repo&gt;</code> under the host's base path. BorgBase is borg-only and not listed.</div>
+                                <?php else: ?>
+                                <div class="form-text small">No SSH host yet. Add one under <a href="/storage-locations">Storage &rarr; Remote SSH</a>; any host with SFTP works, borg is not required there.</div>
+                                <?php endif; ?>
+                            </div>
+                            <div class="sync-block sync-block-local mb-2">
+                                <label class="form-label small fw-semibold mb-1">Storage location</label>
+                                <?php $locChoices = $pluginManager->offsiteTargetChoices()['storage_locations']; ?>
+                                <select class="form-select form-select-sm" name="plugin_config[storage_location_id]">
+                                    <?php foreach ($locChoices as $lid => $llabel): ?>
+                                    <option value="<?= $lid ?>" <?= (string) ('') === (string) $lid ? 'selected' : '' ?>><?= htmlspecialchars($llabel) ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                                <div class="form-text small">The copy goes to <code>bbs-sync/&lt;client&gt;/&lt;repo&gt;</code> on that location. Pick a different disk from the one the repository lives on.</div>
+                            </div>
+                                    <div class="sync-block sync-block-s3">
                                     <div class="mb-2">
                                         <div class="form-check form-check-inline"><input class="form-check-input s3-cred-radio" type="radio" name="plugin_config[credential_source]" value="global" id="newS3Global<?= $plugin['id'] ?>" checked data-target="newS3Custom<?= $plugin['id'] ?>"><label class="form-check-label small" for="newS3Global<?= $plugin['id'] ?>">Use Global S3 Settings</label></div>
                                         <div class="form-check form-check-inline"><input class="form-check-input s3-cred-radio" type="radio" name="plugin_config[credential_source]" value="custom" id="newS3CustomRadio<?= $plugin['id'] ?>" data-target="newS3Custom<?= $plugin['id'] ?>"><label class="form-check-label small" for="newS3CustomRadio<?= $plugin['id'] ?>">Custom Credentials</label></div>
@@ -2987,23 +3502,44 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                             <div class="col-6"><label class="form-label small fw-semibold mb-1">Secret Key</label><input type="text" class="form-control form-control-sm" name="plugin_config[secret_key]"></div>
                                         </div>
                                     </div>
+                                    </div>
                                     <?php endif; ?>
                                     <div class="row g-2 mb-2">
-                                        <div class="col-6"><label class="form-label small fw-semibold mb-1">Path Prefix</label><input type="text" class="form-control form-control-sm" name="plugin_config[path_prefix]"><div class="form-text small">Optional subfolder in bucket</div></div>
+                                        <div class="col-6"><label class="form-label small fw-semibold mb-1">Path Prefix</label><input type="text" class="form-control form-control-sm" name="plugin_config[path_prefix]"><div class="form-text small">Optional subfolder on the destination. Default: none for S3, <code>bbs-sync</code> for SSH and local.</div></div>
                                         <div class="col-6"><label class="form-label small fw-semibold mb-1">Bandwidth Limit</label><input type="text" class="form-control form-control-sm" name="plugin_config[bandwidth_limit]"><div class="form-text small">e.g. 50M</div></div>
                                     </div>
                                 <?php elseif ($plugin['slug'] === 'shell_hook'): ?>
-                                    <div class="row g-2 mb-2">
-                                        <div class="col-6"><label class="form-label small fw-semibold mb-1">Pre-backup Script</label><input type="text" class="form-control form-control-sm" name="plugin_config[pre_script]"><div class="form-text small">Absolute path to script</div></div>
-                                        <div class="col-6"><label class="form-label small fw-semibold mb-1">Post-backup Script</label><input type="text" class="form-control form-control-sm" name="plugin_config[post_script]"><div class="form-text small">Absolute path to script</div></div>
+                                    <div class="mb-3">
+                                        <label class="form-label small fw-semibold mb-1">Pre-backup Script</label>
+                                        <input type="text" class="form-control form-control-sm" name="plugin_config[pre_script]" placeholder="/opt/hooks/pre-backup.sh">
+                                        <div class="form-text small">Runs on the client before borg starts. Leave empty to skip.</div>
                                     </div>
-                                    <div class="row g-2 mb-2">
-                                        <div class="col-auto"><div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[abort_on_failure]" value="1" id="newCfg<?= $plugin['id'] ?>_abort" checked><label class="form-check-label small" for="newCfg<?= $plugin['id'] ?>_abort">Abort backup on failure</label></div></div>
-                                        <div class="col"><label class="form-label small fw-semibold mb-1">Timeout (seconds)</label><input type="number" class="form-control form-control-sm" name="plugin_config[timeout]" value="300"></div>
+                                    <div class="mb-3">
+                                        <label class="form-label small fw-semibold mb-1">Post-backup Script</label>
+                                        <input type="text" class="form-control form-control-sm" name="plugin_config[post_script]" placeholder="/opt/hooks/post-backup.sh">
+                                        <div class="row g-2 mt-1 align-items-center">
+                                            <div class="col-auto"><span class="form-text small mb-0">Run it</span></div>
+                                            <div class="col-auto">
+                                                <select class="form-select form-select-sm" name="plugin_config[post_script_timing]" style="width:auto;">
+                                                    <option value="backup" selected>as soon as the backup finishes</option>
+                                                    <option value="repo_jobs">after prune and offsite sync finish</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                        <div class="form-text small">Prune and offsite sync run on the BBS server after the client has sent its data, so the first option fires while that work is still going. Pick the second if the script does something the repository can't survive mid-prune — powering down its storage host, say. The client must still be online when it's sent.</div>
+                                    </div>
+                                    <div class="row g-3 mb-2 align-items-end">
+                                        <div class="col-sm-4">
+                                            <label class="form-label small fw-semibold mb-1">Timeout (seconds)</label>
+                                            <input type="number" class="form-control form-control-sm" name="plugin_config[timeout]" value="300">
+                                        </div>
+                                        <div class="col-sm-8">
+                                            <div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[abort_on_failure]" value="1" id="newCfg<?= $plugin['id'] ?>_abort" checked><label class="form-check-label small" for="newCfg<?= $plugin['id'] ?>_abort">Abort the backup if the pre-script fails</label></div>
+                                        </div>
                                     </div>
                                     <div class="mb-2">
                                         <div class="form-check"><input class="form-check-input" type="checkbox" name="plugin_config[expose_passphrase]" value="1" id="newCfg<?= $plugin['id'] ?>_expose"><label class="form-check-label small" for="newCfg<?= $plugin['id'] ?>_expose">Expose repository passphrase to script <span class="text-muted">(advanced)</span></label></div>
-                                        <div class="form-text small">Exposes <code>BORG_PASSCOMMAND</code> and <code>BORG_REPO</code> so the script can run <code>borg create --content-from-command</code> directly. Credentials are passed via a mode-0600 temp file (not env vars), but only enable this for scripts you've reviewed — see the wiki for details.</div>
+                                        <div class="form-text small">Exposes <code>BORG_PASSCOMMAND</code> and <code>BORG_REPO</code> so the script can run <code>borg create --content-from-command</code> directly. Credentials go through a mode-0600 temp file rather than env vars — only enable it for scripts you've reviewed.</div>
                                     </div>
                                 <?php else: ?>
                                     <?php foreach ($schema as $field => $def):
@@ -3030,6 +3566,7 @@ $sizeDisplay = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $to
                                         <?php else: ?>
                                             <label class="form-label small fw-semibold mb-1"><?= htmlspecialchars($def['label']) ?></label>
                                             <input type="<?= $def['type'] === 'number' ? 'number' : 'text' ?>" class="form-control form-control-sm" name="plugin_config[<?= $field ?>]" value="<?= htmlspecialchars($fieldVal) ?>">
+                                            <?php if (!empty($def['picker'])): ?><div class="form-text small text-info"><i class="bi bi-info-circle me-1"></i>Once created, edit the configuration and use <strong>Detect databases</strong> to pick them from the server.</div><?php endif; ?>
                                         <?php endif; ?>
                                         <?php if (!empty($def['help'])): ?><div class="form-text small"><?= htmlspecialchars($def['help']) ?></div><?php endif; ?>
                                     </div>
@@ -3068,13 +3605,16 @@ FLUSH PRIVILEGES;</pre>
 GRANT CONNECT ON DATABASE mydb TO <span id="pgUser1b">bbs_backup</span>;
 GRANT USAGE ON SCHEMA public TO <span id="pgUser1c">bbs_backup</span>;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO <span id="pgUser1d">bbs_backup</span>;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO <span id="pgUser1e">bbs_backup</span>;</pre>
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO <span id="pgUser1e">bbs_backup</span>;
+GRANT pg_read_all_data TO <span id="pgUser1f">bbs_backup</span>;  -- PostgreSQL 14+</pre>
+                                        <p class="text-muted mb-2">pg_dump locks every table it dumps, so it needs read access to all of them, including tables outside the <code>public</code> schema and ones created after the grant. <code>pg_read_all_data</code> covers that on PostgreSQL 14 and later.</p>
                                         <strong>Backup + Restore</strong>
                                         <pre class="bg-body-secondary border rounded p-2 mt-1 mb-0" style="font-size:0.78rem;white-space:pre-wrap;">CREATE ROLE <span id="pgUser2">bbs_backup</span> WITH LOGIN PASSWORD '<span id="pgPass2"><?= htmlspecialchars($randomPass) ?></span>';
 GRANT CONNECT ON DATABASE mydb TO <span id="pgUser2b">bbs_backup</span>;
 GRANT USAGE ON SCHEMA public TO <span id="pgUser2c">bbs_backup</span>;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO <span id="pgUser2d">bbs_backup</span>;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO <span id="pgUser2e">bbs_backup</span>;
+GRANT pg_read_all_data TO <span id="pgUser2h">bbs_backup</span>;  -- PostgreSQL 14+
 ALTER ROLE <span id="pgUser2f">bbs_backup</span> CREATEDB;
 GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;</pre>
                                     </div>
@@ -3110,8 +3650,8 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
         })
         .then(r => r.json())
         .then(data => {
-            if (data.status === 'completed') { resultDiv.innerHTML = '<div class="alert alert-success small mb-0 mt-1"><i class="bi bi-check-circle me-1"></i> ' + (data.message || 'Test passed.') + '</div>'; }
-            else if (data.status === 'failed') { resultDiv.innerHTML = '<div class="alert alert-danger small mb-0 mt-1"><i class="bi bi-x-circle me-1"></i> ' + (data.error || 'Test failed.') + '</div>'; }
+            if (data.status === 'completed') { resultDiv.innerHTML = '<div class="alert alert-success small mb-0 mt-1"><i class="bi bi-check-circle me-1"></i> ' + bbsEsc(data.message || 'Test passed.') + '</div>'; }
+            else if (data.status === 'failed') { resultDiv.innerHTML = '<div class="alert alert-danger small mb-0 mt-1"><i class="bi bi-x-circle me-1"></i> ' + bbsEsc(data.error || 'Test failed.') + '</div>'; }
             else if (data.job_id) { resultDiv.innerHTML = '<div class="d-flex align-items-center text-muted small"><span class="spinner-border spinner-border-sm me-2"></span> Waiting for client...</div>'; pollTestStatus(agentId, configId); }
             else { resultDiv.innerHTML = '<div class="alert alert-danger small mb-0 mt-1">Failed to create test job.</div>'; }
         })
@@ -3123,12 +3663,41 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
             fetch('/clients/' + agentId + '/plugin-configs/' + configId + '/test-status', { credentials: 'same-origin' })
             .then(r => r.json())
             .then(data => {
-                if (data.status === 'completed') { clearInterval(poll); resultDiv.innerHTML = '<div class="alert alert-success small mb-0 mt-1"><i class="bi bi-check-circle me-1"></i> ' + (data.message || 'Test passed.') + '</div>'; }
-                else if (data.status === 'failed') { clearInterval(poll); resultDiv.innerHTML = '<div class="alert alert-danger small mb-0 mt-1"><i class="bi bi-x-circle me-1"></i> ' + (data.error || 'Test failed.') + '</div>'; }
+                if (data.status === 'completed') { clearInterval(poll); resultDiv.innerHTML = '<div class="alert alert-success small mb-0 mt-1"><i class="bi bi-check-circle me-1"></i> ' + bbsEsc(data.message || 'Test passed.') + '</div>'; }
+                else if (data.status === 'failed') { clearInterval(poll); resultDiv.innerHTML = '<div class="alert alert-danger small mb-0 mt-1"><i class="bi bi-x-circle me-1"></i> ' + bbsEsc(data.error || 'Test failed.') + '</div>'; }
             });
         }, 2000);
         setTimeout(() => { clearInterval(poll); if (resultDiv.querySelector('.spinner-border')) resultDiv.innerHTML = '<div class="alert alert-warning small mb-0 mt-1"><i class="bi bi-clock me-1"></i> Test timed out. Client may be offline.</div>'; }, 60000);
     }
+
+    // Offsite Sync destination type: show the block for the chosen type,
+    // and require a name unless it is the global-S3 case, which names
+    // itself (#413).
+    function syncTargetChanged(sel) {
+        const form = sel.closest('form');
+        if (!form) return;
+        const t = sel.value;
+        form.querySelectorAll('.sync-block').forEach(b => {
+            b.style.display = b.classList.contains('sync-block-' + t) ? '' : 'none';
+        });
+        const nameWrap = form.querySelector('.s3-name-wrap');
+        const nameInput = form.querySelector('.s3-name-input');
+        const custom = form.querySelector('.s3-cred-radio[value="custom"]');
+        if (nameWrap && nameInput) {
+            const needsName = t !== 's3' || (custom && custom.checked);
+            nameWrap.style.display = needsName ? '' : 'none';
+            nameInput.required = needsName;
+            if (needsName && nameInput.value === 'Global Settings') nameInput.value = '';
+            if (!needsName) nameInput.value = 'Global Settings';
+        }
+    }
+    document.querySelectorAll('.sync-target-select').forEach(sel => {
+        syncTargetChanged(sel);
+        sel.addEventListener('change', () => syncTargetChanged(sel));
+    });
+    document.addEventListener('shown.bs.collapse', e => {
+        e.target.querySelectorAll && e.target.querySelectorAll('.sync-target-select').forEach(syncTargetChanged);
+    });
 
     // S3 credential radio toggle
     document.querySelectorAll('.s3-cred-radio').forEach(radio => {
@@ -3170,35 +3739,44 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
         const u = document.getElementById('newPgUser'), p = document.getElementById('newPgPass');
         if (!u || !p) return;
         function update() {
-            ['pgUser1','pgUser1b','pgUser1c','pgUser1d','pgUser1e','pgUser2','pgUser2b','pgUser2c','pgUser2d','pgUser2e','pgUser2f','pgUser2g'].forEach(id => { const el = document.getElementById(id); if (el) el.textContent = u.value || 'bbs_backup'; });
+            ['pgUser1','pgUser1b','pgUser1c','pgUser1d','pgUser1e','pgUser1f','pgUser2','pgUser2b','pgUser2c','pgUser2d','pgUser2e','pgUser2f','pgUser2g','pgUser2h'].forEach(id => { const el = document.getElementById(id); if (el) el.textContent = u.value || 'bbs_backup'; });
             ['pgPass1','pgPass2'].forEach(id => { const el = document.getElementById(id); if (el) el.textContent = p.value || 'PASSWORD'; });
         }
         u.addEventListener('input', update); p.addEventListener('input', update);
     })();
     </script>
 
+    <?php
+    if (!isset($scripts)) $scripts = [];
+    $scripts[] = '/js/plugin-db-picker.js?v=' . filemtime(__DIR__ . '/../../../public/js/plugin-db-picker.js');
+    ?>
+
 <?php elseif ($tab === 'restore'): ?>
     <?php
     $mysqlPluginEnabled = false;
     $pgPluginEnabled = false;
     $mongoPluginEnabled = false;
+    $mssqlPluginEnabled = false;
     $mysqlConfigs = [];
     $pgConfigs = [];
     $mongoConfigs = [];
+    $mssqlConfigs = [];
     foreach ($agentPlugins as $ap) {
         if ($ap['slug'] === 'mysql_dump' && $ap['agent_enabled']) $mysqlPluginEnabled = true;
         if ($ap['slug'] === 'pg_dump' && $ap['agent_enabled']) $pgPluginEnabled = true;
         if ($ap['slug'] === 'mongo_dump' && $ap['agent_enabled']) $mongoPluginEnabled = true;
+        if ($ap['slug'] === 'mssql_dump' && $ap['agent_enabled']) $mssqlPluginEnabled = true;
     }
     if (!empty($pluginConfigs)) {
         foreach ($pluginConfigs as $pc) {
             if ($pc['slug'] === 'mysql_dump' && $mysqlPluginEnabled) $mysqlConfigs[] = $pc;
             if ($pc['slug'] === 'pg_dump' && $pgPluginEnabled) $pgConfigs[] = $pc;
             if ($pc['slug'] === 'mongo_dump' && $mongoPluginEnabled) $mongoConfigs[] = $pc;
+            if ($pc['slug'] === 'mssql_dump' && $mssqlPluginEnabled) $mssqlConfigs[] = $pc;
         }
     }
-    $dbPluginEnabled = $mysqlPluginEnabled || $pgPluginEnabled || $mongoPluginEnabled;
-    $allDbConfigs = array_merge($mysqlConfigs, $pgConfigs, $mongoConfigs);
+    $dbPluginEnabled = $mysqlPluginEnabled || $pgPluginEnabled || $mongoPluginEnabled || $mssqlPluginEnabled;
+    $allDbConfigs = array_merge($mysqlConfigs, $pgConfigs, $mongoConfigs, $mssqlConfigs);
     $defaultDbUser = 'your_user';
     if (!empty($mysqlConfigs)) {
         $firstCfg = json_decode($mysqlConfigs[0]['config'] ?? '{}', true);
@@ -3235,7 +3813,36 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
     <?php else: ?>
 
     <!-- Shared Control Bar -->
+    <?php
+    // Repositories holding archives, newest archive first. With more than one,
+    // the archive lists below are filtered to the chosen repository (#465).
+    $restoreRepos = [];
+    foreach ($archives as $ar) {
+        $rid = (int) $ar['repository_id'];
+        if (!isset($restoreRepos[$rid])) {
+            $restoreRepos[$rid] = ['name' => $ar['repo_name'], 'count' => 0, 'latest' => $ar['created_at']];
+        }
+        $restoreRepos[$rid]['count']++;
+        if ($ar['created_at'] > $restoreRepos[$rid]['latest']) $restoreRepos[$rid]['latest'] = $ar['created_at'];
+    }
+    uasort($restoreRepos, fn($a, $b) => strcmp($b['latest'], $a['latest']));
+    ?>
     <div class="restore-control-bar">
+        <?php if (count($restoreRepos) > 1): ?>
+        <div class="row gx-2 mb-2">
+            <div class="col-md-5">
+                <label class="form-label fw-semibold mb-1 small">Repository</label>
+                <div class="input-group input-group-sm">
+                <span class="input-group-text"><i class="bi bi-hdd-stack"></i></span>
+                <select class="form-select form-select-sm" id="restore-repo-select">
+                    <?php foreach ($restoreRepos as $rid => $rr): ?>
+                    <option value="<?= $rid ?>"><?= htmlspecialchars($rr['name']) ?> (<?= $rr['count'] ?> <?= $rr['count'] === 1 ? 'archive' : 'archives' ?>)</option>
+                    <?php endforeach; ?>
+                </select>
+                </div>
+            </div>
+        </div>
+        <?php endif; ?>
         <div class="row gx-2 align-items-end">
             <?php if ($dbPluginEnabled): ?>
             <div class="col-md-3">
@@ -3283,6 +3890,13 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
                                 <?php endforeach; ?>
                                 </optgroup>
                             <?php endif; ?>
+                            <?php if (!empty($mssqlConfigs)): ?>
+                                <optgroup label="SQL Server">
+                                <?php foreach ($mssqlConfigs as $sc): ?>
+                                    <option value="mssql:<?= $sc['id'] ?>"><?= htmlspecialchars($sc['name']) ?></option>
+                                <?php endforeach; ?>
+                                </optgroup>
+                            <?php endif; ?>
                         </select>
                     </div>
                 <?php endif; ?>
@@ -3301,16 +3915,21 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
                     foreach ($archives as $ar):
                         if (empty($ar['databases_backed_up'])) continue;
                         $dbMeta = json_decode($ar['databases_backed_up'], true);
-                        if (empty($dbMeta['databases'])) continue;
+                        // Count databases across grouped (v2) or flat (legacy) formats
+                        if (!empty($dbMeta['groups'])) {
+                            $n = array_sum(array_map(fn($g) => count($g['databases'] ?? []), $dbMeta['groups']));
+                        } else {
+                            $n = count($dbMeta['databases'] ?? []);
+                        }
+                        if ($n === 0) continue;
                         if ($ar['repo_name'] !== $currentRepo):
                             if ($currentRepo !== null) echo '</optgroup>';
                             $currentRepo = $ar['repo_name'];
                             echo '<optgroup label="' . htmlspecialchars($currentRepo) . '">';
                         endif;
-                        $n = count($dbMeta['databases']);
                         $dbLabel = " ({$n} " . ($n === 1 ? 'database' : 'databases') . ')';
                     ?>
-                        <option value="<?= $ar['id'] ?>">
+                        <option value="<?= $ar['id'] ?>" data-repo="<?= (int) $ar['repository_id'] ?>">
                             <?= \BBS\Core\TimeHelper::format($ar['created_at'], 'l, M j, Y \a\t g:i A') ?><?= !empty($ar['plan_name']) ? ' — ' . htmlspecialchars($ar['plan_name']) : '' ?><?= $dbLabel ?>
                         </option>
                     <?php endforeach; ?>
@@ -3335,7 +3954,7 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
                             echo '<optgroup label="' . htmlspecialchars($currentRepo) . '">';
                         endif;
                     ?>
-                        <option value="<?= $ar['id'] ?>">
+                        <option value="<?= $ar['id'] ?>" data-repo="<?= (int) $ar['repository_id'] ?>">
                             <?= \BBS\Core\TimeHelper::format($ar['created_at'], 'l, M j, Y \a\t g:i A') ?><?= !empty($ar['plan_name']) ? ' — ' . htmlspecialchars($ar['plan_name']) : '' ?>
                         </option>
                     <?php endforeach; ?>
@@ -3377,8 +3996,11 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
             <?php if ($clickhouseAvailable): ?>
             <!-- Browse Panel -->
             <div id="browse-panel">
-                <div class="restore-panel-header">
-                    <i class="bi bi-folder2-open me-1"></i> Browse Archive
+                <div class="restore-panel-header d-flex align-items-center justify-content-between">
+                    <span><i class="bi bi-folder2-open me-1"></i> Browse Archive</span>
+                    <a href="#" class="text-white text-decoration-none small" style="display:none;" id="tree-select-all">
+                        <i class="bi bi-check2-square me-1"></i><span id="tree-select-all-label">Select all</span>
+                    </a>
                 </div>
                 <div class="restore-panel-body font-monospace small" id="tree-root"></div>
             </div>
@@ -3492,7 +4114,7 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
     <?php if ($dbPluginEnabled): ?>
     <div id="db-restore-section" class="mt-3" style="display:none;">
         <div class="restore-panel-header" style="background: linear-gradient(135deg, #4a90d9 0%, #357abd 100%);">
-            <i class="bi bi-database me-1"></i> Databases to Restore (<span id="db-selected-count">0</span>)
+            <i class="bi bi-database me-1"></i> Databases Selected (<span id="db-selected-count">0</span>)
         </div>
         <div class="restore-panel-body p-0" style="height:auto;" id="db-list-body">
             <div class="p-4 text-muted text-center" id="db-no-data">
@@ -3517,21 +4139,32 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
             <div id="db-all-databases-note" class="alert alert-info small mb-2 py-1 px-2" style="display:none;">
                 <i class="bi bi-info-circle me-1"></i> This backup used a single combined dump file. Copy mode is not available.
             </div>
-            <button class="btn btn-success mb-3" id="db-restore-btn" disabled>
-                <i class="bi bi-arrow-counterclockwise me-1"></i> Restore Selected Databases
-            </button>
+            <div class="d-flex flex-wrap gap-2 mb-3">
+                <button class="btn btn-success" id="db-restore-btn" disabled>
+                    <i class="bi bi-arrow-counterclockwise me-1"></i> Restore Selected Databases
+                </button>
+                <button class="btn btn-primary" id="db-download-btn" disabled>
+                    <i class="bi bi-download me-1"></i> Download .tar.gz
+                </button>
+            </div>
             <div class="alert alert-warning small py-2 px-3 mb-0">
                 <i class="bi bi-shield-exclamation me-1"></i>
-                If you don't already have it set up, the database restore requires a user with write permissions such as below:
+                Restoring to the client requires a database user with write permissions, such as below. Downloading a backup does not:
                 <code class="d-block mt-1" id="db-restore-grant-code" style="font-size:0.8em;">GRANT SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER, CREATE, INSERT, DROP, ALTER, INDEX, REFERENCES ON *.* TO '<span id="db-restore-grant-user"><?= htmlspecialchars($defaultDbUser) ?></span>'@'localhost'; FLUSH PRIVILEGES;</code>
             </div>
         </div>
 
-        <form id="db-restore-form" method="POST" action="/clients/<?= $agent['id'] ?>/restore-mysql" data-mysql-action="/clients/<?= $agent['id'] ?>/restore-mysql" data-pg-action="/clients/<?= $agent['id'] ?>/restore-pg" data-mongo-action="/clients/<?= $agent['id'] ?>/restore-mongo" style="display:none;">
+        <form id="db-restore-form" method="POST" action="/clients/<?= $agent['id'] ?>/restore-mysql" data-mysql-action="/clients/<?= $agent['id'] ?>/restore-mysql" data-pg-action="/clients/<?= $agent['id'] ?>/restore-pg" data-mongo-action="/clients/<?= $agent['id'] ?>/restore-mongo" data-mssql-action="/clients/<?= $agent['id'] ?>/restore-mssql" style="display:none;">
             <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
             <input type="hidden" name="archive_id" id="db-restore-archive-id">
             <input type="hidden" name="plugin_config_id" id="db-restore-config-id">
             <div id="db-restore-fields"></div>
+        </form>
+        <form id="db-download-form" method="POST" action="/clients/<?= $agent['id'] ?>/download-databases" style="display:none;">
+            <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+            <input type="hidden" name="archive_id" id="db-download-archive-id">
+            <input type="hidden" name="plugin_config_id" id="db-download-config-id">
+            <div id="db-download-fields"></div>
         </form>
     </div>
     <?php endif; ?>
@@ -3552,8 +4185,42 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
         array_combine(
             array_map(function($mongoc) { return 'mongo:' . $mongoc['id']; }, $mongoConfigs),
             array_map(function($mongoc) { $c = json_decode($mongoc['config'] ?? '{}', true); return $c['user'] ?? ''; }, $mongoConfigs)
+        ),
+        array_combine(
+            array_map(function($sc) { return 'mssql:' . $sc['id']; }, $mssqlConfigs),
+            array_map(function($sc) { $c = json_decode($sc['config'] ?? '{}', true); return $c['user'] ?? 'bbs_backup'; }, $mssqlConfigs)
         )
     )) ?>;</script>
+    <script>
+    // Repository picker (#465): show only the chosen repository's archives in
+    // both archive lists. Runs before restore.js, so a deep link to an archive
+    // (?archive=N) first switches to the repository that holds it.
+    (function () {
+        const pick = document.getElementById('restore-repo-select');
+        if (!pick) return;
+        const lists = ['archive-select', 'db-archive-select']
+            .map(id => document.getElementById(id))
+            .filter(Boolean)
+            .map(sel => ({
+                sel,
+                placeholder: sel.querySelector('option:not([data-repo])'),
+                opts: [...sel.querySelectorAll('option[data-repo]')],
+            }));
+        function show(repo, reset) {
+            lists.forEach(({ sel, placeholder, opts }) => {
+                const had = sel.value !== '';
+                sel.replaceChildren(...(placeholder ? [placeholder] : []), ...opts.filter(o => o.dataset.repo === repo));
+                sel.value = '';
+                if (reset && had) sel.dispatchEvent(new Event('change', { bubbles: true }));
+            });
+        }
+        const wanted = new URLSearchParams(location.search).get('archive');
+        const holder = wanted && lists.flatMap(l => l.opts).find(o => o.value === wanted);
+        if (holder) pick.value = holder.dataset.repo;
+        show(pick.value, false);
+        pick.addEventListener('change', () => show(pick.value, true));
+    })();
+    </script>
     <?php
     if (!isset($scripts)) $scripts = [];
     $scripts[] = '/js/restore.js?v=' . filemtime(__DIR__ . '/../../../public/js/restore.js');
@@ -3564,7 +4231,20 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
 <?php elseif ($tab === 'install' && $isOwnerOrAdmin): ?>
     <h5 class="mb-3">Install Agent</h5>
 
-    <?php $appUrl = rtrim(\BBS\Core\Config::get('APP_URL', 'https://' . $serverHost), '/'); ?>
+    <?php
+    $appUrl = rtrim(\BBS\Core\Config::get('APP_URL', 'https://' . $serverHost), '/');
+    // Per-client server host override: an agent that reaches the server at a
+    // different address (e.g. an internal Docker hostname) must download the
+    // installer and poll the API via that address too (#367). Keep APP_URL's
+    // scheme; the override may carry its own port, otherwise reuse APP_URL's.
+    if (!empty($agent['server_host_override'])) {
+        $parts = parse_url($appUrl);
+        $override = $agent['server_host_override'];
+        $hasPort = (bool) preg_match('/^([^:\[\]]+|\[[0-9a-fA-F:]+\]):\d+$/', $override);
+        $port = (!$hasPort && !empty($parts['port'])) ? ':' . $parts['port'] : '';
+        $appUrl = ($parts['scheme'] ?? 'https') . '://' . $override . $port;
+    }
+    ?>
 
     <ul class="nav nav-tabs mb-3" role="tablist">
         <li class="nav-item" role="presentation">
@@ -3594,6 +4274,30 @@ GRANT ALL PRIVILEGES ON DATABASE mydb TO <span id="pgUser2g">bbs_backup</span>;<
                     <div class="bg-dark text-white p-3 rounded" style="font-family: monospace; font-size: 0.9rem; word-break: break-all;" id="installCmdLinux">
                         <?= htmlspecialchars($installCmd) ?>
                     </div>
+
+                    <hr class="my-3">
+                    <div class="d-flex justify-content-between align-items-start gap-3">
+                        <div class="small text-muted">
+                            <strong class="text-body">Replace this client's API key</strong>
+                            <div>Issues a new key and stops accepting the old one straight away — for a key that has leaked. This client cannot report again until the new key is on it, so have access to the machine before you do this.</div>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-outline-danger flex-shrink-0" id="rotateKeyBtn">
+                            <i class="bi bi-arrow-repeat me-1"></i>Replace key
+                        </button>
+                    </div>
+                    <div id="rotateKeyResult" class="alert alert-warning mt-3 d-none"></div>
+
+                    <hr class="my-3">
+                    <div class="d-flex justify-content-between align-items-start gap-3">
+                        <div class="small text-muted">
+                            <strong class="text-body">Repair this client's SSH access</strong>
+                            <div>For backups that fail with "Permission denied (publickey)". Issues a new SSH key pair and rebuilds this client's user and authorized_keys on the server. Plans, repositories and the catalogue are untouched. The agent fetches the new key when it is restarted, so restart it afterwards. Replacing the API key above does not fix this error.</div>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-outline-danger flex-shrink-0" id="reprovisionSshBtn">
+                            <i class="bi bi-key me-1"></i>Repair SSH access
+                        </button>
+                    </div>
+                    <div id="reprovisionSshResult" class="alert alert-warning mt-3 d-none"></div>
                 </div>
             </div>
         </div>
@@ -3742,14 +4446,16 @@ const csrfToken = '<?= $this->csrfToken() ?>';
                 // Update agent version display
                 const vw = document.getElementById('agent-version-wrapper');
                 if (vw && data.agent_version) {
-                    const needsUpdate = serverAgentVersion && data.agent_version !== serverAgentVersion;
+                    // Server decides this — see #387; a JS string compare here
+                    // would call a newer agent "outdated" all over again.
+                    const needsUpdate = !!data.agent_needs_update && <?= $canUpdateClient ? 'true' : 'false' ?>;
                     if (needsUpdate) {
                         vw.innerHTML = '<form method="POST" action="/clients/' + agentId + '/update-agent" class="d-inline">' +
                             '<input type="hidden" name="csrf_token" value="' + csrfToken + '">' +
                             '<button type="submit" class="btn btn-link text-warning p-0 text-decoration-none" style="font-size: inherit;" title="Update agent to v' + serverAgentVersion + '" data-confirm="Queue an agent update to v' + serverAgentVersion + '?">' +
-                            '<i class="bi bi-box me-1"></i>Agent v' + data.agent_version + ' <i class="bi bi-arrow-up-circle-fill"></i></button></form>';
+                            '<i class="bi bi-box me-1"></i>Agent v' + bbsEsc(data.agent_version) + ' <i class="bi bi-arrow-up-circle-fill"></i></button></form>';
                     } else {
-                        vw.innerHTML = '<i class="bi bi-box me-1"></i>Agent v' + data.agent_version;
+                        vw.innerHTML = '<i class="bi bi-box me-1"></i>Agent v' + bbsEsc(data.agent_version);
                     }
                 }
 
@@ -3763,9 +4469,12 @@ const csrfToken = '<?= $this->csrfToken() ?>';
                 // Last backup icon color
                 const lbIcon = document.getElementById('stat-lastbackup-icon');
                 if (lbIcon && data.last_backup_status) {
-                    const lbColor = data.last_backup_status === 'completed' ? 'success' : 'danger';
-                    lbIcon.className = 'stat-icon-sm bg-' + lbColor + ' bg-opacity-10 text-' + lbColor + ' rounded-2 p-2 me-2';
-                    lbIcon.innerHTML = '<i class="bi bi-' + (data.last_backup_status === 'completed' ? 'check-circle-fill' : 'x-circle-fill') + '"></i>';
+                    const lb = {
+                        completed: ['success', 'check-circle-fill'],
+                        warning: ['warning', 'exclamation-triangle-fill'],
+                    }[data.last_backup_status] || ['danger', 'x-circle-fill'];
+                    lbIcon.className = 'stat-icon-sm bg-' + lb[0] + ' bg-opacity-10 text-' + lb[0] + ' rounded-2 p-2 me-2';
+                    lbIcon.innerHTML = '<i class="bi bi-' + lb[1] + '"></i>';
                 }
 
                 // Status tab metrics (text only, no form replacement)
@@ -3852,7 +4561,7 @@ const csrfToken = '<?= $this->csrfToken() ?>';
 
 <!-- ─── Live Filesystem Browser modal ─────────────────────────────── -->
 <div class="modal fade" id="dirBrowseModal" tabindex="-1" aria-hidden="true">
-    <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable">
+    <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable modal-fullscreen-md-down">
         <div class="modal-content">
             <div class="modal-header">
                 <h6 class="modal-title"><i class="bi bi-folder2-open me-1"></i>Browse Filesystem — <span id="dirBrowseAgentName"></span></h6>
@@ -3873,22 +4582,26 @@ const csrfToken = '<?= $this->csrfToken() ?>';
                         <i class="bi bi-arrow-clockwise me-1"></i>Refresh
                     </button>
                 </div>
-                <div class="row g-2">
+                <div class="row g-2 dirbrowse-panes">
                     <div class="col-md-7">
-                        <div class="border rounded p-2" style="height: 460px; overflow: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.85rem;" id="dirBrowseTree">
+                        <div class="border rounded p-2 dirbrowse-tree-box" id="dirBrowseTree">
                             <div class="text-muted py-3 text-center"><span class="spinner-border spinner-border-sm me-2"></span>Loading…</div>
                         </div>
                     </div>
-                    <div class="col-md-1 d-flex flex-column align-items-center justify-content-center gap-2">
-                        <button type="button" class="btn btn-sm btn-primary w-100" id="dirBrowseAdd" title="Add selected directories">»</button>
-                        <button type="button" class="btn btn-sm btn-outline-secondary w-100" id="dirBrowseRemove" title="Remove from selected">«</button>
+                    <div class="col-md-1 d-flex flex-row flex-md-column align-items-center justify-content-center gap-2 dirbrowse-transfer">
+                        <button type="button" class="btn btn-sm btn-primary flex-fill w-md-100" id="dirBrowseAdd" title="Add selected directories">
+                            <span class="dirbrowse-arrow-add">»</span>
+                        </button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary flex-fill w-md-100" id="dirBrowseRemove" title="Remove from selected">
+                            <span class="dirbrowse-arrow-remove">«</span>
+                        </button>
                     </div>
                     <div class="col-md-4">
                         <div class="d-flex justify-content-between align-items-center mb-1">
                             <span class="small fw-semibold">Selected</span>
                             <span class="small text-muted" id="dirBrowseSelectedCount">0</span>
                         </div>
-                        <div class="border rounded p-2 small" style="height: 460px; overflow: auto;" id="dirBrowseSelected"></div>
+                        <div class="border rounded p-2 small dirbrowse-selected-box" id="dirBrowseSelected"></div>
                     </div>
                 </div>
                 <div class="alert alert-warning small mt-3 mb-0 d-none" id="dirBrowseTruncated">
@@ -3902,6 +4615,89 @@ const csrfToken = '<?= $this->csrfToken() ?>';
         </div>
     </div>
 </div>
+
+<style>
+/* File picker (#296). Desktop: side-by-side tree | transfer | selected,
+   fixed-height panes. Below md the modal is a fullscreen sheet and the
+   panes stack with viewport-relative heights, so the phone isn't stuck
+   scrolling two 460px boxes inside a scrolling modal. */
+.dirbrowse-tree-box {
+    height: 460px;
+    overflow: auto;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 0.85rem;
+}
+.dirbrowse-selected-box { height: 460px; overflow: auto; }
+.w-md-100 { width: auto; }
+
+@media (min-width: 768px) {
+    .w-md-100 { width: 100%; }
+}
+
+@media (max-width: 767.98px) {
+    /* Fullscreen sheet as a single flex column: tree ~60% on top, selected
+       ~40% below, each with its own scroll. The modal body must not scroll
+       (nested touch-scroll areas fight and the tree can't be scrolled or
+       tapped to expand), and the panes container must be flex-wrap:nowrap —
+       Bootstrap's .row is flex-wrap:wrap, and in a column a tall tree makes
+       the following panes wrap into a second column off to the right (#296). */
+    #dirBrowseModal .modal-body {
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        min-height: 0;
+    }
+    #dirBrowseModal .dirbrowse-panes {
+        flex: 1 1 auto;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        flex-wrap: nowrap;
+    }
+    /* Tree column — 60% of the space, its box scrolls */
+    #dirBrowseModal .dirbrowse-panes > .col-md-7 {
+        flex: 6 1 0;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+    }
+    .dirbrowse-tree-box {
+        flex: 1 1 auto;
+        height: auto;
+        min-height: 0;
+        font-size: 0.95rem;
+        -webkit-overflow-scrolling: touch;
+    }
+    /* Selected column — 40%, its box scrolls, sits below the tree */
+    #dirBrowseModal .dirbrowse-panes > .col-md-4 {
+        flex: 4 1 0;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+    }
+    .dirbrowse-selected-box {
+        flex: 1 1 auto;
+        height: auto;
+        min-height: 0;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    /* Roomier tap targets for folder rows, and a bigger hit area on the
+       expand chevron so folders open on a normal tap. */
+    .dirbrowse-tree-box .dirbrowse-row { padding: 9px 4px !important; }
+    .dirbrowse-tree-box .dirbrowse-expand { min-width: 26px; }
+
+    /* Transfer buttons form a horizontal bar between the stacked panes, so the
+       glyphs point down (add → selected) and up (remove ← tree) instead of
+       the desktop left/right. */
+    .dirbrowse-transfer { flex: 0 0 auto; padding: 4px 0; }
+    .dirbrowse-transfer .btn { padding: 8px 0; font-size: 1.1rem; }
+    .dirbrowse-arrow-add::before { content: "\25BC"; }   /* ▼ */
+    .dirbrowse-arrow-remove::before { content: "\25B2"; } /* ▲ */
+    .dirbrowse-arrow-add, .dirbrowse-arrow-remove { font-size: 0; }
+    .dirbrowse-arrow-add::before, .dirbrowse-arrow-remove::before { font-size: 1rem; }
+}
+</style>
 
 <script>
 (function () {
@@ -3995,7 +4791,10 @@ const csrfToken = '<?= $this->csrfToken() ?>';
         li.className = 'dirbrowse-node';
         li.dataset.path = node.path;
         li.dataset.type = node.type;
-        li.dataset.loaded = (node.children && node.children.length) || node.type !== 'directory' ? '1' : '0';
+        // A folder the agent stopped partway through (it hit the entry cap)
+        // is not loaded: expanding it fetches its full contents.
+        li.dataset.loaded = node.type !== 'directory'
+            || (node.children && node.children.length && !node.truncated) ? '1' : '0';
 
         const row = document.createElement('div');
         row.className = 'dirbrowse-row d-flex align-items-center';
@@ -4084,12 +4883,16 @@ const csrfToken = '<?= $this->csrfToken() ?>';
         expand.textContent = '▼';
     }
 
-    async function fetchTree(path, depth, replaceChildren = false, anchorLi = null) {
+    async function fetchTree(path, depth, replaceChildren = false, anchorLi = null, forceRefresh = false) {
         const body = {
             path,
             depth,
             show_hidden: hiddenChk.checked,
             show_all: showAllChk.checked,
+            // Ask the client again instead of reusing the cached listing —
+            // for when a mount has just been added and the picker is showing
+            // what was there before it (#429).
+            refresh: forceRefresh,
         };
         // Delayed spinner: only show after 300ms so cache hits (which
         // complete in well under that) don't flash a loading state.
@@ -4178,6 +4981,7 @@ const csrfToken = '<?= $this->csrfToken() ?>';
             treeEl.innerHTML = '';
             const root = renderNode(tree, 0);
             root.dataset.level = '0';
+            root.dataset.loaded = '1';
             treeEl.appendChild(root);
             // Auto-expand the root so the user sees children immediately
             const wrap = root.querySelector(':scope > .dirbrowse-children');
@@ -4226,8 +5030,10 @@ const csrfToken = '<?= $this->csrfToken() ?>';
         const active = document.querySelector('.dirbrowse-row.active');
         if (!active) return;
         const li = active.parentElement;
-        if (li.dataset.type !== 'directory') return; // only directories
+        // Directories or individual files — borg create accepts either as a
+        // backup path (#296). Only skip nodes with no real path.
         const path = li.dataset.path;
+        if (!path) return;
         selectedPaths.add(path);
         renderSelected();
     });
@@ -4255,7 +5061,11 @@ const csrfToken = '<?= $this->csrfToken() ?>';
         treeEl.innerHTML = '<div class="text-muted py-3 text-center"><span class="spinner-border spinner-border-sm me-2"></span>Refreshing…</div>';
         const rp = rootForCurrentAgent();
         rootPathEl.textContent = rootLabelForCurrentAgent();
-        fetchTree(rp, 2);
+        // Force a fresh listing. A button labelled Refresh that returned the
+        // cached tree — and, with the old sliding TTL, extended its life —
+        // was the one control someone hunting a newly added mount would keep
+        // pressing (#429).
+        fetchTree(rp, 2, false, null, true);
     });
     hiddenChk.addEventListener('change', () => refreshBtn.click());
     showAllChk.addEventListener('change', () => refreshBtn.click());
@@ -4295,8 +5105,169 @@ const csrfToken = '<?= $this->csrfToken() ?>';
     });
 })();
 </script>
+
+<script>
+// Replace the client's API key. The new key is shown once here and also
+// written into the install command above, since that command is how the
+// key normally reaches a machine.
+(function () {
+    const btn = document.getElementById('rotateKeyBtn');
+    if (!btn) return;
+    const box = document.getElementById('rotateKeyResult');
+
+    btn.addEventListener('click', async function () {
+        if (!confirm('Replace this client\'s API key?\n\nThe current key stops working immediately. The client will not be able to report until the new key is on the machine.')) return;
+
+        btn.disabled = true;
+        const label = btn.innerHTML;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Replacing…';
+        try {
+            const r = await fetch('/clients/<?= (int) $agent['id'] ?>/rotate-key', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+                credentials: 'same-origin',
+                body: '{}',
+            });
+            const d = await r.json();
+            if (!r.ok || d.error) throw new Error(d.error || ('HTTP ' + r.status));
+
+            // Rewrite both install commands so a copy after rotating is
+            // the working one rather than the revoked key.
+            document.querySelectorAll('#installCmdLinux, #installCmdWindows').forEach(function (el) {
+                el.textContent = el.textContent.replace(/[0-9a-f]{64}/g, d.api_key);
+            });
+
+            box.classList.remove('d-none', 'alert-danger');
+            box.classList.add('alert-warning');
+            box.innerHTML =
+                '<div class="fw-semibold mb-1"><i class="bi bi-key me-1"></i>New API key</div>' +
+                '<code class="user-select-all d-block mb-2" style="word-break:break-all;">' + d.api_key + '</code>' +
+                '<div class="small mb-1">The old key no longer works. Put this one in ' + d.reconfigure_location + '.</div>' +
+                '<pre class="small mb-0 mt-2" style="white-space:pre-wrap;">' + d.reconfigure_instructions + '</pre>';
+            box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        } catch (e) {
+            box.classList.remove('d-none', 'alert-warning');
+            box.classList.add('alert-danger');
+            box.textContent = 'Could not replace the key: ' + e.message;
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = label;
+        }
+    });
+})();
+</script>
+
+<script>
+// Repair the client's SSH access. Nothing secret comes back: the agent
+// fetches its new private key over the API when it restarts.
+(function () {
+    const btn = document.getElementById('reprovisionSshBtn');
+    if (!btn) return;
+    const box = document.getElementById('reprovisionSshResult');
+
+    btn.addEventListener('click', async function () {
+        if (!confirm('Repair this client\'s SSH access?\n\nA new SSH key pair is issued and the current one stops working. Backups from this client fail until the agent is restarted and has fetched the new key.')) return;
+
+        btn.disabled = true;
+        const label = btn.innerHTML;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Repairing…';
+        try {
+            const r = await fetch('/clients/<?= (int) $agent['id'] ?>/reprovision-ssh', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+                credentials: 'same-origin',
+                body: '{}',
+            });
+            const d = await r.json();
+            if (!r.ok || d.error) throw new Error(d.error || ('HTTP ' + r.status));
+
+            box.classList.remove('d-none', 'alert-danger');
+            box.classList.add('alert-warning');
+            box.textContent = '';
+            const title = document.createElement('div');
+            title.className = 'fw-semibold mb-1';
+            title.textContent = 'SSH access repaired';
+            const detail = document.createElement('div');
+            detail.className = 'small mb-1';
+            detail.textContent = 'Server user ' + d.ssh_unix_user + ', home ' + d.ssh_home_dir + '. The previous SSH key no longer works.';
+            const steps = document.createElement('pre');
+            steps.className = 'small mb-0 mt-2';
+            steps.style.whiteSpace = 'pre-wrap';
+            steps.textContent = d.restart_instructions;
+            box.append(title, detail, steps);
+            box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        } catch (e) {
+            box.classList.remove('d-none', 'alert-warning');
+            box.classList.add('alert-danger');
+            box.textContent = 'Could not repair SSH access: ' + e.message;
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = label;
+        }
+    });
+})();
+</script>
 <style>
 .dirbrowse-row:hover { background: var(--bs-tertiary-bg); }
 .dirbrowse-row.active { background: var(--bs-primary-bg-subtle, rgba(13,110,253,0.15)); }
 .dirbrowse-selected-row.active { background: var(--bs-primary-bg-subtle, rgba(13,110,253,0.15)); }
 </style>
+
+<!-- Shared notes modal (#334): one modal serves clients, repos, plans, plugin configs -->
+<div class="modal fade" id="notesModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header border-0 pb-0">
+                <h5 class="modal-title"><i class="bi bi-journal-text me-2"></i>Notes — <span id="notesModalLabel"></span></h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <textarea class="form-control" id="notesModalText" rows="6" maxlength="5000"
+                          placeholder="What is this for? Anything your team should know."></textarea>
+                <div class="form-text" id="notesModalMeta"></div>
+                <div class="text-danger small mt-1 d-none" id="notesModalError"></div>
+            </div>
+            <div class="modal-footer border-0 pt-0">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" id="notesModalSave"><i class="bi bi-check2 me-1"></i>Save</button>
+            </div>
+        </div>
+    </div>
+</div>
+<script>
+(function() {
+    let notesCtx = null;
+    window.openNotes = function(entity, id, label, el) {
+        notesCtx = { entity, id };
+        document.getElementById('notesModalLabel').textContent = label;
+        document.getElementById('notesModalText').value = el.dataset.notes || '';
+        const meta = el.dataset.notesMeta || '';
+        document.getElementById('notesModalMeta').textContent = meta ? 'Last updated ' + meta : '';
+        document.getElementById('notesModalError').classList.add('d-none');
+        new bootstrap.Modal(document.getElementById('notesModal')).show();
+    };
+    document.getElementById('notesModalSave').addEventListener('click', function() {
+        if (!notesCtx) return;
+        const btn = this;
+        btn.disabled = true;
+        const body = new URLSearchParams({
+            csrf_token: <?= json_encode($this->csrfToken()) ?>,
+            entity: notesCtx.entity,
+            id: notesCtx.id,
+            notes: document.getElementById('notesModalText').value,
+        });
+        fetch('/notes/save', { method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body })
+            .then(r => r.json())
+            .then(d => {
+                if (d.status === 'ok') { window.location.reload(); return; }
+                throw new Error(d.error || 'Save failed');
+            })
+            .catch(e => {
+                btn.disabled = false;
+                const err = document.getElementById('notesModalError');
+                err.textContent = e.message;
+                err.classList.remove('d-none');
+            });
+    });
+})();
+</script>

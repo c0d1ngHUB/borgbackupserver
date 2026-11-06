@@ -60,9 +60,21 @@ class Mailer
      * 'ssl' (implicit TLS, typically port 465), 'starttls' (upgrade in-band,
      * typically port 587), or 'none' (plaintext, port 25).
      */
-    public function send(string $to, string $subject, string $body): bool
+    /**
+     * Send one message. Plain text unless $isHtml: bodies carry text from
+     * client agents (error output), which must not become markup (GHSA-jwq4-qmhw-54mm).
+     */
+    public function send(string $to, string $subject, string $body, bool $isHtml = false): bool
     {
+        // No line breaks in header values (header injection via names)
+        $to = str_replace(["\r", "\n"], '', $to);
+        $subject = str_replace(["\r", "\n"], ' ', $subject);
         if (!$this->enabled) {
+            return false;
+        }
+
+        if (\BBS\Core\Config::isHosted() && \BBS\Core\UrlGuard::reachesInternal((string) $this->host)) {
+            error_log("SMTP host {$this->host} refused: internal address");
             return false;
         }
 
@@ -94,8 +106,11 @@ class Mailer
             $this->sendCommand($socket, "RCPT TO:<{$to}>");
             $this->sendCommand($socket, "DATA");
 
-            $contentType = (stripos($body, '<') !== false && stripos($body, '>') !== false)
-                ? 'text/html' : 'text/plain';
+            $contentType = $isHtml ? 'text/html' : 'text/plain';
+            // CRLF line endings, and dot-stuffing: a line holding only "." would
+            // otherwise end the message and run the rest as SMTP commands.
+            $body = preg_replace("/\r\n|\r|\n/", "\r\n", $body);
+            $body = preg_replace('/^\./m', '..', $body);
 
             $headers = "From: {$this->fromName} <{$this->fromEmail}>\r\n"
                      . "To: {$to}\r\n"
@@ -152,24 +167,7 @@ class Mailer
 
     private static function taskLabel(string $taskType): string
     {
-        static $labels = [
-            'backup'               => 'Backup',
-            'restore'              => 'Restore',
-            'check'                => 'Repository Check',
-            'prune'                => 'Prune',
-            'compact'              => 'Compact',
-            'update_borg'          => 'Borg Update',
-            'update_agent'         => 'Agent Update',
-            's3_sync'              => 'S3 Sync',
-            's3_restore'           => 'S3 Restore',
-            'repo_repair'          => 'Repository Repair',
-            'break_lock'           => 'Break Lock',
-            'catalog_sync'         => 'Catalog Sync',
-            'catalog_rebuild'      => 'Catalog Rebuild',
-            'catalog_rebuild_full' => 'Catalog Rebuild',
-            'archive_delete'       => 'Archive Delete',
-        ];
-        return $labels[$taskType] ?? ucfirst(str_replace('_', ' ', $taskType));
+        return \BBS\Core\JobType::label($taskType);
     }
 
     public static function inferSecure(int $port): string

@@ -36,6 +36,15 @@ class AuthController extends Controller
      */
     private function localLoginDisabled(?OidcService $oidc = null): bool
     {
+        return self::isLocalLoginDisabled($oidc);
+    }
+
+    /**
+     * Reusable (also from the API): is password login disabled in
+     * favour of SSO-only sign-in?
+     */
+    public static function isLocalLoginDisabled(?OidcService $oidc = null): bool
+    {
         $oidc = $oidc ?? new OidcService();
         if (!$oidc->isEnabled()) {
             return false;
@@ -45,7 +54,7 @@ class AuthController extends Controller
             && in_array(strtolower((string) $env), ['1', 'true', 'yes', 'on'], true)) {
             return true;
         }
-        $row = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'disable_local_login'");
+        $row = \BBS\Core\Database::getInstance()->fetchOne("SELECT `value` FROM settings WHERE `key` = 'disable_local_login'");
         return ($row['value'] ?? '0') === '1';
     }
 
@@ -142,12 +151,12 @@ class AuthController extends Controller
         if (!empty($redirectOverride['value'])) {
             $redirectUri = trim($redirectOverride['value']);
         } else {
-            $serverHost = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
-            $host = $serverHost['value'] ?? $_SERVER['HTTP_HOST'] ?? 'localhost';
-            $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
-                || (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https')
-                ? 'https' : 'http';
-            $redirectUri = "{$scheme}://{$host}/login/oidc/callback";
+            $base = OidcService::serverBaseUrl(true);
+            if ($base === null) {
+                $this->flash('danger', 'SSO needs this server\'s address. Set Server Host in Settings, or the SSO redirect URL.');
+                $this->redirect('/login');
+            }
+            $redirectUri = "{$base}/login/oidc/callback";
         }
 
         try {
@@ -176,16 +185,32 @@ class AuthController extends Controller
         if (!empty($redirectOverride['value'])) {
             $redirectUri = trim($redirectOverride['value']);
         } else {
-            $serverHost = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
-            $host = $serverHost['value'] ?? $_SERVER['HTTP_HOST'] ?? 'localhost';
-            $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
-                || (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https')
-                ? 'https' : 'http';
-            $redirectUri = "{$scheme}://{$host}/login/oidc/callback";
+            $base = OidcService::serverBaseUrl(true);
+            if ($base === null) {
+                $this->flash('danger', 'SSO needs this server\'s address. Set Server Host in Settings, or the SSO redirect URL.');
+                $this->redirect('/login');
+            }
+            $redirectUri = "{$base}/login/oidc/callback";
+        }
+
+        // API-brokered SSO: /api/v1/auth/oidc/start stashed
+        // device info in the session before redirecting to the IdP. The IdP
+        // returns to this same registered callback URL (so customers never
+        // touch their IdP config); when the marker is present we finish by
+        // handing the app a one-time exchange code instead of a web session.
+        $mobile = $_SESSION['mobile_oidc'] ?? null;
+        if ($mobile && (time() - ($mobile['started_at'] ?? 0)) > 600) {
+            unset($_SESSION['mobile_oidc']);
+            $mobile = null;
         }
 
         try {
             $result = $oidcService->handleCallback($redirectUri);
+
+            if ($mobile) {
+                unset($_SESSION['mobile_oidc']);
+                $this->finishMobileOidc($mobile, $result); // never returns
+            }
 
             if ($result['status'] === 'pending') {
                 $this->flash('warning', $result['message']);
@@ -204,9 +229,54 @@ class AuthController extends Controller
                 $this->redirect('/login');
             }
         } catch (\Exception $e) {
+            if ($mobile) {
+                unset($_SESSION['mobile_oidc']);
+                header('Location: ' . $mobile['redirect'] . '?error=error&message=' . urlencode('SSO error: ' . $e->getMessage()));
+                exit;
+            }
             $this->flash('danger', 'SSO error: ' . $e->getMessage());
             $this->redirect('/login');
         }
+    }
+
+    /**
+     * Finish a mobile-brokered OIDC login: mint a one-time exchange code
+     * (60s TTL, single use) and bounce back into the app via its custom
+     * scheme. The app then swaps the code for a real bearer token over TLS
+     * at /api/v1/auth/oidc/exchange — the code is the only thing that
+     * transits the (non-private) URL-handler channel.
+     */
+    private function finishMobileOidc(array $mobile, array $result): void
+    {
+        $appRedirect = $mobile['redirect'];
+
+        if ($result['status'] === 'pending' || $result['status'] === 'denied') {
+            header('Location: ' . $appRedirect . '?error=' . urlencode($result['status'])
+                . '&message=' . urlencode($result['message'] ?? 'Account not approved.'));
+            exit;
+        }
+
+        if (empty($result['user'])) {
+            header('Location: ' . $appRedirect . '?error=error&message=' . urlencode('SSO login failed.'));
+            exit;
+        }
+
+        $code = bin2hex(random_bytes(32));
+        $this->db->insert('auth_challenges', [
+            'kind' => 'oidc_exchange',
+            'challenge_hash' => hash('sha256', $code),
+            'user_id' => $result['user']['id'],
+            'payload' => json_encode([
+                'state' => $mobile['state'] ?? '',
+                'device_id' => $mobile['device_id'] ?? '',
+                'device_name' => $mobile['device_name'] ?? '',
+            ]),
+            'expires_at' => date('Y-m-d H:i:s', time() + 60),
+        ]);
+
+        header('Location: ' . $appRedirect . '?code=' . urlencode($code)
+            . '&state=' . urlencode($mobile['state'] ?? ''));
+        exit;
     }
 
     public function twoFactorForm(): void
@@ -281,11 +351,10 @@ class AuthController extends Controller
     {
         $oidcLogoutUrl = null;
         if (($_SESSION['auth_provider'] ?? 'local') === 'oidc') {
-            $oidcService = new OidcService();
-            $serverHost = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
-            $host = $serverHost['value'] ?? $_SERVER['HTTP_HOST'] ?? 'localhost';
-            $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-            $oidcLogoutUrl = $oidcService->getLogoutUrl("{$scheme}://{$host}/login");
+            $base = OidcService::serverBaseUrl(false);
+            if ($base !== null) {
+                $oidcLogoutUrl = (new OidcService())->getLogoutUrl("{$base}/login");
+            }
         }
 
         session_destroy();
@@ -325,6 +394,14 @@ class AuthController extends Controller
 
         $user = $this->db->fetchOne("SELECT id, email FROM users WHERE email = ?", [$email]);
 
+        // Placeholder addresses (the .invalid default, a bare host) can't
+        // receive mail; don't send a reset link toward one.
+        $domain = strtolower((string) substr(strrchr((string) ($user['email'] ?? ''), '@') ?: '', 1));
+        if ($domain === '' || !str_contains($domain, '.') || str_ends_with($domain, '.invalid')
+            || str_ends_with($domain, '.localhost') || str_ends_with($domain, '.local')) {
+            $user = null;
+        }
+
         if ($user) {
             // Clean up expired tokens
             $this->db->query("DELETE FROM password_resets WHERE expires_at < NOW()");
@@ -340,10 +417,19 @@ class AuthController extends Controller
                 'expires_at' => date('Y-m-d H:i:s', strtotime('+1 hour')),
             ]);
 
-            // Build reset URL
-            $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-            $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
-            $resetUrl = "{$scheme}://{$host}/reset-password/{$token}";
+            // Build the reset URL from the configured address, never from the
+            // request's Host header: a forged Host would send the victim a
+            // working token on the attacker's domain (reset poisoning).
+            $base = rtrim((string) ($_ENV['APP_URL'] ?? ''), '/');
+            if ($base === '') {
+                $row = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'app_url'");
+                $base = rtrim((string) ($row['value'] ?? ''), '/');
+            }
+            if ($base === '') {
+                $row = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
+                $base = 'https://' . ($row['value'] ?? 'localhost');
+            }
+            $resetUrl = "{$base}/reset-password/{$token}";
 
             // Send email
             $subject = 'Password Reset — Borg Backup Server';
@@ -352,7 +438,7 @@ class AuthController extends Controller
                 . "<p>Or copy this link: {$resetUrl}</p>"
                 . "<p>This link expires in 1 hour. If you did not request this, you can safely ignore this email.</p>";
 
-            (new Mailer())->send($user['email'], $subject, $body);
+            (new Mailer())->send($user['email'], $subject, $body, true);
         }
 
         $this->flash('success', $successMsg);

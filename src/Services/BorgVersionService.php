@@ -72,26 +72,28 @@ class BorgVersionService
                 continue;
             }
 
-            // Skip if already stored
+            // A release already stored still has its assets refreshed: that
+            // fills in digests and picks up assets uploaded after the first
+            // sync.
             $existing = $this->db->fetchOne(
                 "SELECT id FROM borg_versions WHERE version = ?",
                 [$version]
             );
             if ($existing) {
-                continue;
+                $versionId = (int) $existing['id'];
+            } else {
+                // Extract release date
+                $releaseDate = substr($release['published_at'] ?? $release['created_at'] ?? date('Y-m-d'), 0, 10);
+
+                // Insert version
+                $versionId = $this->db->insert('borg_versions', [
+                    'version' => $version,
+                    'release_tag' => $tag,
+                    'release_date' => $releaseDate,
+                    'is_prerelease' => 0,
+                    'release_notes' => $release['body'] ?? '',
+                ]);
             }
-
-            // Extract release date
-            $releaseDate = substr($release['published_at'] ?? $release['created_at'] ?? date('Y-m-d'), 0, 10);
-
-            // Insert version
-            $versionId = $this->db->insert('borg_versions', [
-                'version' => $version,
-                'release_tag' => $tag,
-                'release_date' => $releaseDate,
-                'is_prerelease' => 0,
-                'release_notes' => $release['body'] ?? '',
-            ]);
 
             // Process assets
             $assets = $release['assets'] ?? [];
@@ -107,10 +109,28 @@ class BorgVersionService
                     continue;
                 }
 
+                // GitHub's digest ("sha256:<hex>") lets the server check a
+                // download before it is installed.
+                $sha256 = null;
+                if (preg_match('/^sha256:([0-9a-f]{64})$/', (string) ($asset['digest'] ?? ''), $dm)) {
+                    $sha256 = $dm[1];
+                }
+                // Match by name: the unique key can't catch a repeat when
+                // glibc_version is NULL (macOS, FreeBSD).
+                $known = $this->db->fetchOne(
+                    "SELECT id FROM borg_version_assets WHERE borg_version_id = ? AND asset_name = ?",
+                    [$versionId, $name]
+                );
+                if ($known) {
+                    if ($sha256 !== null) {
+                        $this->db->update('borg_version_assets', ['sha256' => $sha256], 'id = ?', [$known['id']]);
+                    }
+                    continue;
+                }
                 $this->db->query(
                     "INSERT IGNORE INTO borg_version_assets
-                     (borg_version_id, platform, architecture, glibc_version, asset_name, download_url, file_size)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     (borg_version_id, platform, architecture, glibc_version, asset_name, download_url, file_size, sha256)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         $versionId,
                         $meta['platform'],
@@ -119,11 +139,14 @@ class BorgVersionService
                         $name,
                         $asset['browser_download_url'] ?? '',
                         $asset['size'] ?? null,
+                        $sha256,
                     ]
                 );
             }
 
-            $added++;
+            if (!$existing) {
+                $added++;
+            }
         }
 
         $this->setSetting('last_borg_version_check', date('Y-m-d H:i:s'));
@@ -564,7 +587,7 @@ class BorgVersionService
         // Find latest version < 2.0 with a compatible binary
         if ($platform === 'linux' && $glibc) {
             $asset = $this->db->fetchOne(
-                "SELECT bv.version, bva.download_url
+                "SELECT bv.version, bva.download_url, bva.sha256
                  FROM borg_versions bv
                  JOIN borg_version_assets bva ON bva.borg_version_id = bv.id
                  WHERE bva.platform = 'linux' AND bva.architecture = ?
@@ -576,7 +599,7 @@ class BorgVersionService
             );
         } else {
             $asset = $this->db->fetchOne(
-                "SELECT bv.version, bva.download_url
+                "SELECT bv.version, bva.download_url, bva.sha256
                  FROM borg_versions bv
                  JOIN borg_version_assets bva ON bva.borg_version_id = bv.id
                  WHERE bva.platform = ? AND bva.architecture = ?
@@ -591,6 +614,7 @@ class BorgVersionService
             return [
                 'version' => $asset['version'],
                 'url' => $asset['download_url'],
+                'sha256' => $asset['sha256'] ?? null,
             ];
         }
 
@@ -664,14 +688,17 @@ class BorgVersionService
             if ($serverUrl) {
                 // Use server binary if no official available or server version is newer
                 if (!$official || version_compare($serverVersion, $official['version'], '>')) {
-                    return $this->updateServerBorgFromUrl($serverUrl, $serverVersion);
+                    // The server installs its own copy from disk; the URL is
+                    // for agents. The helper checks the copy's signature.
+                    $localPath = dirname(__DIR__, 2) . '/public/borg/' . $serverVersion . '/' . basename(parse_url($serverUrl, PHP_URL_PATH));
+                    return $this->updateServerBorgFromUrl($localPath, $serverVersion);
                 }
             }
         }
 
         // Use official binary if available
         if ($official) {
-            return $this->updateServerBorgFromUrl($official['url'], $official['version']);
+            return $this->updateServerBorgFromUrl($official['url'], $official['version'], $official['sha256'] ?? null);
         }
 
         return ['success' => false, 'error' => 'No compatible binary for server platform'];
@@ -680,11 +707,24 @@ class BorgVersionService
     /**
      * Update server borg from a specific URL.
      */
-    public function updateServerBorgFromUrl(string $url, string $version): array
+    public function updateServerBorgFromUrl(string $url, string $version, ?string $sha256 = null): array
     {
+        // Official downloads need the release digest; versions synced before
+        // digests were stored get it from a fresh sync.
+        if (str_starts_with($url, 'https://') && empty($sha256)) {
+            $this->syncVersionsFromGitHub();
+            $sha256 = $this->db->fetchOne(
+                "SELECT sha256 FROM borg_version_assets WHERE download_url = ? AND sha256 IS NOT NULL LIMIT 1",
+                [$url]
+            )['sha256'] ?? null;
+            if (empty($sha256)) {
+                return ['success' => false, 'error' => 'GitHub did not provide a SHA-256 digest for this borg release, so it cannot be verified'];
+            }
+        }
         $cmd = 'sudo /usr/local/bin/bbs-ssh-helper update-borg '
             . escapeshellarg($url) . ' '
-            . escapeshellarg($version) . ' 2>&1';
+            . escapeshellarg($version)
+            . ($sha256 ? ' ' . escapeshellarg($sha256) : '') . ' 2>&1';
 
         $output = [];
         $exitCode = 0;
@@ -914,22 +954,10 @@ class BorgVersionService
             return ['success' => false, 'error' => 'No download URL for matching asset'];
         }
 
-        // Use bbs-ssh-helper to download and install (needs root for /usr/local/bin)
-        $cmd = 'sudo /usr/local/bin/bbs-ssh-helper update-borg '
-            . escapeshellarg($downloadUrl) . ' '
-            . escapeshellarg($version) . ' 2>&1';
-
-        $output = [];
-        $exitCode = 0;
-        exec($cmd, $output, $exitCode);
-
-        $outputStr = implode("\n", $output);
-
-        if ($exitCode !== 0) {
-            return ['success' => false, 'error' => 'Install failed (exit ' . $exitCode . '): ' . $outputStr];
-        }
-
-        return ['success' => true, 'output' => $outputStr];
+        // Use bbs-ssh-helper to download, verify and install (needs root for /usr/local/bin)
+        $result = $this->updateServerBorgFromUrl($downloadUrl, $version, $asset['sha256'] ?? null);
+        unset($result['version']);
+        return $result;
     }
 
     private function getSetting(string $key, string $default = ''): string

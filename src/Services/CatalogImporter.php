@@ -8,6 +8,24 @@ use BBS\Core\Database;
 class CatalogImporter
 {
     /**
+     * Catalog fields from an agent are untrusted and go into a TabSeparated
+     * stream: a tab or newline in one would start a row of the agent's
+     * choosing, under any agent or archive id. Status is one letter, mtime
+     * a "Y-m-d H:i:s" timestamp; anything else becomes unknown.
+     */
+    public static function safeStatus($status): string
+    {
+        $status = substr((string) ($status ?? 'U'), 0, 1);
+        return preg_match('/^[A-Za-z?-]$/', $status) ? $status : 'U';
+    }
+
+    public static function safeMtime($mtime): string
+    {
+        $mtime = (string) ($mtime ?? '');
+        return preg_match('/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/', $mtime) ? $mtime : '\\N';
+    }
+
+    /**
      * Process a JSONL catalog file into ClickHouse file_catalog table.
      *
      * Converts JSONL → TSV in a single pass, then bulk-uploads via
@@ -55,7 +73,6 @@ class CatalogImporter
             $escape = fn(string $s) => str_replace(["\t", "\n", "\\"], ["\\t", "\\n", "\\\\"], $s);
 
             // Track directory stats: dirPath => [file_count, total_size]
-            $dirStats = [];
 
             while (($line = fgets($handle)) !== false) {
                 $line = trim($line);
@@ -75,20 +92,15 @@ class CatalogImporter
                 $name = $escape(basename($rawPath));
                 $rawParent = dirname($rawPath);
                 $parentDir = $escape($rawParent);
-                $status = substr($entry['status'] ?? 'U', 0, 1);
+                $status = self::safeStatus($entry['status'] ?? 'U');
                 $size = (int) ($entry['size'] ?? 0);
-                $mtime = $entry['mtime'] ?? '\\N';
+                $mtime = self::safeMtime($entry['mtime'] ?? null);
 
                 fwrite($tsvFh, "{$agentId}\t{$archiveId}\t{$path}\t{$name}\t{$parentDir}\t{$size}\t{$status}\t{$mtime}\n");
                 $count++;
 
                 // Accumulate per-directory stats (use raw unescaped paths)
                 if ($status !== 'D') {
-                    if (!isset($dirStats[$rawParent])) {
-                        $dirStats[$rawParent] = [0, 0];
-                    }
-                    $dirStats[$rawParent][0]++;
-                    $dirStats[$rawParent][1] += $size;
                 }
             }
 
@@ -118,7 +130,7 @@ class CatalogImporter
             $updateStatus("Building directory index...");
 
             // Build catalog_dirs table for fast directory browsing
-            $this->buildDirIndex($ch, $agentId, $archiveId, $dirStats, $log);
+            $this->buildDirIndex($ch, $agentId, $archiveId, $log);
 
             // Update cached catalog total for dashboard
             self::updateCachedTotal($db);
@@ -132,61 +144,20 @@ class CatalogImporter
     }
 
     /**
-     * Build the catalog_dirs index table from collected directory stats.
-     * Uses TSV upload to ClickHouse for speed.
+     * Build the catalog_dirs index for fast directory browsing.
+     *
+     * Aggregation and ancestor expansion happen inside ClickHouse. Collecting
+     * them in PHP while streaming needed one map entry per directory plus a
+     * second copy carrying every ancestor, which exhausted the memory limit on
+     * large archives (#391).
      */
-    private function buildDirIndex(ClickHouse $ch, int $agentId, int $archiveId, array $dirStats, callable $log): void
+    private function buildDirIndex(ClickHouse $ch, int $agentId, int $archiveId, callable $log): void
     {
-        // Remove old dir entries for this archive
         try {
-            $ch->exec("ALTER TABLE catalog_dirs DELETE WHERE agent_id = {$agentId} AND archive_id = {$archiveId} SETTINGS mutations_sync = 1");
-        } catch (\Exception $e) { /* ignore */ }
-
-        if (empty($dirStats)) return;
-
-        // Collect all directory paths (including ancestors) so the tree is complete.
-        $allDirs = []; // dirPath => [file_count, total_size]
-        foreach ($dirStats as $dirPath => [$fc, $sz]) {
-            if (!isset($allDirs[$dirPath])) {
-                $allDirs[$dirPath] = [0, 0];
-            }
-            $allDirs[$dirPath][0] += $fc;
-            $allDirs[$dirPath][1] += $sz;
-
-            // Walk up ancestors to ensure they exist (no file counts for intermediates)
-            $p = dirname($dirPath);
-            while ($p !== '/' && $p !== '.' && !isset($allDirs[$p])) {
-                $allDirs[$p] = [0, 0];
-                $p = dirname($p);
-            }
-        }
-
-        // Don't include root itself as a directory entry
-        unset($allDirs['/']);
-
-        // Write dirs TSV
-        $escape = fn(string $s) => str_replace(["\t", "\n", "\\"], ["\\t", "\\n", "\\\\"], $s);
-        $dirsTsv = sys_get_temp_dir() . "/catalog_dirs_{$agentId}_{$archiveId}_" . getmypid() . '.tsv';
-        $fh = fopen($dirsTsv, 'w');
-        if (!$fh) return;
-
-        foreach ($allDirs as $dirPath => [$fc, $sz]) {
-            $parent = dirname($dirPath);
-            if ($parent === '.') $parent = '/';
-            $name = basename($dirPath);
-            fwrite($fh, "{$agentId}\t{$archiveId}\t{$escape($dirPath)}\t{$escape($parent)}\t{$escape($name)}\t{$fc}\t{$sz}\n");
-        }
-        fclose($fh);
-
-        try {
-            $ch->insertTsv('catalog_dirs', $dirsTsv, [
-                'agent_id', 'archive_id', 'dir_path', 'parent_dir', 'name', 'file_count', 'total_size'
-            ]);
-            $log("Catalog dirs index: " . number_format(count($allDirs)) . " directories indexed");
+            $ch->rebuildDirIndex($agentId, $archiveId);
+            $log("Catalog dirs index rebuilt");
         } catch (\Exception $e) {
             $log("Catalog dirs index failed: " . $e->getMessage());
-        } finally {
-            @unlink($dirsTsv);
         }
     }
 

@@ -7,6 +7,7 @@ use BBS\Services\BorgCommandBuilder;
 use BBS\Services\Encryption;
 use BBS\Services\PermissionService;
 use BBS\Services\RemoteSshService;
+use BBS\Services\RepositoryImportService;
 use BBS\Services\S3SyncService;
 use BBS\Services\SshKeyManager;
 
@@ -30,6 +31,12 @@ class RepositoryController extends Controller
         return $slug ?: 'repo';
     }
 
+    /**
+     * Sanitize a repo name that refers to an EXISTING directory (import).
+     * Same character rules as sanitizePathName() but case-preserving — the
+     * name must match the on-disk / remote directory exactly (#360).
+     * Returns '' if nothing usable remains so callers can reject the input.
+     */
     public function store(): void
     {
         $this->requireAuth();
@@ -37,10 +44,18 @@ class RepositoryController extends Controller
 
         $agentId = (int) ($_POST['agent_id'] ?? 0);
         $name = trim($_POST['name'] ?? '');
+        if (mb_strlen($name) > 100) {
+            $this->flash('danger', 'Repository names can be at most 100 characters.');
+            $this->redirect("/clients/{$agentId}?tab=repos");
+        }
         $encryption = $_POST['encryption'] ?? 'repokey-blake2';
         $passphrase = $_POST['passphrase'] ?? '';
         $storageType = $_POST['storage_type'] ?? 'local';
         $remoteSshConfigId = !empty($_POST['remote_ssh_config_id']) ? (int) $_POST['remote_ssh_config_id'] : null;
+        if ($remoteSshConfigId && !$this->isAdmin()) {
+            $this->flash('danger', 'Only an admin can place repositories on a Remote SSH host: its key is shared by every repository on that host.');
+            $this->redirect('/clients');
+        }
 
         if (empty($name) || empty($agentId)) {
             $this->flash('danger', 'Repository name and agent are required.');
@@ -301,6 +316,15 @@ class RepositoryController extends Controller
 
         $agentId = $repo['agent_id'];
 
+        // Block if any archive in the repo is locked (legal hold, #314)
+        $lockedCount = $this->db->fetchOne(
+            "SELECT COUNT(*) as cnt FROM archives WHERE repository_id = ? AND locked = 1", [$id]
+        );
+        if ((int) ($lockedCount['cnt'] ?? 0) > 0) {
+            $this->flash('danger', 'Cannot delete repository — it contains locked archives. Unlock them first.');
+            $this->redirect("/clients/{$agentId}/repo/{$id}");
+        }
+
         // Block if backup plans reference this repo
         $planCount = $this->db->fetchOne(
             "SELECT COUNT(*) as cnt FROM backup_plans WHERE repository_id = ?", [$id]
@@ -319,10 +343,14 @@ class RepositoryController extends Controller
             $this->redirect("/clients/{$agentId}?tab=repos");
         }
 
+        // Unlink-only: keep the borg data on disk so the repo can be
+        // re-attached later (to any client) via scan/adopt (#369)
+        $keepData = !empty($_POST['keep_data']);
+
         // Delete borg repository from disk
         $localPath = BorgCommandBuilder::getLocalRepoPath($repo);
         $diskDeleted = false;
-        if (!empty($localPath) && is_dir($localPath)) {
+        if (!$keepData && !empty($localPath) && is_dir($localPath)) {
             // Safety: only delete paths within a known storage location
             $allowedPaths = array_column(
                 $this->db->fetchAll("SELECT path FROM storage_locations"),
@@ -375,9 +403,15 @@ class RepositoryController extends Controller
                 JOIN plugin_configs pc ON pc.id = rsc.plugin_config_id
                 WHERE rsc.repository_id = ?
             ", [$id]);
-            // Legacy form fallback: an explicit plugin_config_id with no link rows
+            // Legacy form fallback: an explicit plugin_config_id with no link
+            // rows. Scoped to this repo's agent — an unscoped lookup would let
+            // a user delete from another tenant's bucket using that tenant's
+            // credentials (same class as GHSA-vm4w-wwpg-v3rc).
             if (empty($linkedConfigs) && !empty($_POST['plugin_config_id'])) {
-                $legacy = $this->db->fetchOne("SELECT id, name, config FROM plugin_configs WHERE id = ?", [(int) $_POST['plugin_config_id']]);
+                $legacy = $this->db->fetchOne(
+                    "SELECT id, name, config FROM plugin_configs WHERE id = ? AND agent_id = ?",
+                    [(int) $_POST['plugin_config_id'], $agentId]
+                );
                 if ($legacy) $linkedConfigs = [$legacy];
             }
             $agent = $this->db->fetchOne("SELECT * FROM agents WHERE id = ?", [$agentId]);
@@ -387,7 +421,7 @@ class RepositoryController extends Controller
                 $s3Deleted = true;
                 foreach ($linkedConfigs as $pluginConfig) {
                     $config = json_decode($pluginConfig['config'], true) ?: [];
-                    $creds = $s3Service->resolveCredentials($config);
+                    $creds = $s3Service->resolveDestination($config);
 
                     $result = $s3Service->deleteFromS3($repo, $agent, $creds);
                     if (!$result['success']) $s3Deleted = false;
@@ -396,8 +430,8 @@ class RepositoryController extends Controller
                         'agent_id' => $agentId,
                         'level' => $result['success'] ? 'info' : 'warning',
                         'message' => $result['success']
-                            ? "S3 data deleted for repository \"{$repo['name']}\" at destination \"{$pluginConfig['name']}\""
-                            : "Failed to delete S3 data for repository \"{$repo['name']}\" at destination \"{$pluginConfig['name']}\": " . ($result['output'] ?? 'Unknown error'),
+                            ? "Offsite copy deleted for repository \"{$repo['name']}\" at destination \"{$pluginConfig['name']}\""
+                            : "Failed to delete the offsite copy of repository \"{$repo['name']}\" at destination \"{$pluginConfig['name']}\": " . ($result['output'] ?? 'Unknown error'),
                     ]);
                 }
             }
@@ -411,28 +445,67 @@ class RepositoryController extends Controller
             $this->updateAgentStoragePaths($agentId, $agent);
         }
 
-        $msg = "Repository \"{$repo['name']}\" deleted.";
-        if ($diskDeleted) {
+        $msg = "Repository \"{$repo['name']}\" " . ($keepData ? 'unlinked' : 'deleted') . ".";
+        if ($keepData && !empty($localPath)) {
+            $msg .= " Data kept at {$localPath} — re-attach it anytime via Scan & Adopt.";
+        } elseif ($diskDeleted) {
             $msg .= " Data removed from disk.";
         } elseif (!empty($localPath) && is_dir($localPath)) {
             $msg .= " Warning: disk data at {$localPath} could not be removed — clean up manually.";
         }
         if ($deleteFromS3) {
             if ($s3Deleted) {
-                $msg .= " S3 offsite copy removed.";
+                $msg .= " Offsite copies removed.";
             } else {
-                $msg .= " Warning: S3 data could not be removed — clean up manually.";
+                $msg .= " Warning: an offsite copy could not be removed — clean up manually.";
             }
         }
 
         $this->db->insert('server_log', [
             'agent_id' => $agentId,
             'level' => 'info',
-            'message' => "Repository \"{$repo['name']}\" deleted" . ($diskDeleted ? " (disk data removed)" : "") . ($s3Deleted ? " (S3 data removed)" : ""),
+            'message' => "Repository \"{$repo['name']}\" " . ($keepData ? "unlinked (data kept on disk)" : "deleted") . ($diskDeleted ? " (disk data removed)" : "") . ($s3Deleted ? " (S3 data removed)" : ""),
         ]);
 
         $this->flash('success', $msg);
         $this->redirect("/clients/{$agentId}?tab=repos");
+    }
+
+    /**
+     * POST /repositories/{id}/passphrase — {passphrase}
+     *
+     * borg re-encrypts the repository key in place, so every archive stays
+     * where it is and clients need no change: they are handed the passphrase
+     * with each job (#412).
+     */
+    public function changePassphrase(int $id): void
+    {
+        $this->requireAuth();
+        $this->verifyCsrf();
+
+        $repo = $this->db->fetchOne("
+            SELECT r.*, a.id as agent_id
+            FROM repositories r
+            JOIN agents a ON a.id = r.agent_id
+            WHERE r.id = ?
+        ", [$id]);
+
+        if (!$repo || !$this->canAccessAgent($repo['agent_id'])) {
+            $this->json(['error' => 'Repository not found'], 404);
+        }
+        $this->requirePermission(PermissionService::MANAGE_REPOS, (int) $repo['agent_id']);
+
+        $svc = new \BBS\Services\RepositoryPassphraseService();
+        $result = $svc->change($repo, (string) ($_POST['passphrase'] ?? ''));
+
+        $this->json([
+            'status' => $result['success'] ? 'ok' : 'error',
+            'message' => $result['message'],
+            'output' => $result['output'],
+            // The caller must show this one rather than a toast that scrolls
+            // away: the repository is open and its passphrase is unrecorded.
+            'orphaned' => $result['orphaned'],
+        ], $result['success'] ? 200 : 422);
     }
 
     public function rename(int $id): void
@@ -459,6 +532,10 @@ class RepositoryController extends Controller
 
         if (empty($newName)) {
             $this->flash('danger', 'Repository name cannot be empty.');
+            $this->redirect("/clients/{$agentId}/repo/{$id}");
+        }
+        if (mb_strlen($newName) > 100) {
+            $this->flash('danger', 'Repository names can be at most 100 characters.');
             $this->redirect("/clients/{$agentId}/repo/{$id}");
         }
 
@@ -585,52 +662,11 @@ class RepositoryController extends Controller
 
     /**
      * Update .storage-paths file for an agent (used by bbs-ssh-gate to allow borg access
-     * to storage locations outside the agent's SSH home directory). Gathers all unique
-     * storage location agent directories and writes them via bbs-ssh-helper.
+     * to storage locations outside the agent's SSH home directory).
      */
     private function updateAgentStoragePaths(int $agentId, array $agent): void
     {
-        // Get agent's home directory from stored ssh_home_dir
-        $homeDir = $agent['ssh_home_dir'] ?? null;
-        if (!$homeDir) {
-            return; // No SSH provisioned — can't update storage paths
-        }
-
-        // The parent of the home dir (e.g., /var/bbs/home from /var/bbs/home/3)
-        // bbs-ssh-gate already allows access to $homeDir, so any storage location
-        // under the same parent is already accessible. We only need to add paths
-        // for locations on different base paths.
-        $homeParent = rtrim(dirname($homeDir), '/');
-
-        // Find all storage locations that have local repos for this agent
-        $locations = $this->db->fetchAll(
-            "SELECT DISTINCT sl.path FROM repositories r
-             JOIN storage_locations sl ON sl.id = r.storage_location_id
-             WHERE r.agent_id = ? AND r.storage_type = 'local'",
-            [$agentId]
-        );
-
-        // Build agent-specific paths for locations outside the home dir's parent
-        $paths = [];
-        foreach ($locations as $loc) {
-            $locPath = rtrim($loc['path'], '/');
-            if ($locPath === $homeParent) continue; // Already allowed via home dir
-            $paths[] = $locPath . '/' . $agentId;
-        }
-
-        // Call bbs-ssh-helper to write the paths file
-        $cmd = ['sudo', '/usr/local/bin/bbs-ssh-helper', 'update-storage-paths', $homeDir];
-        foreach ($paths as $p) {
-            $cmd[] = $p;
-        }
-        exec(implode(' ', array_map('escapeshellarg', $cmd)) . ' 2>&1', $output, $ret);
-        if ($ret !== 0) {
-            $this->db->insert('server_log', [
-                'agent_id' => $agentId,
-                'level' => 'warning',
-                'message' => "update-storage-paths failed: " . implode(' ', $output),
-            ]);
-        }
+        SshKeyManager::updateAgentStoragePaths($this->db, $agentId, $agent);
     }
 
     /**
@@ -671,12 +707,27 @@ class RepositoryController extends Controller
             $planName = $jobInfo['plan_name'] ?? null;
         }
 
-        // Previous archive for deleted-files comparison
+        // Previous (older) archive for deleted-files comparison, and the
+        // next (newer) one so the page can step through the repository's
+        // archives in the order the recovery points list shows them (#475).
+        // Ties on created_at are broken by id so the walk never skips or
+        // repeats an archive.
         $prevArchive = $this->db->fetchOne("
             SELECT id, archive_name, created_at FROM archives
-            WHERE repository_id = ? AND created_at < ?
-            ORDER BY created_at DESC LIMIT 1
-        ", [$id, $archive['created_at']]);
+            WHERE repository_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+            ORDER BY created_at DESC, id DESC LIMIT 1
+        ", [$id, $archive['created_at'], $archive['created_at'], $archiveId]);
+        $nextArchive = $this->db->fetchOne("
+            SELECT id, archive_name, created_at FROM archives
+            WHERE repository_id = ? AND (created_at > ? OR (created_at = ? AND id > ?))
+            ORDER BY created_at ASC, id ASC LIMIT 1
+        ", [$id, $archive['created_at'], $archive['created_at'], $archiveId]);
+        $archiveCount = (int) $this->db->fetchOne("SELECT COUNT(*) AS c FROM archives WHERE repository_id = ?", [$id])['c'];
+        // 1-based position in the newest-first list.
+        $archivePosition = (int) $this->db->fetchOne("
+            SELECT COUNT(*) AS c FROM archives
+            WHERE repository_id = ? AND (created_at > ? OR (created_at = ? AND id >= ?))
+        ", [$id, $archive['created_at'], $archive['created_at'], $archiveId])['c'];
 
         // ClickHouse stats — only the queries that finish quickly run inline.
         // The "deleted vs previous archive" summary used to run a large
@@ -741,6 +792,9 @@ class RepositoryController extends Controller
             'planName' => $planName,
             'jobInfo' => $jobInfo,
             'prevArchive' => $prevArchive,
+            'nextArchive' => $nextArchive,
+            'archiveCount' => $archiveCount,
+            'archivePosition' => $archivePosition,
             'statusBreakdown' => $statusBreakdown,
             'largestFiles' => $largestFiles,
             'clickhouseAvailable' => $clickhouseAvailable,
@@ -897,6 +951,34 @@ class RepositoryController extends Controller
         }
     }
 
+    /**
+     * Lock or unlock an archive (legal hold, #314). Locking renames the
+     * archive with the "locked." prefix so borg prune's glob filter can
+     * never select it; the archives.locked flag drives the UI and the
+     * BBS-side delete guards. Unlocking renames it back.
+     */
+    public function toggleArchiveLock(int $agentId, int $id, int $archiveId): void
+    {
+        $this->requireAuth();
+        $this->verifyCsrf();
+
+        if (!$this->canAccessAgent($agentId)) {
+            $this->flash('danger', 'Repository not found.');
+            $this->redirect('/clients');
+        }
+        $this->requirePermission(PermissionService::MANAGE_REPOS, $agentId);
+
+        // Shared with the admin API (#314). Web toggles the current state.
+        $result = (new \BBS\Services\ArchiveLockService())->setLock($agentId, $id, $archiveId, null);
+
+        if (!$result['ok'] && $result['result'] === 'not_found') {
+            $this->flash('danger', $result['message'] . '.');
+            $this->redirect("/clients/{$agentId}/repo/{$id}");
+        }
+        $this->flash($result['ok'] ? 'success' : 'danger', $result['message']);
+        $this->redirect("/clients/{$agentId}/repo/{$id}");
+    }
+
     public function deleteArchive(int $agentId, int $id, int $archiveId): void
     {
         $this->requireAuth();
@@ -910,16 +992,27 @@ class RepositoryController extends Controller
 
         $this->requirePermission(PermissionService::MANAGE_REPOS, $agentId);
 
+        if (($refusal = \BBS\Services\QueueManager::readOnlyRefusal($repo, 'archive_delete')) !== null) {
+            $this->flash('danger', $refusal);
+            $this->redirect("/clients/{$agentId}/repo/{$id}");
+        }
+
         $archive = $this->db->fetchOne("SELECT * FROM archives WHERE id = ? AND repository_id = ?", [$archiveId, $id]);
         if (!$archive) {
             $this->flash('danger', 'Archive not found.');
             $this->redirect("/clients/{$agentId}/repo/{$id}");
         }
 
+        if (!empty($archive['locked'])) {
+            $this->flash('danger', 'This archive is locked — unlock it first if you really want to delete it.');
+            $this->redirect("/clients/{$agentId}/repo/{$id}");
+        }
+
         // Check for existing delete job for this archive
         $existing = $this->db->fetchOne(
-            "SELECT id FROM backup_jobs WHERE repository_id = ? AND task_type = 'archive_delete' AND status IN ('queued', 'sent', 'running') AND status_message = ?",
-            [$id, $archive['archive_name']]
+            "SELECT id FROM backup_jobs WHERE repository_id = ? AND task_type = 'archive_delete' AND status IN ('queued', 'sent', 'running')
+               AND (restore_archive_id = ? OR status_message = ?)",
+            [$id, $archive['id'], $archive['archive_name']]
         );
         if ($existing) {
             $this->flash('warning', 'A delete job is already queued for this archive.');
@@ -931,6 +1024,9 @@ class RepositoryController extends Controller
             'repository_id' => $id,
             'task_type' => 'archive_delete',
             'status' => 'queued',
+            // The worker resolves the archive by id; the name is only shown
+            // until it starts and replaces it with progress (#527).
+            'restore_archive_id' => $archive['id'],
             'status_message' => $archive['archive_name'],
         ]);
 
@@ -971,6 +1067,13 @@ class RepositoryController extends Controller
 
         // Require repo_maintenance permission
         $this->requirePermission(PermissionService::REPO_MAINTENANCE, $repo['agent_id']);
+
+        // Compact and repair write to the repository; a read-only copy (#523)
+        // must not be written to. Check, catalog work and break lock are fine.
+        if (!empty($repo['read_only']) && in_array($action, ['compact', 'repair'], true)) {
+            $this->flash('danger', 'This repository is a read-only copy restored from an offsite sync. Compact and repair are not available on it.');
+            $this->redirect("/clients/{$repo['agent_id']}/repo/{$id}");
+        }
 
         // Map action to task_type
         // "Rebuild Full" dispatches as catalog_sync which wipes archives,
@@ -1105,13 +1208,20 @@ class RepositoryController extends Controller
         $s3PluginConfigs = [];
         if (($repo['storage_type'] ?? 'local') === 'local') {
             $s3SyncConfigs = $this->db->fetchAll("
-                SELECT rsc.plugin_config_id, pc.name as config_name,
+                SELECT rsc.plugin_config_id, pc.name as config_name, pc.config,
                        rsc.last_sync_at as last_s3_sync, rsc.enabled
                 FROM repository_s3_configs rsc
                 JOIN plugin_configs pc ON pc.id = rsc.plugin_config_id
                 WHERE rsc.repository_id = ?
                 ORDER BY pc.name
             ", [$id]);
+            // Type and label of each destination, for the card (#413)
+            $describe = new S3SyncService();
+            foreach ($s3SyncConfigs as &$dest) {
+                $dest += $describe->describeDestination(json_decode($dest['config'] ?? '{}', true) ?: []);
+                unset($dest['config']);
+            }
+            unset($dest);
 
             // S3 plugin configs for this agent not yet linked to this repo
             // (candidates for "Add destination")
@@ -1149,7 +1259,10 @@ class RepositoryController extends Controller
         // Get agent's borg_version for display (repo columns may not be populated yet)
         $agentInfo = $this->db->fetchOne("SELECT borg_version FROM agents WHERE id = ?", [$agentId]);
 
-        $repoPassphrase = $repo['passphrase_encrypted'] ? Encryption::decrypt($repo['passphrase_encrypted']) : null;
+        // The passphrase unlocks every archive: only for users who manage this
+        // client's repositories, not everyone who can see the client.
+        $repoPassphrase = ($repo['passphrase_encrypted'] && $this->hasPermission(PermissionService::MANAGE_REPOS, (int) $repo['agent_id']))
+            ? Encryption::decrypt($repo['passphrase_encrypted']) : null;
 
         // Get storage location label for display
         $storageLocationLabel = null;
@@ -1208,147 +1321,18 @@ class RepositoryController extends Controller
         // Require repo_maintenance permission for S3 restore
         $this->requirePermission(PermissionService::REPO_MAINTENANCE, $agentId);
 
-        // Which destination to restore from: the posted one, validated
-        // against this repo's links — or the repo's only destination
-        $requestedConfigId = (int) ($_POST['plugin_config_id'] ?? 0);
-        if ($requestedConfigId > 0) {
-            $s3Config = $this->db->fetchOne("
-                SELECT plugin_config_id
-                FROM repository_s3_configs
-                WHERE repository_id = ? AND plugin_config_id = ?
-            ", [$id, $requestedConfigId]);
-        } else {
-            $links = $this->db->fetchAll("
-                SELECT plugin_config_id
-                FROM repository_s3_configs
-                WHERE repository_id = ?
-            ", [$id]);
-            if (count($links) > 1) {
-                $this->flash('danger', 'This repository syncs to multiple S3 destinations — pick which one to restore from.');
-                $this->redirect("/clients/{$agentId}/repo/{$id}");
-            }
-            $s3Config = $links[0] ?? null;
-        }
-
-        if (!$s3Config) {
-            $this->flash('danger', 'This repository does not have S3 sync configured.');
+        $result = (new \BBS\Services\S3RestoreService())->queue(
+            $agentId, $repo, $mode,
+            $_POST['copy_name'] ?? null,
+            (int) ($_POST['plugin_config_id'] ?? 0)
+        );
+        if (!$result['ok']) {
+            $this->flash($result['code'] === 409 && str_starts_with($result['error'], 'Cannot restore') ? 'warning' : 'danger', $result['error']);
             $this->redirect("/clients/{$agentId}/repo/{$id}");
         }
 
-        // For 'copy' mode, create a new repository first
-        $targetRepoId = $id;
-        $targetRepoName = $repo['name'];
-        if ($mode === 'copy') {
-            // Use provided name or generate unique name for the copy
-            $copyName = trim($_POST['copy_name'] ?? '');
-            if (empty($copyName)) {
-                $copyName = $repo['name'] . '-copy';
-            }
-
-            // Check if name already exists
-            if ($this->db->fetchOne("SELECT id FROM repositories WHERE agent_id = ? AND name = ?", [$agentId, $copyName])) {
-                $this->flash('danger', "Repository \"{$copyName}\" already exists. Choose a different name.");
-                $this->redirect("/clients/{$agentId}/repo/{$id}");
-            }
-
-            // Build path for the copy (use same storage location as source repo)
-            $copyLocId = $repo['storage_location_id'] ?? null;
-            $copyLoc = $copyLocId ? $this->db->fetchOne("SELECT * FROM storage_locations WHERE id = ?", [$copyLocId]) : null;
-            if (!$copyLoc) {
-                $copyLoc = $this->db->fetchOne("SELECT * FROM storage_locations WHERE is_default = 1");
-            }
-            $copyStoragePath = $copyLoc['path'] ?? '';
-            if (empty($copyStoragePath)) {
-                $storageSetting = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'storage_path'");
-                $copyStoragePath = $storageSetting['value'] ?? '';
-            }
-            $serverHost = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
-            $host = !empty($repo['server_host_override']) ? $repo['server_host_override'] : ($serverHost['value'] ?? '');
-
-            $storageSetting2 = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'storage_path'");
-            $sshHomePath2 = rtrim($storageSetting2['value'] ?? '/var/bbs/home', '/');
-            $copyIsNonDefault = rtrim($copyStoragePath, '/') !== $sshHomePath2;
-
-            if ($copyIsNonDefault) {
-                $localCopyPath = rtrim($copyStoragePath, '/') . '/' . $agentId . '/' . $copyName;
-                if (!empty($repo['ssh_unix_user']) && !empty($host)) {
-                    $sshHost2 = SshKeyManager::stripHostPort($host);
-                    $copyPath = "ssh://{$repo['ssh_unix_user']}@{$sshHost2}//{$localCopyPath}";
-                } else {
-                    $copyPath = $localCopyPath;
-                }
-            } else {
-                if (!empty($repo['ssh_unix_user']) && !empty($host)) {
-                    $copyPath = SshKeyManager::buildSshRepoPath($repo['ssh_unix_user'], $host, $copyName);
-                } else {
-                    $copyPath = rtrim($copyStoragePath, '/') . '/' . $agentId . '/' . $copyName;
-                }
-            }
-
-            // Create the new repository record
-            $targetRepoId = $this->db->insert('repositories', [
-                'agent_id' => $agentId,
-                'storage_location_id' => $copyLoc['id'] ?? null,
-                'name' => $copyName,
-                'path' => $copyPath,
-                'encryption' => $repo['encryption'],
-                'passphrase_encrypted' => $repo['passphrase_encrypted'],
-            ]);
-            $targetRepoName = $copyName;
-
-            // Create local directory via SSH helper
-            $localPath = BorgCommandBuilder::getLocalRepoPath(['path' => $copyPath, 'agent_id' => $agentId, 'name' => $copyName, 'storage_location_id' => $copyLoc['id'] ?? null]);
-            $helperCmd = ['sudo', '/usr/local/bin/bbs-ssh-helper', 'create-repo-dir', $localPath];
-            exec(implode(' ', array_map('escapeshellarg', $helperCmd)) . ' 2>&1', $helperOutput, $helperRet);
-            if ($helperRet !== 0) {
-                $this->db->insert('server_log', [
-                    'agent_id' => $agentId,
-                    'level' => 'warning',
-                    'message' => "create-repo-dir helper failed for S3 copy restore: " . implode(' ', $helperOutput),
-                ]);
-            }
-
-            $this->db->insert('server_log', [
-                'agent_id' => $agentId,
-                'level' => 'info',
-                'message' => "Created repository \"{$copyName}\" as copy target for S3 restore",
-            ]);
-        } else {
-            // For 'replace' mode, check for active jobs on this repo
-            $activeJob = $this->db->fetchOne(
-                "SELECT id, task_type FROM backup_jobs WHERE repository_id = ? AND status IN ('queued', 'sent', 'running')",
-                [$id]
-            );
-            if ($activeJob) {
-                $this->flash('warning', "Cannot restore from S3 — repository has an active {$activeJob['task_type']} job (#" . $activeJob['id'] . ').');
-                $this->redirect("/clients/{$agentId}/repo/{$id}");
-            }
-        }
-
-        // Queue the S3 restore job on the target repo
-        // For copy mode, source_repository_id tells the restore where to pull S3 data from
-        $jobData = [
-            'agent_id' => $agentId,
-            'repository_id' => $targetRepoId,
-            'task_type' => 's3_restore',
-            'plugin_config_id' => $s3Config['plugin_config_id'],
-            'status' => 'queued',
-        ];
-        if ($mode === 'copy') {
-            $jobData['source_repository_id'] = $id;  // Original repo
-        }
-        $jobId = $this->db->insert('backup_jobs', $jobData);
-
-        $modeLabel = $mode === 'copy' ? 'copy' : 'replace';
-        $this->db->insert('server_log', [
-            'agent_id' => $agentId,
-            'backup_job_id' => $jobId,
-            'level' => 'info',
-            'message' => "S3 restore ({$modeLabel}) job #{$jobId} queued for repository \"{$targetRepoName}\"",
-        ]);
-
-        $this->flash('success', "S3 restore ({$modeLabel}) job queued for repository \"{$targetRepoName}\".");
-        $this->redirect("/clients/{$agentId}/repo/{$targetRepoId}");
+        $this->flash('success', "Restore ({$result['mode']}) from the offsite copy queued for repository \"{$result['repository_name']}\".");
+        $this->redirect("/clients/{$agentId}/repo/{$result['repository_id']}");
     }
 
     /**
@@ -1362,7 +1346,12 @@ class RepositoryController extends Controller
         $repoName = trim($_POST['repo_name'] ?? '');
         $pluginConfigId = (int) ($_POST['plugin_config_id'] ?? 0);
 
-        if (empty($repoName) || $pluginConfigId === 0) {
+        // The name is the offsite folder's and becomes the last part of the
+        // repo path. Offsite folder names only ever contain [A-Za-z0-9_-], so
+        // anything else is refused rather than cleaned up: "../2/x" must not
+        // reach another client's directory.
+        if (empty($repoName) || $pluginConfigId === 0
+            || mb_strlen($repoName) > 100 || RepositoryImportService::sanitizeName($repoName) !== $repoName) {
             $this->flash('danger', 'Invalid restore request.');
             $this->redirect("/clients/{$id}?tab=repos");
         }
@@ -1387,10 +1376,17 @@ class RepositoryController extends Controller
             $this->redirect("/clients/{$id}?tab=repos");
         }
 
-        // Get plugin config and resolve credentials
-        $pluginConfig = $this->db->fetchOne("SELECT config FROM plugin_configs WHERE id = ?", [$pluginConfigId]);
+        // Get plugin config and resolve credentials. Scoped to this agent:
+        // unscoped, a user with manage_repos on their own client could pass
+        // another tenant's S3 config id and pull that tenant's repository out
+        // of their bucket into a repo of their own (same class as
+        // GHSA-vm4w-wwpg-v3rc).
+        $pluginConfig = $this->db->fetchOne(
+            "SELECT config FROM plugin_configs WHERE id = ? AND agent_id = ?",
+            [$pluginConfigId, $id]
+        );
         if (!$pluginConfig) {
-            $this->flash('danger', 'S3 configuration not found.');
+            $this->flash('danger', 'Offsite sync destination not found.');
             $this->redirect("/clients/{$id}?tab=repos");
         }
 
@@ -1448,7 +1444,7 @@ class RepositoryController extends Controller
             'message' => "Restoring orphan repository \"{$repoName}\" from S3 — job #{$jobId} queued",
         ]);
 
-        $this->flash('success', "Repository \"{$repoName}\" created and S3 restore queued.");
+        $this->flash('success', "Repository \"{$repoName}\" created and offsite restore queued.");
         $this->redirect("/clients/{$id}?tab=repos");
     }
 
@@ -1468,9 +1464,14 @@ class RepositoryController extends Controller
 
         $this->requirePermission(PermissionService::MANAGE_REPOS, $agentId);
 
+        if (!empty($repo['read_only'])) {
+            $this->flash('danger', 'This repository is a read-only copy restored from an offsite sync. Backup plans and offsite sync cannot use it.');
+            $this->redirect("/clients/{$agentId}/repo/{$id}");
+        }
+
         $pluginConfigId = (int) ($_POST['plugin_config_id'] ?? 0);
         if ($pluginConfigId === 0) {
-            $this->flash('danger', 'Please select an S3 configuration.');
+            $this->flash('danger', 'Please select a destination.');
             $this->redirect("/clients/{$agentId}/repo/{$id}");
         }
 
@@ -1482,7 +1483,7 @@ class RepositoryController extends Controller
             [$pluginConfigId, $agentId]
         );
         if (!$pluginConfig) {
-            $this->flash('danger', 'Invalid S3 configuration.');
+            $this->flash('danger', 'Invalid offsite sync destination.');
             $this->redirect("/clients/{$agentId}/repo/{$id}");
         }
 
@@ -1508,10 +1509,31 @@ class RepositoryController extends Controller
         $this->db->insert('server_log', [
             'agent_id' => $agentId,
             'level' => 'info',
-            'message' => "S3 sync enabled for repository \"{$repo['name']}\" to destination \"{$pluginConfig['name']}\"",
+            'message' => "Offsite sync enabled for repository \"{$repo['name']}\" to destination \"{$pluginConfig['name']}\"",
         ]);
 
-        $this->flash('success', "S3 destination \"{$pluginConfig['name']}\" added for repository \"{$repo['name']}\".");
+        $this->flash('success', "Saved: repository \"{$repo['name']}\" now copies to \"{$pluginConfig['name']}\" after each backup. Use Sync now to run the first copy right away.");
+        $this->redirect("/clients/{$agentId}/repo/{$id}");
+    }
+
+    /**
+     * Queue an offsite sync to one destination now (#501).
+     */
+    public function s3SyncRun(int $agentId, int $id): void
+    {
+        $this->requireAuth();
+        $this->verifyCsrf();
+        if (!$this->canAccessAgent($agentId)) {
+            $this->flash('danger', 'Repository not found.');
+            $this->redirect('/clients');
+        }
+        $this->requirePermission(PermissionService::MANAGE_REPOS, $agentId);
+        $result = (new S3SyncService())->queueSync($agentId, $id, (int) ($_POST['plugin_config_id'] ?? 0));
+        if (!$result['ok']) {
+            $this->flash($result['code'] === 409 ? 'warning' : 'danger', $result['error']);
+        } else {
+            $this->flash('success', "Offsite sync queued (job #{$result['job_id']})." . ($result['note'] ? ' ' . $result['note'] : ''));
+        }
         $this->redirect("/clients/{$agentId}/repo/{$id}");
     }
 
@@ -1536,7 +1558,11 @@ class RepositoryController extends Controller
         $pluginConfigId = (int) ($_POST['plugin_config_id'] ?? 0);
         $destLabel = '';
         if ($pluginConfigId > 0) {
-            $dest = $this->db->fetchOne("SELECT name FROM plugin_configs WHERE id = ?", [$pluginConfigId]);
+            // Scoped so the label can't echo back another tenant's config name
+            $dest = $this->db->fetchOne(
+                "SELECT name FROM plugin_configs WHERE id = ? AND agent_id = ?",
+                [$pluginConfigId, $agentId]
+            );
             $destLabel = $dest ? " to \"{$dest['name']}\"" : '';
             $this->db->delete('repository_s3_configs', 'repository_id = ? AND plugin_config_id = ?', [$id, $pluginConfigId]);
         } else {
@@ -1546,28 +1572,38 @@ class RepositoryController extends Controller
         $this->db->insert('server_log', [
             'agent_id' => $agentId,
             'level' => 'info',
-            'message' => "S3 sync{$destLabel} disabled for repository \"{$repo['name']}\" (data remains in S3)",
+            'message' => "Offsite sync{$destLabel} disabled for repository \"{$repo['name']}\" (the copy at the destination is kept)",
         ]);
 
-        $this->flash('success', "S3 sync{$destLabel} disabled for repository \"{$repo['name']}\". Data remains in S3.");
+        $this->flash('success', "Offsite sync{$destLabel} disabled for repository \"{$repo['name']}\". The copy is left in place.");
         $this->redirect("/clients/{$agentId}/repo/{$id}");
     }
 
     /**
-     * AJAX: Verify an existing repository can be imported.
-     * POST /repositories/import/verify
+     * Verify an existing repository before importing it.
+     * POST /repositories/import/verify (AJAX, session auth)
      */
     public function verifyImport(): void
     {
         $this->requireAuth();
-        // Skip CSRF for AJAX — session auth is sufficient for same-origin POST
+        $this->verifyCsrf();
 
         $agentId = (int) ($_POST['agent_id'] ?? 0);
+        // Same as the import itself: it runs borg against a repository path
+        if ($agentId > 0) {
+            $this->requirePermission(PermissionService::MANAGE_REPOS, $agentId);
+        }
         $storageType = $_POST['storage_type'] ?? 'local';
-        $name = $this->sanitizePathName(trim($_POST['name'] ?? ''));
+        $name = RepositoryImportService::sanitizeName(trim($_POST['name'] ?? ''));
+        if (mb_strlen($name) > 100) {
+            $this->json(['status' => 'error', 'error' => 'Repository names can be at most 100 characters.']);
+        }
         $passphrase = $_POST['passphrase'] ?? '';
         $storageLocationId = !empty($_POST['storage_location_id']) ? (int) $_POST['storage_location_id'] : null;
         $remoteSshConfigId = !empty($_POST['remote_ssh_config_id']) ? (int) $_POST['remote_ssh_config_id'] : null;
+        if ($remoteSshConfigId && !$this->isAdmin()) {
+            $this->json(['status' => 'error', 'error' => 'Only an admin can place repositories on a Remote SSH host.'], 403);
+        }
 
         if (empty($name) || empty($agentId)) {
             $this->json(['status' => 'error', 'error' => 'Repository name and client are required. Names can only contain letters, numbers, hyphens, and underscores.']);
@@ -1580,110 +1616,15 @@ class RepositoryController extends Controller
             return;
         }
 
-        // Check for duplicate name
-        $existing = $this->db->fetchOne(
-            "SELECT id FROM repositories WHERE agent_id = ? AND name = ?",
-            [$agentId, $name]
-        );
-        if ($existing) {
-            $this->json(['status' => 'error', 'error' => "A repository named \"{$name}\" already exists for this client."]);
+        $result = (new RepositoryImportService())->verify($agent, $storageType, $name, $passphrase, $storageLocationId, $remoteSshConfigId);
+        if (!$result['success']) {
+            $this->json(['status' => 'error', 'error' => $result['error']]);
             return;
         }
-
-        if ($storageType === 'remote_ssh') {
-            if (!$remoteSshConfigId) {
-                $this->json(['status' => 'error', 'error' => 'Please select a remote SSH host.']);
-                return;
-            }
-
-            $remoteSshService = new RemoteSshService();
-            $config = $remoteSshService->getDecrypted($remoteSshConfigId);
-            if (!$config) {
-                $this->json(['status' => 'error', 'error' => 'Remote SSH host not found.']);
-                return;
-            }
-
-            $repoPath = $remoteSshService->buildRepoPath($config, $name);
-
-            $env = [];
-            if (!empty($passphrase)) {
-                $env['BORG_PASSPHRASE'] = $passphrase;
-            }
-
-            $result = $remoteSshService->runBorgCommand($config, $repoPath, ['list', '--json', $repoPath], $passphrase);
-
-            if (!$result['success']) {
-                $errorMsg = trim($result['stderr'] ?? $result['output'] ?? 'Unknown error');
-                $this->json(['status' => 'error', 'error' => "Cannot access repository: {$errorMsg}"]);
-                return;
-            }
-
-            $infoData = json_decode($result['output'], true);
-        } else {
-            // Resolve local path
-            $location = null;
-            if ($storageLocationId) {
-                $location = $this->db->fetchOne("SELECT * FROM storage_locations WHERE id = ?", [$storageLocationId]);
-            }
-            if (!$location) {
-                $location = $this->db->fetchOne("SELECT * FROM storage_locations WHERE is_default = 1");
-            }
-            if (!$location) {
-                $storageSetting = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'storage_path'");
-                $location = ['id' => null, 'path' => $storageSetting['value'] ?? '/var/bbs', 'is_default' => 1];
-            }
-
-            $localPath = rtrim($location['path'], '/') . '/' . $agentId . '/' . $name;
-
-            $helperCmd = ['sudo', '/usr/local/bin/bbs-ssh-helper', 'verify-repo', '-', $localPath];
-            $proc = proc_open($helperCmd, [
-                0 => ['pipe', 'r'],
-                1 => ['pipe', 'w'],
-                2 => ['pipe', 'w'],
-            ], $pipes);
-
-            $output = '';
-            $stderr = '';
-            $exitCode = -1;
-            if (is_resource($proc)) {
-                fwrite($pipes[0], ($passphrase ?? '') . "\n");
-                fclose($pipes[0]);
-                $output = stream_get_contents($pipes[1]);
-                $stderr = stream_get_contents($pipes[2]);
-                fclose($pipes[1]);
-                fclose($pipes[2]);
-                $exitCode = proc_close($proc);
-            }
-
-            if ($exitCode !== 0) {
-                // Prefer stderr — borg writes real errors there and only emits
-                // info/cache messages on stdout. Falling back to stdout keeps
-                // the path reasonable if stderr happens to be empty.
-                $errorMsg = trim($stderr ?: $output);
-                if (str_contains($errorMsg, 'passphrase') || str_contains($errorMsg, 'Passphrase')) {
-                    $errorMsg = 'Incorrect passphrase for this repository.';
-                } elseif (str_contains($errorMsg, 'not a valid repository') || str_contains($errorMsg, 'does not exist') || str_contains($errorMsg, 'Failed to create/acquire')) {
-                    $errorMsg = "No valid borg repository found at: {$localPath}";
-                }
-                $this->json(['status' => 'error', 'error' => $errorMsg ?: 'Failed to verify repository.']);
-                return;
-            }
-
-            $infoData = json_decode($output, true);
-        }
-
-        if (!$infoData) {
-            $this->json(['status' => 'error', 'error' => 'Failed to parse repository info. Is this a valid borg repository?']);
-            return;
-        }
-
-        $encryption = $infoData['encryption']['mode'] ?? 'unknown';
-        $archiveCount = count($infoData['archives'] ?? []);
-
         $this->json([
             'status' => 'ok',
-            'encryption' => $encryption,
-            'archive_count' => $archiveCount,
+            'encryption' => $result['encryption'],
+            'archive_count' => $result['archive_count'],
         ]);
     }
 
@@ -1698,11 +1639,19 @@ class RepositoryController extends Controller
 
         $agentId = (int) ($_POST['agent_id'] ?? 0);
         $name = trim($_POST['name'] ?? '');
+        if (mb_strlen($name) > 100) {
+            $this->flash('danger', 'Repository names can be at most 100 characters.');
+            $this->redirect("/clients/{$agentId}?tab=repos");
+        }
         $encryption = $_POST['encryption'] ?? 'unknown';
         $passphrase = $_POST['passphrase'] ?? '';
         $storageType = $_POST['storage_type'] ?? 'local';
         $storageLocationId = !empty($_POST['storage_location_id']) ? (int) $_POST['storage_location_id'] : null;
         $remoteSshConfigId = !empty($_POST['remote_ssh_config_id']) ? (int) $_POST['remote_ssh_config_id'] : null;
+        if ($remoteSshConfigId && !$this->isAdmin()) {
+            $this->flash('danger', 'Only an admin can place repositories on a Remote SSH host: its key is shared by every repository on that host.');
+            $this->redirect('/clients');
+        }
 
         if (empty($name) || empty($agentId)) {
             $this->flash('danger', 'Repository name and client are required.');
@@ -1718,172 +1667,18 @@ class RepositoryController extends Controller
         }
         $this->requirePermission(PermissionService::MANAGE_REPOS, $agentId);
 
-        // Check for duplicate name
-        $existing = $this->db->fetchOne(
-            "SELECT id FROM repositories WHERE agent_id = ? AND name = ?",
-            [$agentId, $name]
-        );
-        if ($existing) {
-            $this->flash('warning', "Repository \"{$name}\" already exists.");
+        // Special characters are stripped but case is kept: the name must
+        // match the existing directory (#360).
+        $name = RepositoryImportService::sanitizeName($name);
+
+        $result = (new RepositoryImportService())->import($agent, $storageType, $name, $encryption, $passphrase, $storageLocationId, $remoteSshConfigId);
+        if (!$result['success']) {
+            $this->flash(str_contains($result['error'], 'already exists') ? 'warning' : 'danger', $result['error']);
             $this->redirect("/clients/{$agentId}?tab=repos");
             return;
         }
 
-        // Sanitize the name — import uses this for both the directory lookup
-        // and the DB record. Leading slashes, special characters, etc. get
-        // stripped to match how new repos are created.
-        $name = $this->sanitizePathName($name);
-        if (empty($name)) {
-            $this->flash('danger', 'Repository name must contain at least one alphanumeric character.');
-            $this->redirect("/clients/{$agentId}?tab=repos");
-            return;
-        }
-
-        if ($storageType === 'remote_ssh') {
-            $this->importRemoteSsh($agentId, $name, $encryption, $passphrase, $remoteSshConfigId);
-        } else {
-            $this->importLocal($agentId, $agent, $name, $encryption, $passphrase, $storageLocationId);
-        }
-    }
-
-    /**
-     * Import a local repository that already exists on disk.
-     */
-    private function importLocal(int $agentId, array $agent, string $name, string $encryption, string $passphrase, ?int $storageLocationId): void
-    {
-        // Resolve storage location (same logic as storeLocal)
-        $location = null;
-        if ($storageLocationId) {
-            $location = $this->db->fetchOne("SELECT * FROM storage_locations WHERE id = ?", [$storageLocationId]);
-        }
-        if (!$location) {
-            $location = $this->db->fetchOne("SELECT * FROM storage_locations WHERE is_default = 1");
-        }
-        if (!$location) {
-            $storageSetting = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'storage_path'");
-            $location = ['id' => null, 'path' => $storageSetting['value'] ?? '/var/bbs', 'is_default' => 1];
-        }
-
-        $serverHost = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
-        $host = !empty($agent['server_host_override']) ? $agent['server_host_override'] : ($serverHost['value'] ?? '');
-
-        // Determine if this is a non-default storage location (same logic as storeLocal)
-        $locationPath = rtrim($location['path'], '/');
-        $sshHomeDir = $agent['ssh_home_dir'] ?? null;
-        $sshHomePath = $sshHomeDir ? rtrim(dirname($sshHomeDir), '/') : null;
-        $isNonDefault = !$sshHomePath || $locationPath !== $sshHomePath;
-
-        if ($isNonDefault) {
-            $localPath = $locationPath . '/' . $agentId . '/' . $name;
-            if (!empty($agent['ssh_unix_user']) && !empty($host)) {
-                $sshHost = SshKeyManager::stripHostPort($host);
-                $path = "ssh://{$agent['ssh_unix_user']}@{$sshHost}//{$localPath}";
-            } else {
-                $path = $localPath;
-            }
-        } else {
-            if (!empty($agent['ssh_unix_user']) && !empty($host)) {
-                $path = SshKeyManager::buildSshRepoPath($agent['ssh_unix_user'], $host, $name);
-            } else {
-                $path = rtrim($location['path'], '/') . '/' . $agentId . '/' . $name;
-            }
-            $localPath = rtrim($location['path'], '/') . '/' . $agentId . '/' . $name;
-        }
-
-        $repoId = $this->db->insert('repositories', [
-            'agent_id' => $agentId,
-            'storage_type' => 'local',
-            'storage_location_id' => $location['id'] ?? null,
-            'name' => $name,
-            'path' => $path,
-            'encryption' => $encryption,
-            'passphrase_encrypted' => ($encryption !== 'none' && !empty($passphrase)) ? Encryption::encrypt($passphrase) : null,
-        ]);
-
-        // Fix ownership so the SSH user can access the repo
-        if (!empty($agent['ssh_unix_user'])) {
-            $fixCmd = ['sudo', '/usr/local/bin/bbs-ssh-helper', 'fix-repo-perms', $localPath, $agent['ssh_unix_user']];
-            exec(implode(' ', array_map('escapeshellarg', $fixCmd)) . ' 2>&1', $fixOutput, $fixRet);
-            if ($fixRet !== 0) {
-                $this->db->insert('server_log', [
-                    'agent_id' => $agentId,
-                    'level' => 'warning',
-                    'message' => "fix-repo-perms failed during import: " . implode(' ', $fixOutput),
-                ]);
-            }
-        }
-
-        // Update .storage-paths so bbs-ssh-gate allows borg access to this location
-        if (!empty($agent['ssh_unix_user'])) {
-            $this->updateAgentStoragePaths($agentId, $agent);
-        }
-
-        // Queue catalog_sync to discover archives and populate file catalog
-        $this->db->insert('backup_jobs', [
-            'agent_id' => $agentId,
-            'repository_id' => $repoId,
-            'backup_plan_id' => null,
-            'task_type' => 'catalog_sync',
-            'status' => 'queued',
-        ]);
-
-        $this->db->insert('server_log', [
-            'agent_id' => $agentId,
-            'level' => 'info',
-            'message' => "Repository \"{$name}\" imported ({$encryption}) from {$localPath}",
-        ]);
-
-        $this->flash('success', "Repository \"{$name}\" imported successfully. A catalog sync has been queued.");
-        $this->redirect("/clients/{$agentId}?tab=repos");
-    }
-
-    /**
-     * Import a repository from a remote SSH host.
-     */
-    private function importRemoteSsh(int $agentId, string $name, string $encryption, string $passphrase, ?int $remoteSshConfigId): void
-    {
-        if (!$remoteSshConfigId) {
-            $this->flash('danger', 'Please select a remote SSH host.');
-            $this->redirect("/clients/{$agentId}?tab=repos");
-            return;
-        }
-
-        $remoteSshService = new RemoteSshService();
-        $config = $remoteSshService->getById($remoteSshConfigId);
-        if (!$config) {
-            $this->flash('danger', 'Remote SSH host not found.');
-            $this->redirect("/clients/{$agentId}?tab=repos");
-            return;
-        }
-
-        $repoPath = $remoteSshService->buildRepoPath($config, $name);
-
-        $repoId = $this->db->insert('repositories', [
-            'agent_id' => $agentId,
-            'storage_type' => 'remote_ssh',
-            'remote_ssh_config_id' => $remoteSshConfigId,
-            'name' => $name,
-            'path' => $repoPath,
-            'encryption' => $encryption,
-            'passphrase_encrypted' => ($encryption !== 'none' && !empty($passphrase)) ? Encryption::encrypt($passphrase) : null,
-        ]);
-
-        // Queue catalog_sync to discover archives
-        $this->db->insert('backup_jobs', [
-            'agent_id' => $agentId,
-            'repository_id' => $repoId,
-            'backup_plan_id' => null,
-            'task_type' => 'catalog_sync',
-            'status' => 'queued',
-        ]);
-
-        $this->db->insert('server_log', [
-            'agent_id' => $agentId,
-            'level' => 'info',
-            'message' => "Remote repository \"{$name}\" imported ({$encryption}) from {$config['remote_user']}@{$config['remote_host']}",
-        ]);
-
-        $this->flash('success', "Repository \"{$name}\" imported from {$config['remote_host']}. A catalog sync has been queued.");
+        $this->flash('success', $result['message']);
         $this->redirect("/clients/{$agentId}?tab=repos");
     }
 
@@ -2042,6 +1837,10 @@ class RepositoryController extends Controller
 
         $agentId = (int) ($_POST['agent_id'] ?? 0);
         $name = $this->sanitizePathName(trim($_POST['name'] ?? ''));
+        if (mb_strlen($name) > 100) {
+            $this->json(['status' => 'error', 'error' => 'Repository names can be at most 100 characters.']);
+            return;
+        }
         $passphrase = $_POST['passphrase'] ?? '';
         $storageLocationId = !empty($_POST['storage_location_id']) ? (int) $_POST['storage_location_id'] : null;
         $sourcePath = $this->validateSourcePath($_POST['source_path'] ?? '');
@@ -2147,6 +1946,10 @@ class RepositoryController extends Controller
 
         $agentId = (int) ($_POST['agent_id'] ?? 0);
         $name = $this->sanitizePathName(trim($_POST['name'] ?? ''));
+        if (mb_strlen($name) > 100) {
+            $this->flash('danger', 'Repository names can be at most 100 characters.');
+            $this->redirect("/clients/{$agentId}?tab=repos");
+        }
         $encryption = $_POST['encryption'] ?? 'unknown';
         $passphrase = $_POST['passphrase'] ?? '';
         $storageLocationId = !empty($_POST['storage_location_id']) ? (int) $_POST['storage_location_id'] : null;
@@ -2203,6 +2006,13 @@ class RepositoryController extends Controller
 
         // From here the repo sits at the canonical path — register it through
         // the standard import path (DB row, perms, ssh-gate paths, catalog sync).
-        $this->importLocal($agentId, $agent, $name, $encryption, $passphrase, $storageLocationId);
+        $result = (new RepositoryImportService())->import($agent, 'local', $name, $encryption, $passphrase, $storageLocationId, null);
+        if (!$result['success']) {
+            $this->flash('danger', $result['error']);
+            $this->redirect("/clients/{$agentId}?tab=repos");
+            return;
+        }
+        $this->flash('success', $result['message']);
+        $this->redirect("/clients/{$agentId}?tab=repos");
     }
 }

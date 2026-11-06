@@ -78,6 +78,16 @@ class Controller
         }
         $_SESSION['last_activity'] = time();
 
+        // The role is read again on every request: a demoted admin must lose
+        // admin now, and a deleted user must be signed out, not at timeout.
+        $current = $this->db->fetchOne("SELECT role FROM users WHERE id = ?", [(int) $_SESSION['user_id']]);
+        if (!$current) {
+            session_destroy();
+            session_start();
+            $this->redirect('/login');
+        }
+        $_SESSION['user_role'] = $current['role'];
+
         // Force 2FA: redirect users without 2FA to profile setup
         // Skip for OIDC users — they rely on their identity provider for auth strength
         $currentUri = $_SERVER['REQUEST_URI'] ?? '';
@@ -126,6 +136,134 @@ class Controller
      */
     protected function requireApiToken(): array
     {
+        $ctx = $this->authenticateBearer();
+
+        if ($ctx['role'] !== 'admin') {
+            $this->json(['error' => 'API token must belong to an admin user'], 403);
+        }
+
+        return $ctx;
+    }
+
+    /**
+     * Authenticate a Bearer token without requiring the admin role.
+     * Used by mobile/session endpoints, which scope their own results
+     * through PermissionService instead (see apiAgentWhereClause /
+     * apiCanAccessAgent). Do NOT loosen requireApiToken() itself —
+     * existing automation depends on its admin gate.
+     */
+    protected function requireApiAuth(): array
+    {
+        return $this->authenticateBearer();
+    }
+
+    /**
+     * The gate in front of the monitoring endpoints.
+     *
+     * A scraper is a machine on a network: it is admitted by address first
+     * (metrics_acl), then — if that range asks for one — by a token. The
+     * decision itself lives in MetricsAccess so it can be exercised without a
+     * request; this method is the plumbing around it.
+     *
+     * $legacyAdminFallback keeps the JSON endpoints working exactly as before
+     * on an install that has never opened the feature: monitoring off means
+     * "nothing changed", not "your automation broke".
+     *
+     * @return array the token context, or [] when the range needs no token
+     */
+    protected function requireMetricsAccess(bool $legacyAdminFallback = false): array
+    {
+        $setting = function (string $key, string $default): string {
+            $row = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = ?", [$key]);
+            $value = $row['value'] ?? '';
+            return $value === '' ? $default : (string) $value;
+        };
+
+        if ($setting('metrics_enabled', '0') !== '1') {
+            if ($legacyAdminFallback) {
+                return $this->requireApiToken();
+            }
+            // 404, not 403: an endpoint nobody turned on should not announce
+            // itself, exactly as denyIfHosted() reasons about hosted surfaces.
+            $this->json(['error' => 'Not found'], 404);
+        }
+
+        // /api/v1/metrics and /api/v1/health took an admin token before the
+        // monitoring gate existed, from any address (the app calls /health).
+        // A regular token there keeps that check; the address list governs
+        // monitoring tokens and token-less callers only.
+        if ($legacyAdminFallback && $this->presentedTokenKind() === 'user') {
+            return $this->requireApiToken();
+        }
+
+        $acl = \BBS\Services\MetricsAccess::parseAcl($setting('metrics_acl', '[]'));
+        $proxies = \BBS\Services\MetricsAccess::parseCidrList($setting('metrics_trusted_proxies', '[]'));
+        $ip = \BBS\Services\MetricsAccess::resolveClientIp(
+            $_SERVER['REMOTE_ADDR'] ?? '',
+            $_SERVER['HTTP_X_FORWARDED_FOR'] ?? null,
+            $proxies
+        );
+
+        $decision = \BBS\Services\MetricsAccess::decide(true, $acl, $ip);
+        if ($decision['verdict'] !== \BBS\Services\MetricsAccess::ALLOW) {
+            // Naming the address costs nothing — the caller already knows its
+            // own — and is the difference between a five-second fix and an
+            // afternoon, especially behind Docker or an ingress where the
+            // address BBS sees is not the one the operator expects.
+            $this->json([
+                'error' => "Monitoring access denied for {$ip}. Add it to the allowed ranges in Settings → API.",
+            ], 403);
+        }
+
+        $rate = (int) $setting('metrics_rate_per_minute', '12');
+        if ($rate < 1) {
+            $rate = 1;
+        }
+        if (!$this->checkRateLimit('metrics', $rate, 60, $ip)) {
+            header('Retry-After: 60');
+            $this->json(['error' => "Rate limit exceeded ({$rate} requests per minute)"], 429);
+        }
+
+        if (!$decision['require_token']) {
+            return [];
+        }
+
+        // Its own budget, separate from admin_api: a scraper left with a
+        // revoked token must not lock the admin API out for everything else
+        // coming from that address. Keyed to the resolved address, so the
+        // reset after a good token clears the same row behind a proxy.
+        $ctx = $this->authenticateBearer(true, 'metrics_auth', $ip);
+        if (($ctx['token_kind'] ?? 'user') !== 'metrics' && ($ctx['role'] ?? '') !== 'admin') {
+            $this->json(['error' => 'Token must be a monitoring token or belong to an admin user'], 403);
+        }
+
+        return $ctx;
+    }
+
+    /**
+     * Kind of the Bearer token on this request, without authenticating it:
+     * 'user', 'metrics', or null when none was sent or it matches nothing.
+     */
+    private function presentedTokenKind(): ?string
+    {
+        $header = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
+        if (!str_starts_with($header, 'Bearer ') || strlen($header) <= 7) {
+            return null;
+        }
+        $row = $this->db->fetchOne(
+            "SELECT kind FROM api_tokens WHERE token_hash = ?",
+            [hash('sha256', substr($header, 7))]
+        );
+        return $row ? (($row['kind'] ?? 'user') === 'metrics' ? 'metrics' : 'user') : null;
+    }
+
+    /**
+     * Shared Bearer-token authentication: hash lookup, rate limit,
+     * expiry check, last_used_at / last_seen_ip bump. Role enforcement
+     * is the caller's job.
+     */
+    protected function authenticateBearer(bool $allowMetricsKind = false, string $rateLimitKey = 'admin_api', ?string $ipOverride = null): array
+    {
         $header = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
         $token = '';
         if (str_starts_with($header, 'Bearer ')) {
@@ -136,13 +274,13 @@ class Controller
             $this->json(['error' => 'Missing authorization token. Use: Authorization: Bearer <token>'], 401);
         }
 
-        if (!$this->checkRateLimit('admin_api', 20, 300)) {
+        if (!$this->checkRateLimit($rateLimitKey, 20, 300, $ipOverride)) {
             $this->json(['error' => 'Too many failed attempts. Try again later.'], 429);
         }
 
         $hash = hash('sha256', $token);
         $apiToken = $this->db->fetchOne(
-            "SELECT t.*, u.role FROM api_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ?",
+            "SELECT t.*, u.role, u.username, u.all_clients FROM api_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ?",
             [$hash]
         );
 
@@ -150,21 +288,107 @@ class Controller
             $this->json(['error' => 'Invalid API token'], 401);
         }
 
-        if ($apiToken['role'] !== 'admin') {
-            $this->json(['error' => 'API token must belong to an admin user'], 403);
+        if (!empty($apiToken['expires_at']) && strtotime($apiToken['expires_at']) < time()) {
+            $this->json(['error' => 'API token has expired'], 401);
         }
 
-        $this->resetRateLimit('admin_api');
+        // A monitoring token is read-only by construction: it opens the
+        // monitoring endpoints and nothing else, whatever the role of the user
+        // it was minted under. Enforced here rather than in each caller, so a
+        // route added later cannot accidentally accept one.
+        if (($apiToken['kind'] ?? 'user') === 'metrics' && !$allowMetricsKind) {
+            $this->json(['error' => 'This token may only read the monitoring endpoints'], 403);
+        }
 
-        $this->db->query("UPDATE api_tokens SET last_used_at = NOW() WHERE id = ?", [$apiToken['id']]);
+        $this->resetRateLimit($rateLimitKey, $ipOverride);
+
+        $ip = $ipOverride ?? ($_SERVER['REMOTE_ADDR'] ?? null);
+        $this->db->query(
+            "UPDATE api_tokens SET last_used_at = NOW(), last_seen_ip = ? WHERE id = ?",
+            [$ip, $apiToken['id']]
+        );
 
         return [
             'id' => $apiToken['user_id'],
+            'username' => $apiToken['username'],
+            'role' => $apiToken['role'],
+            'all_clients' => !empty($apiToken['all_clients']),
             'token_id' => $apiToken['id'],
             'token_name' => $apiToken['name'],
             'token_kind' => $apiToken['kind'] ?? 'user',
             'can_read_secrets' => !empty($apiToken['can_read_secrets']),
         ];
+    }
+
+    /**
+     * Authenticate a Bearer token and require the admin role.
+     *
+     * For server-wide endpoints (settings, tokens, updates) that have no
+     * per-agent scoping to fall back on. Unlike requireApiToken() this accepts
+     * mobile tokens, so an admin can use them from the app; unlike
+     * requireApiAuth() it refuses non-admins outright, matching
+     * SettingsController::requireAdmin().
+     */
+    protected function requireApiAdmin(): array
+    {
+        $ctx = $this->authenticateBearer();
+        if (($ctx['role'] ?? '') !== 'admin') {
+            $this->json(['error' => 'Administrator access required'], 403);
+        }
+        return $ctx;
+    }
+
+    /**
+     * Agent-visibility WHERE clause for token-authenticated endpoints,
+     * mirroring getAgentWhereClause() for the session-based web UI.
+     * Admins see everything; other users see their assigned agents.
+     */
+    protected function apiAgentWhereClause(array $ctx, string $agentAlias = 'a'): array
+    {
+        if (($ctx['role'] ?? '') === 'admin') {
+            return ['1=1', []];
+        }
+        $permService = new \BBS\Services\PermissionService();
+        return $permService->getAgentWhereClause((int) $ctx['id'], $agentAlias);
+    }
+
+    /**
+     * Per-agent access check for token-authenticated endpoints.
+     */
+    protected function apiCanAccessAgent(array $ctx, int $agentId): bool
+    {
+        if (($ctx['role'] ?? '') === 'admin') {
+            return true;
+        }
+        $permService = new \BBS\Services\PermissionService();
+        return $permService->canAccessAgent((int) $ctx['id'], $agentId);
+    }
+
+    /**
+     * Per-agent action permission check for token-authenticated endpoints
+     * (trigger_backup, restore, ...). Admins bypass, matching the web UI.
+     */
+    /**
+     * Enforce an action permission, with the refusal worded for a person.
+     * The client shows the message as-is, so it names the permission the way
+     * the web's user-edit screen labels it — not the internal key.
+     */
+    protected function apiRequirePermission(array $ctx, string $permission, int $agentId): void
+    {
+        if ($this->apiHasPermission($ctx, $permission, $agentId)) {
+            return;
+        }
+        $label = \BBS\Services\PermissionService::PERMISSION_LABELS[$permission] ?? $permission;
+        $this->json(['error' => "You don't have the {$label} permission."], 403);
+    }
+
+    protected function apiHasPermission(array $ctx, string $permission, int $agentId): bool
+    {
+        if (($ctx['role'] ?? '') === 'admin') {
+            return true;
+        }
+        $permService = new \BBS\Services\PermissionService();
+        return $permService->hasPermission((int) $ctx['id'], $permission, $agentId);
     }
 
     /**
@@ -176,6 +400,11 @@ class Controller
      */
     protected function tokenCanReadSecrets(array $ctx): bool
     {
+        // Mobile tokens can NEVER read secrets, even for admin accounts —
+        // passphrases and S3 credentials must not reach a phone.
+        if (($ctx['token_kind'] ?? 'user') === 'mobile') {
+            return false;
+        }
         if (($ctx['token_kind'] ?? 'user') === 'platform') {
             return true;
         }
@@ -286,14 +515,18 @@ class Controller
     /**
      * Check rate limit. Returns true if allowed, false if rate-limited.
      */
-    protected function checkRateLimit(string $endpoint, int $maxAttempts = 10, int $windowSeconds = 300): bool
+    protected function checkRateLimit(string $endpoint, int $maxAttempts = 10, int $windowSeconds = 300, ?string $ipOverride = null): bool
     {
-        $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+        // $ipOverride exists for callers that resolved the address themselves
+        // (the monitoring gate, which may read it from a trusted proxy): the
+        // budget has to follow the scraper, not the proxy in front of it.
+        $ip = $ipOverride ?? ($_SERVER['REMOTE_ADDR'] ?? '0.0.0.0');
 
-        // Clean old entries
+        // Clean old entries for this endpoint only. Endpoints use different
+        // windows; a short one must not clear a longer one's attempts early.
         $this->db->query(
-            "DELETE FROM rate_limits WHERE window_start < DATE_SUB(NOW(), INTERVAL ? SECOND)",
-            [$windowSeconds]
+            "DELETE FROM rate_limits WHERE endpoint = ? AND window_start < DATE_SUB(NOW(), INTERVAL ? SECOND)",
+            [$endpoint, $windowSeconds]
         );
 
         $row = $this->db->fetchOne(
@@ -322,10 +555,38 @@ class Controller
     /**
      * Reset rate limit on successful action (e.g. after login).
      */
-    protected function resetRateLimit(string $endpoint): void
+    protected function resetRateLimit(string $endpoint, ?string $ipOverride = null): void
     {
-        $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+        $ip = $ipOverride ?? ($_SERVER['REMOTE_ADDR'] ?? '0.0.0.0');
         $this->db->delete('rate_limits', 'ip_address = ? AND endpoint = ?', [$ip, $endpoint]);
+    }
+
+    /**
+     * The path a running backup is on, from the end of its catalog log.
+     *
+     * The SSH gate writes the stream with `head -c`, which flushes in 4 KB
+     * blocks, so the file usually ends partway through a line. Use the last
+     * complete line instead of the last line (#546).
+     */
+    protected function currentCatalogFile(string $catalogPath): ?string
+    {
+        $fh = @fopen($catalogPath, 'rb');
+        if (!$fh) {
+            return null;
+        }
+        $size = (int) (fstat($fh)['size'] ?? 0);
+        $readBytes = min($size, 65536);
+        fseek($fh, $size - $readBytes);
+        $tail = $readBytes > 0 ? (string) fread($fh, $readBytes) : '';
+        fclose($fh);
+
+        foreach (array_reverse(explode("\n", $tail)) as $line) {
+            $entry = json_decode(trim($line), true);
+            if (is_array($entry) && !empty($entry['path'])) {
+                return rtrim($entry['path'], '/');
+            }
+        }
+        return null;
     }
 
     protected function flash(string $type, string $message): void

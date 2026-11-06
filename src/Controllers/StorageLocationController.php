@@ -26,17 +26,42 @@ class StorageLocationController extends Controller
                 [$loc['id']]
             )['total'] ?? 0);
 
-            $diskUsage = ServerStats::getDiskUsage($loc['path']);
-            $loc['disk_total'] = $diskUsage['total'] ?? 0;
-            $loc['disk_used'] = $diskUsage['used'] ?? 0;
-            $loc['disk_free'] = $diskUsage['free'] ?? 0;
-            $loc['disk_percent'] = $diskUsage['percent'] ?? 0;
+            // capacityForLocation() prefers a stated capacity and refuses to
+            // repeat the local cache disk's figures for a mount that cannot
+            // report its own size (#415).
+            $capacity = ServerStats::capacityForLocation($loc);
+            $loc['disk_total'] = $capacity['total'] ?? 0;
+            $loc['disk_used'] = $capacity['used'] ?? 0;
+            $loc['disk_free'] = $capacity['free'] ?? 0;
+            $loc['disk_percent'] = $capacity['percent'] ?? 0;
+            $loc['capacity_source'] = $capacity['source'] ?? null;
+            $loc['capacity_unknown_reason'] = $capacity === null
+                ? ServerStats::capacityUnknownReason($loc)
+                : null;
         }
         unset($loc);
 
-        // Remote SSH configs
+        // BorgBase accounts: one card each; their locations live on the account page
+        $borgBaseService = new \BBS\Services\BorgBaseService();
+        $borgBaseAccounts = $borgBaseService->getAll();
+        foreach ($borgBaseAccounts as &$ba) {
+            $ba['location_count'] = (int) ($this->db->fetchOne(
+                "SELECT COUNT(*) as cnt FROM remote_ssh_configs WHERE borgbase_account_id = ?",
+                [$ba['id']]
+            )['cnt'] ?? 0);
+            $ba['repo_count'] = (int) ($this->db->fetchOne(
+                "SELECT COUNT(*) as cnt FROM repositories r JOIN remote_ssh_configs rsc ON rsc.id = r.remote_ssh_config_id WHERE rsc.borgbase_account_id = ?",
+                [$ba['id']]
+            )['cnt'] ?? 0);
+        }
+        unset($ba);
+
+        // Remote SSH configs (locations grouped under a BorgBase account are shown there instead)
         $remoteSshService = new \BBS\Services\RemoteSshService();
-        $remoteSshConfigs = $remoteSshService->getAll();
+        $remoteSshConfigs = array_values(array_filter(
+            $remoteSshService->getAll(),
+            fn($c) => empty($c['borgbase_account_id'])
+        ));
         $remoteRepoCount = (int) ($this->db->fetchOne("SELECT COUNT(*) as cnt FROM repositories WHERE storage_type = 'remote_ssh'")['cnt'] ?? 0);
 
         // Attach repo counts to each remote SSH config
@@ -75,10 +100,12 @@ class StorageLocationController extends Controller
             'pageTitle' => 'Storage',
             'locations' => $locations,
             'remoteSshConfigs' => $remoteSshConfigs,
+            'borgBaseAccounts' => $borgBaseAccounts,
             'remoteRepoCount' => $remoteRepoCount,
             'localRepoCount' => $localRepoCount,
             'settings' => $settings,
             's3Destinations' => $s3Destinations,
+            'maxQueue' => \BBS\Services\QueueManager::maxQueueSetting(),
         ]);
     }
 
@@ -91,6 +118,8 @@ class StorageLocationController extends Controller
         $label = trim($_POST['label'] ?? '');
         $path = rtrim(trim($_POST['path'] ?? ''), '/');
         $isDefault = !empty($_POST['is_default']) ? 1 : 0;
+        $capacityBytes = $this->capacityFromPost();
+        $maxConcurrent = $this->maxConcurrentFromPost();
 
         if (empty($label) || empty($path)) {
             $this->flash('danger', 'Label and path are required.');
@@ -110,6 +139,8 @@ class StorageLocationController extends Controller
         $this->db->insert('storage_locations', [
             'label' => $label,
             'path' => $path,
+            'capacity_bytes' => $capacityBytes,
+            'max_concurrent' => $maxConcurrent,
             'is_default' => $isDefault,
         ]);
 
@@ -133,7 +164,9 @@ class StorageLocationController extends Controller
         }
 
         $label = trim($_POST['label'] ?? '');
-        $path = rtrim(trim($_POST['path'] ?? ''), '/');
+        // The edit form doesn't offer the path — repositories live under it, so
+        // moving one is a filesystem operation rather than a settings change.
+        $path = rtrim(trim($_POST['path'] ?? $location['path']), '/');
         $isDefault = !empty($_POST['is_default']) ? 1 : 0;
 
         if (empty($label) || empty($path)) {
@@ -159,6 +192,8 @@ class StorageLocationController extends Controller
         $this->db->update('storage_locations', [
             'label' => $label,
             'path' => $path,
+            'capacity_bytes' => $this->capacityFromPost(),
+            'max_concurrent' => $this->maxConcurrentFromPost(),
             'is_default' => $isDefault,
         ], 'id = ?', [$id]);
 
@@ -265,9 +300,10 @@ class StorageLocationController extends Controller
         $this->requireAdmin();
         $this->verifyCsrf();
 
+        // Test what is in the form, not only what was last saved, so a
+        // change can be checked before it replaces the working settings (#441).
         $s3Service = new \BBS\Services\S3SyncService();
-        $creds = $s3Service->resolveCredentials(['credential_source' => 'global']);
-        $result = $s3Service->testConnection($creds);
+        $result = $s3Service->testConnection($s3Service->globalCredentialsWithOverrides($_POST));
 
         $this->json($result);
     }
@@ -281,84 +317,60 @@ class StorageLocationController extends Controller
         $this->requireAdmin();
         $this->verifyCsrf();
 
-        $s3Service = new \BBS\Services\S3SyncService();
-        $creds = $s3Service->resolveCredentials(['credential_source' => 'global']);
-
-        if (empty($creds['bucket']) || empty($creds['access_key'])) {
-            $this->json(['success' => false, 'error' => 'S3 credentials not configured']);
-            return;
-        }
-
-        $helper = '/usr/local/bin/bbs-ssh-helper';
-        $cmd = sprintf(
-            'sudo %s rclone-server-list %s %s %s %s %s %s 2>&1',
-            escapeshellarg($helper),
-            escapeshellarg($creds['endpoint']),
-            escapeshellarg($creds['region']),
-            escapeshellarg($creds['bucket']),
-            escapeshellarg($creds['access_key']),
-            escapeshellarg($creds['secret_key']),
-            escapeshellarg($creds['path_prefix'] ?? '')
-        );
-
-        $output = shell_exec($cmd);
-        $json = json_decode($output, true);
-
-        if (!is_array($json)) {
-            $this->json(['success' => false, 'error' => 'Failed to list backups: ' . trim($output)]);
-            return;
-        }
-
-        $backups = [];
-        foreach ($json as $item) {
-            if (!isset($item['Name'])) continue;
-            $backups[] = [
-                'filename' => $item['Name'],
-                'size' => $item['Size'] ?? 0,
-                'modified' => $item['ModTime'] ?? '',
-            ];
-        }
-
-        // Sort newest first
-        usort($backups, function ($a, $b) {
-            return strcmp($b['modified'], $a['modified']);
-        });
-
-        $this->json(['success' => true, 'backups' => $backups]);
+        $this->json((new \BBS\Services\ServerBackupService())->listInS3());
     }
 
     /**
-     * POST /storage-locations/s3/restore-backup — download and restore a server backup from S3.
+     * POST /storage-locations/s3/download-backup — stream one server backup
+     * from off-site storage to the browser.
+     *
+     * The counterpart to Restore: keeping a copy somewhere of your own is a
+     * reasonable thing to want, and until now it meant shelling into the
+     * server to fetch the file by hand.
      */
-    public function restoreS3Backup(): void
+    public function downloadS3Backup(): void
     {
         $this->denyIfHosted();
         $this->requireAdmin();
         $this->verifyCsrf();
 
         $filename = trim($_POST['filename'] ?? '');
-
-        if (empty($filename) || !preg_match('/^bbs-backup-.*\.tar\.gz$/', $filename)) {
-            $this->json(['success' => false, 'error' => 'Invalid backup filename']);
-            return;
+        // Same guard as Restore: the name reaches a shell command, and only
+        // the backups this server writes are ever a valid target.
+        if ($filename === '' || !preg_match('/^bbs-backup-[A-Za-z0-9_\-]+\.tar\.gz$/', $filename)) {
+            $this->json(['success' => false, 'error' => 'Invalid backup filename'], 400);
         }
 
         $s3Service = new \BBS\Services\S3SyncService();
         $creds = $s3Service->resolveCredentials(['credential_source' => 'global']);
-
         if (empty($creds['bucket']) || empty($creds['access_key'])) {
-            $this->json(['success' => false, 'error' => 'S3 credentials not configured']);
-            return;
+            $this->json(['success' => false, 'error' => 'S3 credentials not configured'], 400);
         }
 
-        // Create temp directory
-        $tmpDir = '/tmp/bbs-restore-' . bin2hex(random_bytes(8));
-        mkdir($tmpDir, 0700, true);
+        // Staged on the data volume rather than /tmp: these land on the root
+        // filesystem otherwise, which is the small one (#344).
+        $stagingBase = '/var/bbs/tmp';
+        if (!is_dir($stagingBase) && !@mkdir($stagingBase, 0770, true)) {
+            $stagingBase = sys_get_temp_dir();
+        }
+        // The helper only writes into a bbs-restore-<hex> directory, so the
+        // name follows that contract rather than inventing one it would reject.
+        $tmpDir = $stagingBase . '/bbs-restore-' . bin2hex(random_bytes(8));
+        if (!@mkdir($tmpDir, 0700, true)) {
+            $this->json(['success' => false, 'error' => 'Could not create a staging directory'], 500);
+        }
+
+        // However the request ends — including the browser hanging up
+        // mid-transfer — the staged copy goes away.
+        ignore_user_abort(true);
+        register_shutdown_function(function () use ($tmpDir) {
+            if (is_dir($tmpDir)) {
+                exec('rm -rf ' . escapeshellarg($tmpDir) . ' 2>/dev/null');
+            }
+        });
 
         $helper = '/usr/local/bin/bbs-ssh-helper';
-
-        // Step 1: Download the backup file
-        $dlCmd = sprintf(
+        $cmd = sprintf(
             'sudo %s rclone-server-download %s %s %s %s %s %s %s %s 2>&1',
             escapeshellarg($helper),
             escapeshellarg($filename),
@@ -370,60 +382,89 @@ class StorageLocationController extends Controller
             escapeshellarg($creds['secret_key']),
             escapeshellarg($creds['path_prefix'] ?? '')
         );
+        $output = shell_exec($cmd);
 
-        $dlOutput = shell_exec($dlCmd);
-        $backupFile = $tmpDir . '/' . $filename;
-
-        if (!file_exists($backupFile)) {
-            // Cleanup
-            shell_exec('rm -rf ' . escapeshellarg($tmpDir));
-            $this->json(['success' => false, 'error' => 'Failed to download backup: ' . trim($dlOutput)]);
-            return;
-        }
-
-        // Step 2: Run bbs-restore --yes
-        $restoreCmd = sprintf(
-            'sudo %s server-restore %s 2>&1',
-            escapeshellarg($helper),
-            escapeshellarg($backupFile)
-        );
-
-        $restoreOutput = shell_exec($restoreCmd);
-
-        // Cleanup temp dir
-        shell_exec('rm -rf ' . escapeshellarg($tmpDir));
-
-        // Parse the new admin password from output
-        $newPassword = '';
-        if (preg_match('/NEW_ADMIN_PASSWORD=(.+)/', $restoreOutput, $matches)) {
-            $newPassword = trim($matches[1]);
-        }
-
-        // Enable maintenance mode — the restored DB is fresh, so insert the setting
-        // (bbs-restore also sets this, but the DB connection there uses CLI creds;
-        // this ensures it's set even if the restore script's insert was lost)
-        $db = \BBS\Core\Database::getInstance();
-        $existing = $db->fetchOne("SELECT `key` FROM settings WHERE `key` = 'maintenance_mode'");
-        if ($existing) {
-            $db->update('settings', ['value' => '1'], "`key` = ?", ['maintenance_mode']);
-        } else {
-            $db->insert('settings', ['key' => 'maintenance_mode', 'value' => '1']);
-        }
-
-        if (empty($newPassword)) {
+        $local = $tmpDir . '/' . $filename;
+        if (!is_file($local)) {
             $this->json([
                 'success' => false,
-                'error' => 'Restore may have failed — no new password generated',
-                'output' => $restoreOutput,
-            ]);
-            return;
+                'error' => 'Could not fetch that backup: ' . trim((string) $output),
+            ], 502);
         }
+
+        $this->db->insert('server_log', [
+            'level' => 'info',
+            'message' => "Server backup \"{$filename}\" downloaded from off-site storage",
+        ]);
+
+        if (ob_get_level()) {
+            ob_end_clean();
+        }
+        header('Content-Type: application/gzip');
+        header('Content-Disposition: attachment; filename="' . $filename . '"');
+        header('Content-Length: ' . filesize($local));
+        header('Cache-Control: no-store');
+        readfile($local);
+        exit;
+    }
+
+    /**
+     * POST /storage-locations/s3/backup-now — take a server backup immediately.
+     *
+     * Worth having before an upgrade or a configuration change, rather than
+     * waiting for the daily run. Uses the same options and the same code as
+     * that run, and pushes it off-site afterwards when that is enabled.
+     */
+    public function backupNow(): void
+    {
+        $this->denyIfHosted();
+        $this->requireAdmin();
+        $this->verifyCsrf();
+
+        // A server backup takes minutes on a large install, and the browser is
+        // waiting on the response — don't let PHP's own clock end it half-way.
+        set_time_limit(0);
+        ignore_user_abort(true);
+
+        $service = new \BBS\Services\ServerBackupService();
+        $result = $service->run();
+
+        if (!$result['success']) {
+            $this->db->insert('server_log', [
+                'level' => 'error',
+                'message' => 'On-demand server backup failed: ' . $result['message'],
+            ]);
+            $this->json(['success' => false, 'error' => $result['message']], 500);
+        }
+
+        $sync = $service->syncToS3();
+
+        $this->db->insert('server_log', [
+            'level' => 'info',
+            'message' => 'Server backup created on demand'
+                . ($result['filename'] ? ": {$result['filename']}" : '')
+                . ($sync['skipped'] ? '' : ' — ' . $sync['message']),
+        ]);
 
         $this->json([
             'success' => true,
-            'username' => 'admin',
-            'password' => $newPassword,
+            'filename' => $result['filename'],
+            'synced' => !$sync['skipped'] && $sync['success'],
+            'sync_message' => $sync['skipped'] ? null : $sync['message'],
+            'message' => $result['message'],
         ]);
+    }
+
+    /**
+     * POST /storage-locations/s3/restore-backup — download and restore a server backup from S3.
+     */
+    public function restoreS3Backup(): void
+    {
+        $this->denyIfHosted();
+        $this->requireAdmin();
+        $this->verifyCsrf();
+
+        $this->json((new \BBS\Services\ServerBackupService())->restoreFromS3(trim($_POST['filename'] ?? '')));
     }
 
     /**
@@ -432,6 +473,34 @@ class StorageLocationController extends Controller
      * Public because the admin API also creates storage locations and needs
      * to refresh the allow-list.
      */
+    /**
+     * A stated capacity in GB from the form, as bytes. Blank or zero means
+     * "measure it" (#415) — only mounts that cannot report their own size
+     * need this, so an empty field is the normal case.
+     */
+    private function capacityFromPost(): ?int
+    {
+        $raw = trim((string) ($_POST['capacity_gb'] ?? ''));
+        if ($raw === '' || !is_numeric($raw) || (float) $raw <= 0) {
+            return null;
+        }
+        return (int) round((float) $raw * 1073741824);
+    }
+
+    /**
+     * Per-storage job limit from the form (#154): blank or 0 means none of
+     * its own. Above the global Max Concurrent Jobs is refused, not clamped.
+     */
+    private function maxConcurrentFromPost(): ?int
+    {
+        $cap = \BBS\Services\QueueManager::parseStorageCap($_POST['max_concurrent'] ?? null, $error);
+        if ($error !== null) {
+            $this->flash('danger', $error);
+            $this->redirect('/storage-locations');
+        }
+        return $cap;
+    }
+
     public function updateAllowedPaths(): void
     {
         $locations = $this->db->fetchAll("SELECT path FROM storage_locations");

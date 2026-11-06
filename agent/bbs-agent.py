@@ -4,20 +4,30 @@ Borg Backup Server Agent
 Polls the BBS server for tasks, executes borg commands, reports progress/status.
 """
 
+import base64
+import contextlib
+import binascii
 import datetime
+import hashlib
 import json
 import logging
+import ntpath
 import os
 import platform
+import posixpath
 import re
 import shlex
 import signal
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
+import shutil
+import ssl
 import urllib.request
 from configparser import ConfigParser
 
@@ -46,9 +56,19 @@ if not hasattr(subprocess, "run"):
     subprocess.run = _subprocess_run
     subprocess.CompletedProcess = _CompletedProcess
 
-AGENT_VERSION = "2.61.0"
+AGENT_VERSION = "2.100.0"
+
+# Ed25519 public keys, hex, that may sign an update to this script and to
+# the start wrapper. Kept in step with agent/signing-key.pub. An update the
+# server offers is installed only if its last line carries a signature by
+# one of these keys, so a server that has been tampered with cannot push
+# code to its clients. See bin/bbs-sign-agent and _verify_signed_script().
+AGENT_SIGNING_KEYS = [
+    "837be6c01018aa97ea57b244c53b241f9e55089a77c2dfb66cf23d5e5e564186",
+]
 BORG_PATH = None  # Resolved in get_system_info()
 IS_WINDOWS = sys.platform == "win32"
+IS_MACOS = sys.platform == "darwin"
 
 # Ensure UTF-8 filesystem encoding for handling filenames with non-ASCII characters.
 # CentOS 7 and older systems may default to ASCII, causing encoding errors.
@@ -131,6 +151,29 @@ def _detect_dropbear():
 IS_DROPBEAR = _detect_dropbear()
 
 
+def _detect_nixos():
+    """Detect NixOS. Packages there are managed declaratively through Nix:
+    foreign glibc binaries can't execute (no FHS ELF interpreter at
+    /lib/ld-linux-*), there is no imperative package manager the agent can
+    drive, and pip is unavailable — so borg self-update must be skipped
+    (#359). /etc/NIXOS is the canonical marker; os-release is the backup."""
+    if IS_WINDOWS:
+        return False
+    if os.path.exists("/etc/NIXOS"):
+        return True
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.strip() in ("ID=nixos", 'ID="nixos"'):
+                    return True
+    except (FileNotFoundError, OSError):
+        pass
+    return False
+
+
+IS_NIXOS = _detect_nixos()
+
+
 def _ssh_common_opts(connect_timeout=None):
     """Argv fragment for non-interactive ssh: skip hostkey check, run in
     batch mode, optionally cap connect time. Dropbear has none of the
@@ -151,11 +194,51 @@ def _ssh_common_opts(connect_timeout=None):
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile={}".format(null),
         "-o", "BatchMode=yes",
+        "-o", "ServerAliveInterval=10",
+        "-o", "ServerAliveCountMax=30",
         "-o", "LogLevel=ERROR",
     ]
     if connect_timeout:
         opts.extend(["-o", "ConnectTimeout={}".format(int(connect_timeout))])
     return opts
+
+
+# ssh notices that arrive on every connection and mean nothing to the user.
+# borg forwards ssh's stderr as "Remote: ..." warnings; with the INFO log
+# level set below these would otherwise land in every job log (#225, #521).
+SSH_ROUTINE_NOTICES = (
+    "Permanently added",                    # known_hosts is /dev/null
+    "post-quantum key exchange",            # OpenSSH 10.1+ weak-kex warning
+    "This session may be vulnerable",
+    "The server may need to be upgraded",
+)
+
+
+def _is_ssh_routine_notice(message):
+    return any(n in message for n in SSH_ROUTINE_NOTICES)
+
+
+def _translate_borg_rsh_windows(rsh):
+    """The server builds BORG_RSH with Unix paths (/etc/bbs-agent/ssh_key,
+    /tmp/bbs-remote-ssh-key) and the system ssh; on Windows they have to
+    name the agent's own key files and the bundled ssh.exe.
+    Forward slashes are used on purpose: Windows ssh accepts them and
+    backslashes get stripped as escape characters when passed through
+    subprocess/shell."""
+    # Note: "/dev/null" in UserKnownHostsFile is intentionally NOT rewritten
+    # to "NUL". The bundled MinGit/MSYS2 ssh maps "/dev/null" to the real
+    # null device but would create a literal, undeletable reserved-name file
+    # named NUL for "NUL" (#300).
+    rsh = rsh.replace(
+        "/etc/bbs-agent/ssh_key", SSH_KEY_PATH.replace("\\", "/")
+    ).replace(
+        "/tmp/bbs-remote-ssh-key", REMOTE_KEY_PATH.replace("\\", "/")
+    )
+    # Replace bare "ssh" command with our bundled ssh.exe to avoid the
+    # Windows built-in OpenSSH stdin forwarding bug that hangs borg.
+    if SSH_CMD != "ssh" and rsh.startswith("ssh "):
+        rsh = '"' + SSH_CMD + '"' + rsh[3:]
+    return rsh
 
 
 def _rewrite_borg_rsh_for_dropbear(rsh):
@@ -299,6 +382,17 @@ def load_ssh_info():
         return None
 
 
+def _in_container():
+    """Best-effort detection of Docker/Podman."""
+    if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+        return True
+    try:
+        with open("/proc/1/cgroup") as f:
+            return any(m in f.read() for m in ("docker", "containerd", "kubepods"))
+    except (OSError, IOError):
+        return False
+
+
 def load_config():
     if not os.path.exists(CONFIG_PATH):
         logger.error("Config file not found: {}".format(CONFIG_PATH))
@@ -307,11 +401,73 @@ def load_config():
     config = ConfigParser()
     config.read(CONFIG_PATH)
 
+    # Whether this agent accepts server-driven updates of its own script.
+    # Containers ship the agent inside the image, so replacing the running copy
+    # is undone by the next restart and hides which version is really deployed
+    # — those default to off and are updated by pulling a new image (#387).
+    # Order: BBS_AUTO_UPDATE env var, then config.ini, then the default.
+    auto_update_default = not _in_container()
+    auto_update = config.getboolean("agent", "auto_update", fallback=auto_update_default)
+    env_auto = os.environ.get("BBS_AUTO_UPDATE")
+    if env_auto is not None:
+        auto_update = env_auto.strip().lower() in ("1", "true", "yes", "on")
+
+    # Signed updates are required unless this client opts out in its own
+    # config (a fork running its own build). The setting lives here, on the
+    # client, so the server cannot turn it off.
+    require_signed = config.getboolean("agent", "require_signed_updates", fallback=True)
+    env_signed = os.environ.get("BBS_REQUIRE_SIGNED_UPDATES")
+    if env_signed is not None:
+        require_signed = env_signed.strip().lower() in ("1", "true", "yes", "on")
+
     return {
         "server_url": config.get("server", "url").rstrip("/"),
         "api_key": config.get("server", "api_key"),
         "poll_interval": config.getint("agent", "poll_interval", fallback=30),
+        "auto_update": auto_update,
+        "require_signed_updates": require_signed,
+        # Optional: confine shell hooks to one directory on this client.
+        "hooks_dir": config.get("agent", "hooks_dir", fallback="").strip() or None,
+        # TLS towards the server (#476): a CA bundle for a self-signed or
+        # private-CA certificate, or no verification at all. Written by the
+        # installer from --cacert / --insecure; default is normal verification.
+        "ca_cert": config.get("server", "ca_cert", fallback="").strip() or None,
+        "insecure": config.getboolean("server", "insecure", fallback=False),
     }
+
+
+_SSL_CONTEXT = None
+
+
+def server_ssl_context(config):
+    """SSL context for requests to the BBS server, honouring the config's
+    ca_cert / insecure settings. Cached: the context is built once per run.
+    Downloads from GitHub (borg binaries) keep the default verification and
+    must not use this."""
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is not None:
+        return _SSL_CONTEXT
+    ctx = ssl.create_default_context()
+    if config.get("insecure"):
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        logger.warning("TLS verification towards the server is disabled (insecure = true in config)")
+    elif config.get("ca_cert"):
+        try:
+            ctx.load_verify_locations(cafile=config["ca_cert"])
+        except Exception as e:
+            logger.error("Could not load ca_cert {}: {} — using the system CA store".format(config["ca_cert"], e))
+    _SSL_CONTEXT = ctx
+    return ctx
+
+
+def server_urlopen(config, req, timeout):
+    """urlopen towards the BBS server with the config's TLS context. Goes
+    through an opener because urlopen(context=...) only exists from Python
+    3.4.3, and agents on 3.4.2 (Debian 8) died at registration with
+    "urlopen() got an unexpected keyword argument 'context'" (2.94.1)."""
+    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=server_ssl_context(config)))
+    return opener.open(req, timeout=timeout)
 
 
 def api_request(config, endpoint, method="GET", data=None, timeout=60):
@@ -334,7 +490,7 @@ def api_request(config, endpoint, method="GET", data=None, timeout=60):
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with server_urlopen(config, req, timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
@@ -392,12 +548,44 @@ def set_borg_source(source):
         logger.warning("Failed to save borg source: {}".format(e))
 
 
-def get_system_info():
+def get_primary_mac():
+    """Best-effort MAC address of the primary network interface — the
+    server uses it to prefill the client's Wake-on-LAN MAC field.
+    Linux: interface of the default route. Elsewhere (and as fallback):
+    uuid.getnode(), skipped when it returns a random node rather than a
+    real hardware address (multicast bit set)."""
+    try:
+        if not IS_WINDOWS and platform.system().lower() == "linux":
+            with open("/proc/net/route") as f:
+                for line in f.readlines()[1:]:
+                    parts = line.split()
+                    if len(parts) > 1 and parts[1] == "00000000":  # default route
+                        with open("/sys/class/net/{}/address".format(parts[0])) as af:
+                            mac = af.read().strip().lower()
+                        if mac and mac != "00:00:00:00:00:00":
+                            return mac
+    except Exception:
+        pass
+    try:
+        import uuid
+        node = uuid.getnode()
+        if not (node >> 40) & 0x01:  # multicast bit set = randomly generated
+            return ":".join("{:02x}".format((node >> i) & 0xFF) for i in range(40, -8, -8))
+    except Exception:
+        pass
+    return None
+
+
+def get_system_info(config=None):
     """Gather system information for registration."""
     info = {
         "hostname": socket.gethostname() or socket.getfqdn(),
         "os_info": "{} {} {}".format(platform.system(), platform.release(), platform.machine()),
         "agent_version": AGENT_VERSION,
+        # Tells the server whether to offer/queue updates for this agent at
+        # all. Containers manage their own version via the image (#387).
+        "auto_update_enabled": bool(config.get("auto_update", True)) if config else True,
+        "in_container": _in_container(),
     }
 
     # Try to get more detailed OS info
@@ -418,6 +606,12 @@ def get_system_info():
 
     # Platform and architecture info (for borg binary matching)
     info["platform"] = platform.system().lower()  # linux, darwin, freebsd, windows
+    # Whether this host can back up from filesystem snapshots, and how.
+    try:
+        info["snapshot_support"] = get_snapshot_support()
+    except Exception as e:
+        info["snapshot_support"] = {"capable": False, "methods": [], "volumes": [], "reason": "detection failed: {}".format(e)}
+    info["mac_address"] = get_primary_mac()
     arch = platform.machine()
     if arch in ("aarch64", "arm64"):
         info["architecture"] = "arm64"
@@ -444,6 +638,12 @@ def get_system_info():
     borg_path = None
     if IS_WINDOWS:
         candidates = [r"C:\Program Files\BorgBackup\borg.exe", r"C:\Program Files (x86)\BorgBackup\borg.exe"]
+    elif IS_MACOS:
+        # Homebrew's borg first: on macOS borg is managed through brew, and a
+        # manually upgraded /opt/homebrew/bin/borg must not stay shadowed by
+        # an older copy at /usr/local/bin (#453).
+        candidates = ["/opt/homebrew/bin/borg", "/usr/local/bin/borg", "/usr/bin/borg",
+                      os.path.expanduser("~/.local/bin/borg")]
     else:
         candidates = ["/usr/local/bin/borg", "/usr/bin/borg", "/opt/homebrew/bin/borg",
                       os.path.expanduser("~/.local/bin/borg"), "/root/.local/bin/borg"]
@@ -505,7 +705,7 @@ def get_system_info():
 
 def register(config):
     """Register this agent with the server."""
-    info = get_system_info()
+    info = get_system_info(config)
     logger.info("Registering with server: {}".format(config['server_url']))
 
     result = api_request(config, "/api/agent/register", method="POST", data=info)
@@ -569,7 +769,7 @@ def download_ssh_key(config):
     try:
         key_dir = os.path.dirname(SSH_KEY_PATH)
         os.makedirs(key_dir, exist_ok=True)
-        with open(SSH_KEY_PATH, "w") as f:
+        with open(SSH_KEY_PATH, "w", newline="\n") as f:  # LF endings — CRLF keys are rejected by ssh (#347)
             f.write(private_key)
         if IS_WINDOWS:
             _lockdown_key_windows(SSH_KEY_PATH)
@@ -778,6 +978,19 @@ def execute_update_borg(config, task):
         })
         return
 
+    # NixOS: borg is managed declaratively via nixpkgs — every install
+    # method the agent has (foreign binary, package manager, pip) is a
+    # guaranteed failure there. Report a clear skip instead (#359).
+    if IS_NIXOS:
+        logger.info("Skipping borg update - borg is managed by Nix on NixOS")
+        report_status(config, {
+            "job_id": job_id,
+            "result": "completed",
+            "output_log": "Skipped - borg on NixOS is managed through nixpkgs. "
+                          "Update it via your Nix configuration (e.g. nixos-rebuild switch --upgrade).",
+        })
+        return
+
     # Report running
     api_request(config, "/api/agent/progress", method="POST", data={
         "job_id": job_id, "files_total": 0, "files_processed": 0,
@@ -791,6 +1004,21 @@ def execute_update_borg(config, task):
         if IS_WINDOWS:
             # Windows: always update from borg-windows GitHub releases
             result, update_output, error_output = _install_borg_windows()
+
+        elif IS_MACOS:
+            # macOS: borg comes from Homebrew. A server-provided binary is
+            # still preferred when one matches, but the fallback is brew —
+            # never pip, which cannot build borg here, and never a Linux
+            # package manager (#453).
+            if install_method == "binary" and download_url:
+                result, update_output, error_output = _install_borg_binary(
+                    download_url, binary_path, target_version
+                )
+                if result == "failed" and fallback_to_pip:
+                    logger.warning("Binary install failed ({}), falling back to Homebrew".format(error_output))
+                    result, update_output, error_output = _install_borg_homebrew(target_version)
+            else:
+                result, update_output, error_output = _install_borg_homebrew(target_version)
 
         elif install_method == "binary" and download_url:
             result, update_output, error_output = _install_borg_binary(
@@ -832,7 +1060,7 @@ def execute_update_borg(config, task):
     if result == "completed":
         # Save the source for future reporting
         set_borg_source(source)
-        info = get_system_info()
+        info = get_system_info(config)
         api_request(config, "/api/agent/info", method="POST", data=info)
         logger.info("Updated borg version: {} (source={})".format(info.get('borg_version', 'unknown'), source))
 
@@ -1128,6 +1356,94 @@ def _install_borg_pip(target_version):
         return "failed", "", str(e)
 
 
+def _find_brew():
+    """Full path to the Homebrew binary, or None."""
+    for p in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew"):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _brew_command(brew_bin, args):
+    """A brew invocation that works from the agent: brew refuses to run as
+    root, and the agent is a root daemon — so run it as the user who owns
+    the brew binary, with their HOME (#453)."""
+    cmd = [brew_bin] + args
+    if os.geteuid() == 0:
+        try:
+            import pwd
+            owner = pwd.getpwuid(os.stat(brew_bin).st_uid).pw_name
+        except Exception:
+            owner = None
+        if owner and owner != "root":
+            cmd = ["sudo", "-u", owner, "-H", brew_bin] + args
+    return cmd
+
+
+def _install_borg_homebrew(target_version=None):
+    """Update borg through Homebrew — the only supported source on macOS.
+    brew installs its current formula version; a specific target can't be
+    pinned, so the installed version is reported back instead."""
+    brew_bin = _find_brew()
+    if not brew_bin:
+        return "failed", "", ("Borg on macOS is managed through Homebrew, and Homebrew is not "
+                              "installed. Install it from https://brew.sh, then `brew install "
+                              "borgbackup`, and the agent will pick it up.")
+
+    env = dict(os.environ)
+    env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
+    env["NONINTERACTIVE"] = "1"
+
+    def run_brew(args):
+        cmd = _brew_command(brew_bin, args)
+        logger.info("Running: {}".format(" ".join(cmd)))
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=900, env=env)
+        out = proc.stdout.decode("utf-8", errors="replace").strip()
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        return proc.returncode, out, err
+
+    try:
+        # Ask first whether an upgrade is even needed: `brew upgrade` can fail
+        # for reasons unrelated to borg (e.g. untrusted third-party taps), and
+        # an up-to-date borg must not be reported as a failed update.
+        rc0, out0, err0 = run_brew(["outdated", "--quiet", "borgbackup"])
+        if rc0 == 0 and "borgbackup" not in out0:
+            action = None  # installed and current
+        elif rc0 == 0:
+            action = "upgrade"
+        else:
+            action = "install"  # not installed through brew (or brew can't say)
+
+        if action is None:
+            rc, out, err = 0, "", ""
+        else:
+            rc, out, err = run_brew([action, "borgbackup"])
+            combined = (err + "\n" + out).strip()
+            if rc != 0 and action == "upgrade" and ("already installed" in combined
+                                                    or "already up-to-date" in combined):
+                rc = 0
+            if rc != 0:
+                return "failed", "", "brew {} failed (exit {}): {}".format(action, rc, combined[:800])
+    except subprocess.TimeoutExpired:
+        return "failed", "", "brew timed out"
+    except Exception as e:
+        return "failed", "", "brew error: {}".format(e)
+
+    # Report what is actually installed now.
+    label = "already up to date (Homebrew)" if action is None else "updated via Homebrew"
+    for candidate in ("/opt/homebrew/bin/borg", "/usr/local/bin/borg"):
+        if os.path.exists(candidate):
+            try:
+                r = subprocess.run([candidate, "--version"], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, timeout=10)
+                if r.returncode == 0:
+                    ver = r.stdout.decode("utf-8", errors="replace").strip()
+                    return "completed", "Borg {}: {}".format(label, ver), ""
+            except Exception:
+                pass
+    return "completed", "Borg {}".format(label), ""
+
+
 def _install_borg_package_manager():
     """Install/update borg via OS package manager. Removes any existing /usr/local/bin/borg first."""
     if IS_WINDOWS:
@@ -1158,8 +1474,8 @@ def _install_borg_package_manager():
     elif os.path.exists("/usr/local/sbin/pkg"):
         cmd = ["pkg", "install", "-y", "borgbackup"]
         pre_cmd = None
-    elif os.path.exists("/usr/local/bin/brew") or os.path.exists("/opt/homebrew/bin/brew"):
-        cmd = ["brew", "install", "borgbackup"]
+    elif _find_brew():
+        cmd = _brew_command(_find_brew(), ["install", "borgbackup"])
         pre_cmd = None
     else:
         # Restore backup if no package manager
@@ -1212,10 +1528,142 @@ def _install_borg_package_manager():
         return "failed", "", str(e)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Update signatures. Ed25519 (RFC 8032) in plain Python: the agent runs on
+# Python 3.4 to 3.14 with no libraries beyond the standard one, and
+# verifying a 250 KB script once per update takes about a second. The
+# arithmetic is the reference affine construction, slow and obvious on
+# purpose. Same code as bin/bbs-sign-agent, which also signs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ED_Q = 2 ** 255 - 19
+_ED_L = 2 ** 252 + 27742317777372353535851937790883648493
+
+
+def _ed_inv(x):
+    return pow(x, _ED_Q - 2, _ED_Q)
+
+
+_ED_D = (-121665 * _ed_inv(121666)) % _ED_Q
+_ED_I = pow(2, (_ED_Q - 1) // 4, _ED_Q)
+
+
+def _ed_xrecover(y):
+    xx = (y * y - 1) * _ed_inv(_ED_D * y * y + 1)
+    x = pow(xx, (_ED_Q + 3) // 8, _ED_Q)
+    if (x * x - xx) % _ED_Q != 0:
+        x = (x * _ED_I) % _ED_Q
+    if x % 2 != 0:
+        x = _ED_Q - x
+    return x
+
+
+_ED_BY = (4 * _ed_inv(5)) % _ED_Q
+_ED_B = (_ed_xrecover(_ED_BY), _ED_BY)
+
+
+def _ed_add(P, Q):
+    x1, y1 = P
+    x2, y2 = Q
+    x3 = (x1 * y2 + x2 * y1) * _ed_inv(1 + _ED_D * x1 * x2 * y1 * y2)
+    y3 = (y1 * y2 + x1 * x2) * _ed_inv(1 - _ED_D * x1 * x2 * y1 * y2)
+    return (x3 % _ED_Q, y3 % _ED_Q)
+
+
+def _ed_mult(P, e):
+    if e == 0:
+        return (0, 1)
+    Q = _ed_mult(P, e // 2)
+    Q = _ed_add(Q, Q)
+    if e & 1:
+        Q = _ed_add(Q, P)
+    return Q
+
+
+def _ed_decodeint(s):
+    b = bytearray(s)
+    return sum(b[i] << (8 * i) for i in range(32))
+
+
+def _ed_decodepoint(s):
+    b = bytearray(s)
+    y = sum((b[i] if i < 31 else (b[31] & 0x7f)) << (8 * i) for i in range(32))
+    x = _ed_xrecover(y)
+    if x & 1 != (b[31] >> 7):
+        x = _ED_Q - x
+    if (-x * x + y * y - 1 - _ED_D * x * x * y * y) % _ED_Q != 0:
+        raise ValueError("point is not on the curve")
+    return (x, y)
+
+
+def _ed_hint(m):
+    h = hashlib.sha512(m).digest()
+    return _ed_decodeint(h[:32]) + (_ed_decodeint(h[32:]) << 256)
+
+
+def _ed_verify(signature, message, pk):
+    if len(signature) != 64 or len(pk) != 32:
+        return False
+    try:
+        R = _ed_decodepoint(signature[:32])
+        A = _ed_decodepoint(pk)
+    except ValueError:
+        return False
+    S = _ed_decodeint(signature[32:])
+    if S >= _ED_L:
+        return False
+    k = _ed_hint(signature[:32] + pk + message) % _ED_L
+    return _ed_mult(_ED_B, S) == _ed_add(R, _ed_mult(A, k))
+
+
+_SIGNATURE_MARKER = b"# bbs-signature: v1 "
+
+
+def _verify_signed_script(data):
+    """Is `data` (bytes of a downloaded script) signed by a trusted key?
+    The signature is the last line, "# bbs-signature: v1 <base64>", and
+    covers every byte before it. Returns (ok, reason)."""
+    idx = data.rfind(b"\n" + _SIGNATURE_MARKER)
+    if idx < 0:
+        return False, "the file carries no signature"
+    message = data[:idx + 1]
+    line = data[idx + 1:].strip()
+    try:
+        sig = base64.b64decode(line[len(_SIGNATURE_MARKER):])
+    except (binascii.Error, ValueError, TypeError):
+        return False, "the signature line is malformed"
+    for hexkey in AGENT_SIGNING_KEYS:
+        try:
+            pk = binascii.unhexlify(hexkey)
+        except (binascii.Error, TypeError, ValueError):
+            continue
+        if _ed_verify(sig, message, pk):
+            return True, "signed by a trusted key"
+    return False, "the signature does not match a trusted key"
+
+
+def _version_tuple(v):
+    parts = []
+    for p in str(v).split("."):
+        digits = "".join(ch for ch in p if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
 def execute_update_agent(config, task):
     """Download and replace the agent script from the server, then restart."""
     job_id = task.get("job_id")
     logger.info("Executing agent update job #{}".format(job_id))
+
+    # Opted out (containers by default): decline rather than replace a script
+    # the image owns. A server older than 2.75.0 doesn't know to skip us.
+    if not config.get("auto_update", True):
+        msg = ("Agent updates are disabled on this client "
+               "(containerised agents are updated by pulling a new image). "
+               "Set auto_update = true in config.ini or BBS_AUTO_UPDATE=1 to allow them.")
+        logger.info(msg)
+        report_status(config, {"job_id": job_id, "result": "failed", "error_log": msg})
+        return
 
     # Report running
     api_request(config, "/api/agent/progress", method="POST", data={
@@ -1235,12 +1683,30 @@ def execute_update_agent(config, task):
         }
         req = urllib.request.Request(url, headers=headers, method="GET")
 
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            new_script = resp.read().decode("utf-8")
+        with server_urlopen(config, req, 60) as resp:
+            new_script_bytes = resp.read()
+        new_script = new_script_bytes.decode("utf-8")
 
-        # Validate the downloaded script
-        if "AGENT_VERSION" not in new_script or len(new_script) < 1000:
+        # The version the server offers, from the script's header.
+        offered = None
+        for line in new_script.split("\n")[:500]:
+            m = re.match(r'^AGENT_VERSION\s*=\s*["\']([^"\']+)["\']', line)
+            if m:
+                offered = m.group(1)
+                break
+
+        # A tampered server must not be able to push code to its clients:
+        # the update has to carry a signature by a trusted key, and may not
+        # be older than what runs now (a replay of a signed but buggy
+        # version). Both checks come before anything is written.
+        sig_ok, sig_why = _verify_signed_script(new_script_bytes)
+        if config.get("require_signed_updates", True) and not sig_ok:
+            error_output = "Update refused: {}. The server's agent script is not signed by the project key; the agent was not changed.".format(sig_why)
+        elif offered and _version_tuple(offered) < _version_tuple(AGENT_VERSION):
+            error_output = "Update refused: the server offers agent {} but this agent runs {}; downgrades are not installed.".format(offered, AGENT_VERSION)
+        elif "AGENT_VERSION" not in new_script or len(new_script) < 1000:
             error_output = "Downloaded script failed validation"
+        if error_output:
             logger.error(error_output)
         else:
             # Syntax-check the new script BEFORE replacing — a SyntaxError
@@ -1280,13 +1746,7 @@ def execute_update_agent(config, task):
                 os.chmod(tmp_path, os.stat(script_path).st_mode)
             os.replace(tmp_path, script_path)
 
-            # Extract new version from downloaded script
-            new_version = "unknown"
-            for line in new_script.split("\n")[:50]:
-                m = __import__("re").match(r'^AGENT_VERSION\s*=\s*["\']([^"\']+)["\']', line)
-                if m:
-                    new_version = m.group(1)
-                    break
+            new_version = offered or "unknown"
 
             result = "completed"
             update_output = "Agent updated to v{}".format(new_version)
@@ -1299,8 +1759,11 @@ def execute_update_agent(config, task):
                 try:
                     wrapper_url = "{}/api/agent/download?file=bbs-agent-start.sh".format(config['server_url'])
                     wrapper_req = urllib.request.Request(wrapper_url, headers=headers, method="GET")
-                    with urllib.request.urlopen(wrapper_req, timeout=30) as wresp:
+                    with server_urlopen(config, wrapper_req, 30) as wresp:
                         wrapper_script = wresp.read()
+                    w_ok, w_why = _verify_signed_script(wrapper_script)
+                    if config.get("require_signed_updates", True) and not w_ok:
+                        raise RuntimeError("start wrapper refused: {}".format(w_why))
                     wrapper_dir = os.path.dirname(script_path)
                     wrapper_path = os.path.join(wrapper_dir, "bbs-agent-start.sh")
                     with open(wrapper_path, "wb") as wf:
@@ -1327,7 +1790,7 @@ def execute_update_agent(config, task):
 
     # Re-report system info so agent_version gets updated, then restart
     if result == "completed":
-        info = get_system_info()
+        info = get_system_info(config)
         api_request(config, "/api/agent/info", method="POST", data=info)
         logger.info("Restarting agent with new script...")
         if IS_WINDOWS:
@@ -1355,19 +1818,35 @@ PLUGIN_DISPLAY_NAMES = {
     "mysql_dump": "MySQL Dump",
     "pg_dump": "PostgreSQL Dump",
     "mongo_dump": "MongoDB Dump",
+    "mssql_dump": "SQL Server Backup",
     "interworx": "InterWorx Backup",
     "shell_hook": "Shell Script Hook",
 }
 
 
-def execute_plugins(plugins, config=None, job_id=None, task=None):
-    """Execute pre-backup plugins. Returns dict of results keyed by slug.
+def _truthy(value):
+    """Config values arrive as real bools or as strings from the settings form."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def execute_plugins(plugins, config=None, job_id=None, task=None, streams=None):
+    """Execute pre-backup plugins. Returns a LIST of per-config run records
+    (dicts: slug, config_id, config_name, config, result). A plan can attach
+    several configs — including two of the same engine — so results must be
+    kept per config, not collapsed by slug (#382).
 
     `task` is the full task dict from the server; passed through to plugins
     that consume backup-context env vars (currently shell_hook only — see
     #250). Other plugins ignore it.
+
+    With `streams` (a DumpStreams), MySQL and PostgreSQL configs register
+    their databases to be streamed into the archive instead of dumping now.
     """
-    results = {}
+    runs = []
     for plugin in plugins:
         slug = plugin.get("slug", "")
         cfg = plugin.get("config", {})
@@ -1383,22 +1862,73 @@ def execute_plugins(plugins, config=None, job_id=None, task=None):
         if not func:
             logger.warning("Plugin {} not implemented, skipping".format(slug))
             continue
+        stream_func = None
+        if streams is not None and slug in _STREAMABLE_PLUGINS:
+            if slug == "pg_dump" and not _pg_format_streams(cfg.get("extra_options", "--no-owner --no-privileges")):
+                if config and job_id:
+                    log_to_server(config, job_id, "{} uses pg_dump's directory format, which cannot be streamed; dumping it to disk".format(
+                        plugin.get("config_name") or display))
+            else:
+                stream_func = globals().get("stream_plugin_{}".format(slug))
+        mark = len(streams.streams) if streams is not None else 0
         # shell_hook needs the task context to inject BBS_* env vars and
         # (opt-in) BORG_PASSCOMMAND. Other plugins keep the simpler
         # single-arg signature.
-        if slug == "shell_hook":
-            result = func(cfg, task)
-        else:
-            result = func(cfg)
-        results[slug] = result
+        try:
+            if stream_func is not None:
+                result = stream_func(cfg, streams)
+            elif slug == "shell_hook":
+                result = func(cfg, task)
+            else:
+                result = func(cfg)
+        except Exception as e:
+            if streams is not None:
+                del streams.streams[mark:]
+            # A failing pre-backup plugin does not have to cost the backup.
+            # Unless this config says otherwise, record the failure, tell the
+            # server, and carry on: the remaining plugins still run and the
+            # archive is still written, marked "completed with warnings".
+            # Aborting instead meant one flaky control-panel dump left a
+            # client with no backups at all.
+            if _truthy(cfg.get("abort_on_failure")):
+                raise
+            logger.error("Plugin {} failed (continuing): {}".format(slug, e))
+            runs.append({
+                "slug": slug,
+                "config_id": plugin.get("config_id"),
+                "config_name": plugin.get("config_name"),
+                "config": cfg,
+                "result": {},
+                "error": str(e),
+            })
+            if config and job_id:
+                log_to_server(config, job_id, "Plugin {} failed, backup continued: {}".format(display, e))
+            continue
+
+        runs.append({
+            "slug": slug,
+            "config_id": plugin.get("config_id"),
+            "config_name": plugin.get("config_name"),
+            "config": cfg,
+            "result": result if isinstance(result, dict) else {},
+        })
         logger.info("Plugin {} completed".format(slug))
+
+        if stream_func is not None:
+            for st in streams.streams[mark:]:
+                st["run"] = runs[-1]
+            if config and job_id:
+                names = result.get("databases", [])
+                log_to_server(config, job_id, "{}: {} database(s) ({}) to stream into the archive".format(
+                    display, len(names), ", ".join(names)))
+            continue
 
         # Send plugin summary to server log
         if config and job_id:
             summary = _plugin_summary(slug, cfg, result)
             if summary:
                 log_to_server(config, job_id, summary)
-    return results
+    return runs
 
 
 def _plugin_summary(slug, config, result):
@@ -1431,6 +1961,14 @@ def _plugin_summary(slug, config, result):
                         total_size += os.path.getsize(fp)
         size_str = _format_size(total_size)
         return "MongoDB dump: {} database(s) ({}) dumped to {} ({})".format(len(databases), ', '.join(databases), dump_dir, size_str)
+    if slug == "mssql_dump":
+        dump_files = result.get("dump_files", [])
+        total_size = sum(os.path.getsize(f) for f in dump_files if os.path.exists(f))
+        text = "SQL Server backup: {} database(s) ({}) written to {} ({})".format(
+            len(dump_files), ", ".join(result.get("databases", [])), result.get("dump_dir", ""), _format_size(total_size))
+        if result.get("partial_error"):
+            text += " - WARNING: " + result["partial_error"]
+        return text
     if slug == "interworx":
         dump_dir = result.get("dump_dir", "")
         backup_type = result.get("backup_type", "full")
@@ -1471,21 +2009,22 @@ def _format_size(bytes_val):
     return "{:.1f} PB".format(bytes_val)
 
 
-def cleanup_plugins(plugins, plugin_results, config=None, job_id=None, backup_result="completed", task=None):
-    """Run post-backup cleanup for plugins.
+def cleanup_plugins(plugin_runs, config=None, job_id=None, backup_result="completed", task=None):
+    """Run post-backup cleanup for each plugin config that ran (#382).
     Shell hook post-scripts always run (to restart services stopped by pre-scripts).
     File cleanup (dump deletion) only runs on successful backups.
     """
-    for plugin in plugins:
-        slug = plugin.get("slug", "")
-        cfg = plugin.get("config", {})
+    for run in plugin_runs:
+        slug = run.get("slug", "")
+        cfg = run.get("config", {})
+        res = run.get("result", {}) or {}
 
         # Shell hook post-scripts ALWAYS run regardless of backup result
         if slug == "shell_hook":
             func = globals().get("cleanup_plugin_shell_hook")
             if func:
                 try:
-                    cleanup_result = func(cfg, plugin_results.get(slug, {}), task=task, backup_result=backup_result)
+                    cleanup_result = func(cfg, res, task=task, backup_result=backup_result)
                     if config and job_id and cleanup_result:
                         log_to_server(config, job_id, "Shell hook post-script: {}".format(cleanup_result))
                 except Exception as e:
@@ -1501,10 +2040,10 @@ def cleanup_plugins(plugins, plugin_results, config=None, job_id=None, backup_re
         func = globals().get("cleanup_plugin_{}".format(slug))
         if func:
             try:
-                func(cfg, plugin_results.get(slug, {}))
+                func(cfg, res)
                 if config and job_id:
                     if cfg.get("cleanup_after", True):
-                        dump_dir = plugin_results.get(slug, {}).get("dump_dir", "")
+                        dump_dir = res.get("dump_dir", "")
                         if dump_dir:
                             log_to_server(config, job_id, "Plugin cleanup: removed dump files from {}".format(dump_dir))
             except Exception as e:
@@ -1513,9 +2052,596 @@ def cleanup_plugins(plugins, plugin_results, config=None, job_id=None, backup_re
                     log_to_server(config, job_id, "Plugin cleanup for {} failed: {}".format(slug, e), "warning")
 
 
+# --- Database dump plugins: input checks -------------------------------------
+# Plugin settings come from the server and the dump tools run as root. The
+# settings must not be able to make a dump tool write or load files of their
+# choosing.
+
+# Options that name a file or directory the tool would write to or load from.
+_DUMP_BLOCKED_LONG = {
+    "mysqldump": ("--result-file", "--tab", "--log-error", "--debug", "--plugin-dir",
+                  "--default-auth", "--defaults-file", "--defaults-extra-file",
+                  "--defaults-group-suffix", "--character-sets-dir", "--load-data-local-dir"),
+    "pg_dump": ("--file",),
+    "mongodump": ("--out", "--archive", "--config"),
+}
+_DUMP_BLOCKED_SHORT = {
+    "mysqldump": "rT#",
+    "pg_dump": "f",
+    "mongodump": "o",
+}
+
+
+def _checked_extra_options(tool, extra_options):
+    """Split extra_options and refuse any option that writes or loads a file."""
+    args = extra_options.split()
+    blocked_long = _DUMP_BLOCKED_LONG.get(tool, ())
+    blocked_short = _DUMP_BLOCKED_SHORT.get(tool, "")
+    for arg in args:
+        if arg.startswith("--"):
+            name = arg.split("=", 1)[0].lower()
+            # mysqldump accepts any unambiguous prefix of a long option
+            if any(b == name or (len(name) > 4 and b.startswith(name)) for b in blocked_long):
+                raise Exception("{} option {} is not allowed in extra options".format(tool, name))
+        elif arg.startswith("-"):
+            if any(c in blocked_short for c in arg[1:]):
+                raise Exception("{} option {} is not allowed in extra options (short options that "
+                                "can write files are refused; use the long form)".format(tool, arg))
+    return args
+
+
+def _checked_db_name(db):
+    """Refuse database names that would read as an option or escape the dump directory."""
+    name = str(db)
+    if not name or name.startswith("-") or "/" in name or "\\" in name or "\0" in name or name in (".", ".."):
+        raise Exception("Refusing to dump database with unsafe name {!r}".format(name))
+    return name
+
+
+_DUMP_DIR_DENIED = ("/", "/root", "/etc", "/var", "/usr", "/home", "/boot", "/dev",
+                    "/proc", "/sys", "/tmp", "/opt", "/srv", "/var/lib", "/var/www")
+
+
+def _checked_dump_dir(path):
+    """The dump directory must be absolute and outside system directories.
+    Cleanup deletes every .sql/.sql.gz file in it."""
+    if IS_WINDOWS:
+        return path
+    if not path or not os.path.isabs(path):
+        raise Exception("Dump directory must be an absolute path: {!r}".format(path))
+    real = os.path.realpath(path)
+    # macOS maps /etc, /tmp and /var to /private/... and /home to the data volume
+    for prefix in ("/System/Volumes/Data", "/private"):
+        if real.startswith(prefix + "/"):
+            real = real[len(prefix):]
+    for candidate in {os.path.normpath(path).rstrip("/") or "/", real.rstrip("/") or "/"}:
+        if candidate in _DUMP_DIR_DENIED or any(
+                candidate == d or candidate.startswith(d + "/")
+                for d in _HOOK_SYSTEM_DIRS + ("/etc", "/boot", "/dev", "/proc", "/sys", "/root/.ssh")):
+            raise Exception("Dump directory {} is a system directory".format(path))
+    return path
+
+
+_GZIP_ARGV = None
+
+
+def _gzip_argv():
+    """gzip with --rsyncable where the local gzip has it. A plain gzip stream
+    changes from the first changed byte to the end, so borg finds almost
+    nothing to deduplicate between two nights' dumps. --rsyncable resets the
+    compressor at content-defined points, which keeps most of it."""
+    global _GZIP_ARGV
+    if _GZIP_ARGV is None:
+        try:
+            r = subprocess.run(["gzip", "--rsyncable", "-c"], input=b"",
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+            _GZIP_ARGV = ["gzip", "--rsyncable"] if r.returncode == 0 else ["gzip"]
+        except (OSError, subprocess.SubprocessError):
+            _GZIP_ARGV = ["gzip"]
+    return _GZIP_ARGV
+
+
+def _dump_to_file(cmd, dump_path, compress, env=None):
+    """Run a dump command into dump_path, gzipped or not. Returns
+    (returncode, stderr text)."""
+    if not compress:
+        with open(dump_path, "wb") as f:
+            r = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, env=env)
+        return r.returncode, r.stderr.decode("utf-8", errors="replace")
+
+    dump_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    if IS_WINDOWS:
+        import gzip as gzip_mod
+        with gzip_mod.open(dump_path, "wb") as f:
+            while True:
+                chunk = dump_proc.stdout.read(65536)
+                if not chunk:
+                    break
+                f.write(chunk)
+        dump_proc.wait()
+    else:
+        with open(dump_path, "wb") as f:
+            gzip_proc = subprocess.Popen(_gzip_argv(), stdin=dump_proc.stdout, stdout=f, stderr=subprocess.PIPE)
+        dump_proc.stdout.close()
+        gzip_proc.wait()
+        dump_proc.wait()
+    stderr = dump_proc.stderr.read().decode("utf-8", errors="replace") if dump_proc.stderr else ""
+    return dump_proc.returncode, stderr
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Streaming database dumps into the archive
+#
+# With a plan's "Stream database dumps" option on, a MySQL or PostgreSQL
+# dump never touches the client's disk. Where the dump file would go, the
+# agent makes a named pipe, and borg runs with --read-special, which reads a
+# pipe as if it were a regular file. When borg reaches the pipe, the dump
+# starts writing into it. The archive ends up with name.sql at the same path
+# a dump to disk would have used, so restores need nothing new.
+#
+# What that costs, and what this code does about it:
+# - borg opens a pipe and waits for a writer, and the writer waits for borg.
+#   Each dump therefore starts when borg gets to it, one at a time, and runs
+#   at the speed borg can store it. A database is read for longer than with
+#   a dump to local disk.
+# - --read-special applies to the whole backup: any other pipe or device
+#   under the plan's directories would be read too, and one that never ends
+#   (a postfix fifo, /dev/zero in a chroot) hangs the backup. They are found
+#   before borg starts and excluded; the job log names them.
+# - borg cannot tell that a dump failed half way; it stores what arrived.
+#   The dump's exit status is checked afterwards, and a failed database is
+#   left out of the restore list and flags the job "completed with warnings".
+# - A pipe borg never opens (an exclude pattern matches it, or borg failed
+#   first) would leave its writer waiting forever, so the agent opens any
+#   unread pipe itself once borg is done.
+# Linux and macOS only, and not with snapshots: a pipe seen through a
+# snapshot is a different file with no writer.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_STREAMABLE_PLUGINS = ("pg_dump", "mysql_dump")
+
+
+class DumpStreams(object):
+    """The database dumps of one backup job that go to borg through pipes."""
+
+    def __init__(self, config, job_id):
+        self.config = config
+        self.job_id = job_id
+        self.streams = []
+        self._lock = threading.Lock()
+        self._done = False
+        self._held = contextlib.ExitStack()
+        self._started = False
+        self.on_disk = False  # fell back to dump files for this run
+
+    def hold(self, context_manager):
+        """Keep a context (the MySQL option file) open until finish()."""
+        return self._held.enter_context(context_manager)
+
+    def add(self, path, name, cmd, env, describe_error):
+        self.streams.append({
+            "path": path, "name": name, "cmd": cmd, "env": env, "run": None, "waiting": False, "listed": [], "ino": None,
+            "describe_error": describe_error,
+            "opened": False, "bytes": 0, "error": None, "thread": None, "proc": None,
+        })
+
+    def paths(self):
+        return [s["path"] for s in self.streams]
+
+    def dump_to_disk(self, reason):
+        """Fall back to plain dump files when streaming cannot be used for
+        this run. The files get the names the pipes would have had."""
+        log_to_server(self.config, self.job_id,
+                      "Not streaming database dumps ({}); dumping to disk instead".format(reason))
+        for s in self.streams:
+            if os.path.lexists(s["path"]):
+                os.remove(s["path"])  # a pipe from start(); writing to it would block
+            rc, stderr = _dump_to_file(s["cmd"], s["path"], False, env=s["env"])
+            if rc != 0:
+                s["error"] = s["describe_error"](stderr.strip() or "exited with code {}".format(rc))
+        self.on_disk = True
+
+    def make_pipes(self):
+        """Create the pipes. Done before the special-file scan, so that a
+        pipe reachable through a second path (a symlinked or bind-mounted
+        parent) is found there and excluded under every other name."""
+        for s in self.streams:
+            if os.path.lexists(s["path"]):
+                os.remove(s["path"])
+            os.mkfifo(s["path"], 0o600)
+            st = os.stat(s["path"])
+            s["ino"] = (st.st_dev, st.st_ino)
+
+    def note_listed(self, path, status):
+        """Called for each item borg lists. Records the paths each pipe was
+        stored under, matched by inode, so a pipe reached through a second
+        path is caught whatever the reason."""
+        if not path.endswith(".sql") or (status[:1].lower() in ("x", "e")):
+            return
+        full = path if path.startswith("/") else "/" + path
+        try:
+            st = os.stat(full)
+        except OSError:
+            return
+        for s in self.streams:
+            if s.get("ino") == (st.st_dev, st.st_ino):
+                s["listed"].append(os.path.normpath(full))
+                return
+
+    def size_of(self, st):
+        for s in self.streams:
+            if s.get("ino") == (st.st_dev, st.st_ino):
+                return s["bytes"]
+        return None
+
+    def start(self):
+        """Start a writer for each pipe. Each writer waits until borg opens
+        its pipe, then runs the dump into it."""
+        for s in self.streams:
+            t = threading.Thread(target=self._feed, args=(s,), name="bbs-stream-{}".format(s["name"]))
+            t.daemon = True
+            s["thread"] = t
+            t.start()
+        self._started = True
+
+    def _wait_for_reader(self, s):
+        """Block until borg opens the pipe. Returns the write end, or None
+        once finish() has released the wait."""
+        with self._lock:
+            if self._done:
+                return None
+            s["waiting"] = True
+        try:
+            fd = os.open(s["path"], os.O_WRONLY)
+        finally:
+            with self._lock:
+                s["waiting"] = False
+                done = self._done
+        if done:
+            os.close(fd)
+            return None
+        return fd
+
+    def _feed(self, s):
+        try:
+            fd = self._wait_for_reader(s)
+        except OSError as e:
+            s["error"] = s["describe_error"]("could not open the pipe: {}".format(e))
+            return
+        if fd is None:
+            s["error"] = s["describe_error"](
+                "borg did not read it (is the dump directory matched by an exclude pattern?)")
+            return
+        s["opened"] = True
+        try:
+            logger.info("Streaming database {} into the archive".format(s["name"]))
+            with tempfile.TemporaryFile() as errf:
+                proc = subprocess.Popen(s["cmd"], stdout=subprocess.PIPE, stderr=errf, env=s["env"])
+                s["proc"] = proc
+                out = proc.stdout.fileno()
+                try:
+                    while True:
+                        chunk = os.read(out, 1 << 20)
+                        if not chunk:
+                            break
+                        view = memoryview(chunk)
+                        while view:
+                            view = view[os.write(fd, view):]
+                        s["bytes"] += len(chunk)
+                except BrokenPipeError:
+                    s["error"] = s["describe_error"]("borg stopped reading before the dump finished")
+                    proc.kill()
+                proc.stdout.close()
+                proc.wait()
+                if proc.returncode != 0 and not s["error"]:
+                    errf.seek(0)
+                    stderr = errf.read().decode("utf-8", errors="replace").strip()
+                    s["error"] = s["describe_error"](stderr or "exited with code {}".format(proc.returncode))
+        except Exception as e:
+            s["error"] = s["describe_error"](str(e))
+            if s["proc"] is not None and s["proc"].poll() is None:
+                s["proc"].kill()
+        finally:
+            os.close(fd)
+
+        # Borg should read each pipe once. If it opens it again (the dump
+        # directory reached through a path the scan could not see), a pipe
+        # with no writer would block borg forever, so answer any further
+        # open with an empty read. This can also pair with borg's read end
+        # of the first visit while it is still open, so it proves nothing;
+        # report() checks borg's own list of what it stored instead.
+        while True:
+            try:
+                fd = self._wait_for_reader(s)
+            except OSError:
+                break
+            if fd is None:
+                break
+            os.close(fd)
+
+    def finish(self):
+        """After borg has exited: release writers still waiting for borg,
+        wait for the rest, remove the pipes. Never raises."""
+        try:
+            if self._started:
+                with self._lock:
+                    self._done = True
+                    waiting = [s for s in self.streams if s.get("waiting")]
+                # Opening the read end lets a waiting writer's open() return;
+                # it sees the job is done and closes without dumping.
+                readers = []
+                for s in waiting:
+                    try:
+                        readers.append(os.open(s["path"], os.O_RDONLY | os.O_NONBLOCK))
+                    except OSError:
+                        pass
+                for s in self.streams:
+                    t = s["thread"]
+                    if t is not None:
+                        t.join(timeout=60)
+                        if t.is_alive() and s["proc"] is not None and s["proc"].poll() is None:
+                            s["proc"].kill()
+                            t.join(timeout=10)
+                for r in readers:
+                    try:
+                        os.close(r)
+                    except OSError:
+                        pass
+        finally:
+            for s in self.streams:
+                try:
+                    if not self.on_disk and os.path.lexists(s["path"]):
+                        os.remove(s["path"])
+                except OSError:
+                    pass
+            try:
+                self._held.close()
+            except Exception:
+                pass
+
+    def report(self, plugin_runs):
+        """Log each database, drop failed ones from what the archive claims
+        to hold, and return failure records like execute_plugins' own."""
+        failures = []
+        for run in plugin_runs:
+            mine = [s for s in self.streams if s.get("run") is run]
+            if not mine:
+                continue
+            ok = []
+            for s in mine:
+                if not s["error"] and not self.on_disk:
+                    want = os.path.normpath(s["path"])
+                    others = sorted(set(p for p in s["listed"] if p != want))
+                    if others:
+                        s["error"] = s["describe_error"](
+                            "the dump directory is also reachable as {} in this plan, so borg read the pipe there too "
+                            "and the copy at {} may be empty".format(", ".join(others), want))
+                    elif s["listed"].count(want) != 1:
+                        s["error"] = s["describe_error"](
+                            "borg stored it {} times at {}, expected once".format(s["listed"].count(want), want))
+                if s["error"]:
+                    log_to_server(self.config, self.job_id, "Database {} not backed up: {}".format(s["name"], s["error"]))
+                    failures.append({"slug": run.get("slug"), "config_name": run.get("config_name"),
+                                     "config": run.get("config"), "error": s["error"]})
+                else:
+                    ok.append(s["name"])
+                    if not self.on_disk:
+                        log_to_server(self.config, self.job_id, "Streamed database {} into the archive ({})".format(
+                            s["name"], _format_size(s["bytes"])))
+            run["result"]["databases"] = ok
+        return failures
+
+
+def _special_files(directories, excludes, keep, one_file_system):
+    """Paths under `directories` that borg --read-special would open and read:
+    pipes, device files, and symlinks to either. /dev/null (or a link to it)
+    is harmless, reads as empty, and is left alone, as are the paths in `keep`.
+    A /dev/null node that cannot be opened (snap images are mounted nodev)
+    is listed anyway: borg's open fails too, and the job carries a warning
+    for nothing. A symlink into /proc or /dev/fd is listed without looking
+    at its target, because the target is a different thing in every
+    process: dev/stderr -> fd/2 is a log socket here and borg's own stderr
+    pipe in borg, which then reads the pipe it writes to and never returns.
+
+    Pruning the walk with the plan's excludes only saves time, so only
+    patterns that certainly exclude a whole directory are used: plain paths
+    with no wildcards, as fm: (the default) or pp:. Walking more than borg
+    does finds extra paths to exclude, which is harmless; walking less could
+    miss one, so nothing else is pruned."""
+    prune = set()
+    for pattern in (excludes or "").splitlines():
+        pattern = pattern.strip()
+        if len(pattern) > 3 and pattern[2] == ":":
+            style, pattern = pattern[:2], pattern[3:]
+            if style not in ("fm", "pp"):
+                continue
+        if pattern and not any(c in pattern for c in "*?[]") and pattern.startswith("/"):
+            prune.add(os.path.normpath(pattern))
+    keep = {os.path.normpath(k) for k in keep}
+    try:
+        null_rdev = os.stat("/dev/null").st_rdev
+    except OSError:
+        null_rdev = None
+
+    def openable(path):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0))
+        except OSError:
+            return False
+        os.close(fd)
+        return True
+
+    def harmful(st, path):
+        mode = st.st_mode
+        if stat.S_ISCHR(mode) and st.st_rdev == null_rdev:
+            return not openable(path)
+        return stat.S_ISFIFO(mode) or stat.S_ISCHR(mode) or stat.S_ISBLK(mode)
+
+    def volatile_link(path):
+        try:
+            target = os.path.realpath(path)
+        except (OSError, ValueError):
+            return False
+        return any(target == d or target.startswith(d + "/") for d in ("/proc", "/dev/fd"))
+
+    found = []
+    for root in [d.strip() for d in (directories or "").splitlines() if d.strip()]:
+        root = os.path.normpath(root)
+        try:
+            root_dev = os.lstat(root).st_dev
+        except OSError:
+            continue
+        stack = [root]
+        while stack:
+            d = stack.pop()
+            try:
+                it = os.scandir(d)
+            except OSError:
+                continue
+            with it:
+                for e in it:
+                    path = e.path
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            if path in prune:
+                                continue
+                            if one_file_system and e.stat(follow_symlinks=False).st_dev != root_dev:
+                                continue
+                            stack.append(path)
+                        elif e.is_symlink():
+                            if path in keep:
+                                continue
+                            if volatile_link(path):
+                                found.append(path)
+                                continue
+                            try:
+                                if harmful(os.stat(path), path):
+                                    found.append(path)
+                            except OSError:
+                                pass  # dangling link
+                        elif not e.is_file(follow_symlinks=False):
+                            if path not in keep and harmful(e.stat(follow_symlinks=False), path):
+                                found.append(path)
+                    except OSError:
+                        continue
+    return found
+
+
+_SPECIAL_FILES_MAX = 2000
+
+
+def _without_covered_dump_roots(command, pipe_paths, one_file_system):
+    """Drop a dump directory from borg's paths when another path in the same
+    command already contains it. The server adds the dump directory as its
+    own path; with /home/bbs in the plan as well, borg would walk
+    /home/bbs/mysql twice and open each pipe twice, under the same name, so
+    no exclude could tell the visits apart."""
+    if "--" not in command:
+        return command
+    at = command.index("--") + 1
+    roots = command[at:]
+    dump_dirs = {os.path.normpath(os.path.dirname(p)) for p in pipe_paths}
+    kept = []
+    for i, root in enumerate(roots):
+        norm = os.path.normpath(root)
+        if norm in dump_dirs:
+            covered = False
+            for j, other in enumerate(roots):
+                o = os.path.normpath(other)
+                if j == i or not (o == "/" or norm.startswith(o.rstrip("/") + "/") or (o == norm and j < i)):
+                    continue
+                if one_file_system:
+                    try:
+                        if os.stat(o).st_dev != os.stat(norm).st_dev:
+                            continue
+                    except OSError:
+                        continue
+                covered = True
+                break
+            if covered:
+                continue
+        kept.append(root)
+    return command[:at] + kept
+
+
+def _prepare_streaming(config, job_id, command, directories, streams):
+    """Make the borg command safe for --read-special, start the pipes, and
+    return the command to run. Falls back to dump files if any step fails."""
+    try:
+        t0 = time.time()
+        one_fs = "--one-file-system" in command
+        command = _without_covered_dump_roots(command, streams.paths(), one_fs)
+        directories = "\n".join(command[command.index("--") + 1:]) if "--" in command else directories
+        streams.make_pipes()
+        excludes = "\n".join(t[len("--exclude="):] for t in command if t.startswith("--exclude="))
+        specials = _special_files(directories, excludes, streams.paths(), one_fs)
+        logger.info("Special-file check took {:.1f}s, found {}".format(time.time() - t0, len(specials)))
+        if len(specials) > _SPECIAL_FILES_MAX:
+            raise RuntimeError("{} pipes or device files under the plan's directories; exclude them to stream".format(len(specials)))
+        at = command.index("create") + 1
+        new_command = command[:at] + ["--read-special"] + ["--exclude=pp:" + p for p in specials] + command[at:]
+        if specials:
+            shown = ", ".join(specials[:10]) + (" and {} more".format(len(specials) - 10) if len(specials) > 10 else "")
+            log_to_server(config, job_id,
+                          "Left {} pipe/device file(s) out of this archive so borg does not read from them: {}".format(len(specials), shown))
+        streams.start()
+        return new_command
+    except Exception as e:
+        logger.error("Job #{}: streaming not possible: {}".format(job_id, e))
+        streams.dump_to_disk(str(e))
+        return command
+
+
+@contextlib.contextmanager
+def _mysql_login(password):
+    """Pass the MySQL password in a private option file instead of on the
+    command line, where any local user could read it from the process list.
+    Yields the --defaults-file argument, which must come first.
+
+    The password on the command line used to win over every option file.
+    An option file given with --defaults-extra-file does not: the user's
+    own ~/.my.cnf is read after it, and a [client] password there (common
+    for root on admin-managed servers) replaced the plugin's (#528). So the
+    file is passed with --defaults-file, which reads only it; it includes
+    the usual option files first, so their other settings (socket, SSL)
+    still apply, and puts the password last, where it wins."""
+    fd, path = tempfile.mkstemp(prefix="bbs-mysql-", suffix=".cnf")
+    try:
+        lines = []
+        if not IS_WINDOWS:
+            for candidate in ("/etc/my.cnf", "/etc/mysql/my.cnf", os.path.expanduser("~/.my.cnf")):
+                if os.path.isfile(candidate):
+                    lines.append("!include {}".format(candidate))
+        lines.append("[client]")
+        lines.append('password="{}"'.format(
+            str(password or "").replace("\\", "\\\\").replace('"', '\\"')))
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        if IS_WINDOWS:
+            # Windows clients read no ~/.my.cnf, so the extra file is enough
+            # and keeps my.ini settings.
+            yield "--defaults-extra-file={}".format(path)
+        else:
+            yield "--defaults-file={}".format(path)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def execute_plugin_mysql_dump(config):
     """Dump MySQL/MariaDB databases before backup."""
-    dump_dir = config.get("dump_dir", "/home/bbs/mysql")
+    with _mysql_login(config.get("password")) as login:
+        return _execute_plugin_mysql_dump(config, login)
+
+
+def _mysql_dump_jobs(config, login):
+    """What a MySQL dump of this config runs, without running it:
+    (dump_dir, per_database, [(name, argv)]). Shared by the dump-to-disk and
+    the streaming paths. `login` is the --defaults-file argument from
+    _mysql_login(); it must stay valid until the commands have run."""
+    dump_dir = _checked_dump_dir(config.get("dump_dir", "/home/bbs/mysql"))
     os.makedirs(dump_dir, exist_ok=True)
 
     host = config.get("host", "localhost")
@@ -1524,7 +2650,6 @@ def execute_plugin_mysql_dump(config):
     password = config.get("password")
     databases = config.get("databases", "*")
     per_database = config.get("per_database", True)
-    compress = config.get("compress", True)
     exclude = config.get("exclude_databases", ["information_schema", "performance_schema", "sys"])
     extra_options = config.get("extra_options", "--single-transaction --quick --routines --triggers --events")
 
@@ -1534,11 +2659,10 @@ def execute_plugin_mysql_dump(config):
     if isinstance(databases, str) and databases.strip() == "*":
         # List all databases
         list_cmd = [
-            "mysql",
+            "mysql", login,
             "--host={}".format(host),
             "--port={}".format(port),
             "--user={}".format(user),
-            "--password={}".format(password),
             "-e", "SHOW DATABASES;",
             "-s", "--skip-column-names",
         ]
@@ -1553,79 +2677,39 @@ def execute_plugin_mysql_dump(config):
         ]
     elif isinstance(databases, str):
         databases = [d.strip() for d in databases.split(",") if d.strip()]
+    databases = [_checked_db_name(db) for db in databases]
 
-    base_cmd = ["mysqldump", "--host={}".format(host), "--port={}".format(port), "--user={}".format(user), "--password={}".format(password)]
+    base_cmd = ["mysqldump", login, "--host={}".format(host), "--port={}".format(port), "--user={}".format(user)]
     if extra_options:
-        base_cmd.extend(extra_options.split())
-
-    dump_files = []
+        base_cmd.extend(_checked_extra_options("mysqldump", extra_options))
 
     if per_database:
-        for db in databases:
-            filename = "{}.sql.gz".format(db) if compress else "{}.sql".format(db)
-            dump_path = os.path.join(dump_dir, filename)
-            logger.info("Dumping database {} to {}".format(db, dump_path))
-
-            cmd = base_cmd + [db]
-            if compress:
-                dump_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if IS_WINDOWS:
-                    import gzip as gzip_mod
-                    with gzip_mod.open(dump_path, "wb") as f:
-                        while True:
-                            chunk = dump_proc.stdout.read(65536)
-                            if not chunk:
-                                break
-                            f.write(chunk)
-                    dump_proc.wait()
-                else:
-                    with open(dump_path, "wb") as f:
-                        gzip_proc = subprocess.Popen(["gzip"], stdin=dump_proc.stdout, stdout=f, stderr=subprocess.PIPE)
-                    dump_proc.stdout.close()
-                    gzip_proc.wait()
-                    dump_proc.wait()
-                if dump_proc.returncode != 0:
-                    stderr = dump_proc.stderr.read().decode() if dump_proc.stderr else ""
-                    raise Exception("mysqldump failed for {}: {}".format(db, stderr))
-            else:
-                with open(dump_path, "w") as f:
-                    r = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE)
-                    if r.returncode != 0:
-                        raise Exception("mysqldump failed for {}: {}".format(db, r.stderr.decode('utf-8', errors='replace')))
-
-            dump_files.append(dump_path)
+        jobs = [(db, base_cmd + ["--", db]) for db in databases]
     else:
-        filename = "all_databases.sql.gz" if compress else "all_databases.sql"
+        jobs = [("all_databases", base_cmd + ["--all-databases"])]
+    return dump_dir, per_database, jobs
+
+
+def _mysql_dump_error(name, stderr):
+    if name == "all_databases":
+        return "mysqldump failed: {}".format(stderr)
+    return "mysqldump failed for {}: {}".format(name, stderr)
+
+
+def _execute_plugin_mysql_dump(config, login):
+    dump_dir, per_database, jobs = _mysql_dump_jobs(config, login)
+    compress = config.get("compress", True)
+    dump_files = []
+    for name, cmd in jobs:
+        filename = "{}.sql.gz".format(name) if compress else "{}.sql".format(name)
         dump_path = os.path.join(dump_dir, filename)
-        logger.info("Dumping all databases to {}".format(dump_path))
-
-        cmd = base_cmd + ["--all-databases"]
-        if compress:
-            dump_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if IS_WINDOWS:
-                import gzip as gzip_mod
-                with gzip_mod.open(dump_path, "wb") as f:
-                    while True:
-                        chunk = dump_proc.stdout.read(65536)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                dump_proc.wait()
-            else:
-                with open(dump_path, "wb") as f:
-                    gzip_proc = subprocess.Popen(["gzip"], stdin=dump_proc.stdout, stdout=f, stderr=subprocess.PIPE)
-                dump_proc.stdout.close()
-                gzip_proc.wait()
-                dump_proc.wait()
-            if dump_proc.returncode != 0:
-                stderr = dump_proc.stderr.read().decode() if dump_proc.stderr else ""
-                raise Exception("mysqldump failed: {}".format(stderr))
+        if per_database:
+            logger.info("Dumping database {} to {}".format(name, dump_path))
         else:
-            with open(dump_path, "w") as f:
-                r = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE)
-                if r.returncode != 0:
-                    raise Exception("mysqldump failed: {}".format(r.stderr.decode('utf-8', errors='replace')))
-
+            logger.info("Dumping all databases to {}".format(dump_path))
+        rc, stderr = _dump_to_file(cmd, dump_path, compress)
+        if rc != 0:
+            raise Exception(_mysql_dump_error(name, stderr))
         dump_files.append(dump_path)
 
     logger.info("MySQL dump complete: {} file(s) in {}".format(len(dump_files), dump_dir))
@@ -1638,6 +2722,23 @@ def execute_plugin_mysql_dump(config):
         "compress": compress,
     }
 
+
+def stream_plugin_mysql_dump(config, streams):
+    """Register this config's databases to be streamed into the archive. The
+    option file holding the password lives until the streams are done."""
+    login = streams.hold(_mysql_login(config.get("password")))
+    dump_dir, per_database, jobs = _mysql_dump_jobs(config, login)
+    for name, cmd in jobs:
+        streams.add(os.path.join(dump_dir, "{}.sql".format(name)), name, cmd, None,
+                    lambda stderr, name=name: _mysql_dump_error(name, stderr))
+    return {
+        "dump_files": [],
+        "dump_dir": dump_dir,
+        "databases": [name for name, _ in jobs],
+        "per_database": per_database,
+        "compress": False,
+        "streamed": True,
+    }
 
 def cleanup_plugin_mysql_dump(config, plugin_result):
     """Delete dump files after backup if cleanup_after is enabled."""
@@ -1656,6 +2757,11 @@ def cleanup_plugin_mysql_dump(config, plugin_result):
 
 def test_plugin_mysql_dump(config):
     """Test MySQL connectivity without dumping."""
+    with _mysql_login(config.get("password")) as login:
+        return _test_plugin_mysql_dump(config, login)
+
+
+def _test_plugin_mysql_dump(config, login):
     host = config.get("host", "localhost")
     port = str(config.get("port", 3306))
     user = config.get("user")
@@ -1663,24 +2769,57 @@ def test_plugin_mysql_dump(config):
     if not user or not password:
         raise Exception("MySQL plugin requires user and password")
 
-    cmd = ["mysql", "--host={}".format(host), "--port={}".format(port), "--user={}".format(user),
-           "--password={}".format(password), "-e", "SELECT 1;", "-s", "--skip-column-names"]
+    cmd = ["mysql", login, "--host={}".format(host), "--port={}".format(port), "--user={}".format(user),
+           "-e", "SELECT 1;", "-s", "--skip-column-names"]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
     if result.returncode != 0:
         raise Exception("Connection failed: {}".format(result.stderr.decode('utf-8', errors='replace').strip()))
 
     # Test SHOW DATABASES for permissions
-    cmd2 = ["mysql", "--host={}".format(host), "--port={}".format(port), "--user={}".format(user),
-            "--password={}".format(password), "-e", "SHOW DATABASES;", "-s", "--skip-column-names"]
+    cmd2 = ["mysql", login, "--host={}".format(host), "--port={}".format(port), "--user={}".format(user),
+            "-e", "SHOW DATABASES;", "-s", "--skip-column-names"]
     result2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
     dbs = result2.stdout.decode("utf-8", errors="replace").strip().split("\n")
     dbs = [d for d in dbs if d]
     return "Connection successful. Found {} database(s): {}".format(len(dbs), ', '.join(dbs[:10]))
 
 
-def execute_plugin_pg_dump(config):
-    """Dump PostgreSQL databases before backup."""
-    dump_dir = config.get("dump_dir", "/home/bbs/pgdump")
+def _pg_dump_for_server(host, port, user, pg_env):
+    """The pg_dump to use for this server: the one matching the server's major
+    version when it is installed (pg_dump refuses a server newer than
+    itself, #495), else whatever is on PATH. Returns (path, note)."""
+    major = None
+    try:
+        r = subprocess.run(["psql", "-h", host, "-p", port, "-U", user, "-d", "postgres", "-tAc",
+                            "SHOW server_version_num"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=pg_env, timeout=30)
+        if r.returncode == 0:
+            num = int(r.stdout.decode("utf-8", "replace").strip() or 0)
+            major = num // 10000 if num >= 100000 else num // 10000
+    except Exception:
+        major = None
+    if not major:
+        return "pg_dump", "server version unknown, using pg_dump from PATH"
+    candidates = [
+        "/usr/lib/postgresql/{}/bin/pg_dump".format(major),          # Debian, Ubuntu
+        "/usr/pgsql-{}/bin/pg_dump".format(major),                    # RHEL, Rocky, Alma
+        "/opt/homebrew/opt/postgresql@{}/bin/pg_dump".format(major),  # macOS Homebrew
+        "/usr/local/opt/postgresql@{}/bin/pg_dump".format(major),
+        "/Library/PostgreSQL/{}/bin/pg_dump".format(major),           # EDB installer
+    ]
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c, "server is PostgreSQL {}, using {}".format(major, c)
+    default = shutil.which("pg_dump") or "pg_dump"
+    return default, ("server is PostgreSQL {}; no matching pg_dump installed, using {} "
+                     "(install postgresql-client-{} if the versions do not match)").format(major, default, major)
+
+
+def _pg_dump_jobs(config):
+    """What a PostgreSQL dump of this config runs, without running it:
+    (dump_dir, env, [(database, argv)]). Shared by the dump-to-disk and the
+    streaming paths so both dump the same databases the same way."""
+    dump_dir = _checked_dump_dir(config.get("dump_dir", "/home/bbs/pgdump"))
     os.makedirs(dump_dir, exist_ok=True)
 
     host = config.get("host", "localhost")
@@ -1688,7 +2827,6 @@ def execute_plugin_pg_dump(config):
     user = config.get("user")
     password = config.get("password")
     databases = config.get("databases", "*")
-    compress = config.get("compress", True)
     exclude = config.get("exclude_databases", ["template0", "template1", "postgres"])
     extra_options = config.get("extra_options", "--no-owner --no-privileges")
 
@@ -1699,60 +2837,60 @@ def execute_plugin_pg_dump(config):
     pg_env["PGPASSWORD"] = password
 
     if isinstance(databases, str) and databases.strip() == "*":
-        # List all databases via psql
-        list_cmd = ["psql", "-h", host, "-p", port, "-U", user, "-l", "-t", "-A"]
+        # List databases via a catalog query. Parsing `psql -l` is unsafe: DBs with
+        # GRANTed privileges have a multi-line "Access privileges" column whose
+        # continuation lines (e.g. "<grantee>=<privs>/<grantor>") get mis-parsed as names.
+        # -d postgres: without an explicit database, psql defaults the dbname
+        # to the USERNAME — fatal for dedicated backup users with no
+        # same-named database (#345). The old `psql -l` connected to the
+        # postgres maintenance db implicitly; do the same explicitly.
+        list_cmd = ["psql", "-h", host, "-p", port, "-U", user, "-d", "postgres", "-tAc",
+                    "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate"]
         result = subprocess.run(list_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=pg_env)
         if result.returncode != 0:
             raise Exception("Failed to list databases: {}".format(result.stderr.decode('utf-8', errors='replace').strip()))
         if isinstance(exclude, str):
             exclude = [x.strip() for x in exclude.split(",")]
-        # psql -l -t -A outputs: dbname|owner|encoding|collate|ctype|access
         databases = []
         for line in result.stdout.decode("utf-8", errors="replace").strip().split("\n"):
-            parts = line.split("|")
-            if parts and parts[0].strip() and parts[0].strip() not in exclude:
-                databases.append(parts[0].strip())
+            name = line.strip()
+            if name and name not in exclude:
+                databases.append(name)
     elif isinstance(databases, str):
         databases = [d.strip() for d in databases.split(",") if d.strip()]
 
-    dump_files = []
+    databases = [_checked_db_name(db) for db in databases]
+    pg_dump_bin, pg_note = _pg_dump_for_server(host, port, user, pg_env)
+    logger.info("PostgreSQL plugin: {}".format(pg_note))
 
+    jobs = []
     for db in databases:
+        cmd = [pg_dump_bin, "-h", host, "-p", port, "-U", user]
+        if extra_options:
+            cmd.extend(_checked_extra_options("pg_dump", extra_options))
+        cmd.extend(["--", db])
+        jobs.append((db, cmd))
+    return dump_dir, pg_env, jobs
+
+
+def _pg_dump_error(db, stderr):
+    if "server version mismatch" in stderr:
+        stderr += " Install the PostgreSQL client that matches the server (Debian/Ubuntu: postgresql-client-<major> from the PostgreSQL apt repository); the agent picks the matching pg_dump when it is present."
+    return "pg_dump failed for {}: {}".format(db, stderr)
+
+
+def execute_plugin_pg_dump(config):
+    """Dump PostgreSQL databases before backup."""
+    dump_dir, pg_env, jobs = _pg_dump_jobs(config)
+    compress = config.get("compress", True)
+    dump_files = []
+    for db, cmd in jobs:
         filename = "{}.sql.gz".format(db) if compress else "{}.sql".format(db)
         dump_path = os.path.join(dump_dir, filename)
         logger.info("Dumping PostgreSQL database {} to {}".format(db, dump_path))
-
-        cmd = ["pg_dump", "-h", host, "-p", port, "-U", user]
-        if extra_options:
-            cmd.extend(extra_options.split())
-        cmd.append(db)
-
-        if compress:
-            dump_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=pg_env)
-            if IS_WINDOWS:
-                import gzip as gzip_mod
-                with gzip_mod.open(dump_path, "wb") as f:
-                    while True:
-                        chunk = dump_proc.stdout.read(65536)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                dump_proc.wait()
-            else:
-                with open(dump_path, "wb") as f:
-                    gzip_proc = subprocess.Popen(["gzip"], stdin=dump_proc.stdout, stdout=f, stderr=subprocess.PIPE)
-                dump_proc.stdout.close()
-                gzip_proc.wait()
-                dump_proc.wait()
-            if dump_proc.returncode != 0:
-                stderr = dump_proc.stderr.read().decode() if dump_proc.stderr else ""
-                raise Exception("pg_dump failed for {}: {}".format(db, stderr))
-        else:
-            with open(dump_path, "w") as f:
-                r = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, env=pg_env)
-                if r.returncode != 0:
-                    raise Exception("pg_dump failed for {}: {}".format(db, r.stderr.decode('utf-8', errors='replace')))
-
+        rc, stderr = _dump_to_file(cmd, dump_path, compress, env=pg_env)
+        if rc != 0:
+            raise Exception(_pg_dump_error(db, stderr))
         dump_files.append(dump_path)
 
     logger.info("PostgreSQL dump complete: {} file(s) in {}".format(len(dump_files), dump_dir))
@@ -1765,6 +2903,41 @@ def execute_plugin_pg_dump(config):
         "compress": compress,
     }
 
+
+def _pg_format_streams(extra_options):
+    """pg_dump's directory format writes many files, so it cannot go down a
+    pipe. Plain, custom and tar all go to stdout."""
+    try:
+        opts = shlex.split(extra_options or "")
+    except ValueError:
+        return True
+    for i, opt in enumerate(opts):
+        value = None
+        if opt.startswith("--format="):
+            value = opt.split("=", 1)[1]
+        elif opt in ("-F", "--format") and i + 1 < len(opts):
+            value = opts[i + 1]
+        elif opt.startswith("-F") and len(opt) > 2:
+            value = opt[2:]
+        if value is not None and value.lower() in ("d", "directory"):
+            return False
+    return True
+
+
+def stream_plugin_pg_dump(config, streams):
+    """Register this config's databases to be streamed into the archive."""
+    dump_dir, pg_env, jobs = _pg_dump_jobs(config)
+    for db, cmd in jobs:
+        streams.add(os.path.join(dump_dir, "{}.sql".format(db)), db, cmd, pg_env,
+                    lambda stderr, db=db: _pg_dump_error(db, stderr))
+    return {
+        "dump_files": [],
+        "dump_dir": dump_dir,
+        "databases": [db for db, _ in jobs],
+        "per_database": True,
+        "compress": False,
+        "streamed": True,
+    }
 
 def cleanup_plugin_pg_dump(config, plugin_result):
     """Delete PostgreSQL dump files after backup if cleanup_after is enabled."""
@@ -1798,26 +2971,92 @@ def test_plugin_pg_dump(config):
         raise Exception("Connection failed: {}".format(result.stderr.decode('utf-8', errors='replace').strip()))
 
     # List databases
-    cmd2 = ["psql", "-h", host, "-p", port, "-U", user, "-l", "-t", "-A"]
+    # -d postgres — see execute_plugin_pg_dump: psql defaults dbname to the
+    # username otherwise, which fails for dedicated backup users (#345)
+    cmd2 = ["psql", "-h", host, "-p", port, "-U", user, "-d", "postgres", "-tAc",
+            "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate"]
     result2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=pg_env, timeout=15)
     dbs = []
     for line in result2.stdout.decode("utf-8", errors="replace").strip().split("\n"):
-        parts = line.split("|")
-        if parts and parts[0].strip():
-            dbs.append(parts[0].strip())
+        name = line.strip()
+        if name:
+            dbs.append(name)
     return "Connection successful. Found {} database(s): {}".format(len(dbs), ', '.join(dbs[:10]))
 
 
-def _mongo_auth_args(host, port, user, password, auth_db):
-    """Build mongodump/mongorestore auth arguments. Returns list of args."""
-    args = ["--host={}".format(host), "--port={}".format(port)]
-    if user and password:
-        args.extend([
-            "--username={}".format(user),
-            "--password={}".format(password),
-            "--authenticationDatabase={}".format(auth_db),
-        ])
-    return args
+_MONGO_CONFIG_SUPPORT = {}
+
+
+def _mongo_tool_takes_config(tool):
+    """mongodump and mongorestore read the password from a --config file
+    since MongoDB Database Tools 100.3. Older tools only take it on the
+    command line."""
+    if tool not in _MONGO_CONFIG_SUPPORT:
+        try:
+            r = subprocess.run([tool, "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+            _MONGO_CONFIG_SUPPORT[tool] = b"--config" in (r.stdout + r.stderr)
+        except (OSError, subprocess.SubprocessError):
+            _MONGO_CONFIG_SUPPORT[tool] = False
+    return _MONGO_CONFIG_SUPPORT[tool]
+
+
+class _MongoAuth:
+    """Auth arguments for mongodump/mongorestore. The password goes in a
+    private --config file where the tool supports it, so it stays out of the
+    process list, where any local user could read it. Call close() when done."""
+
+    def __init__(self, host, port, user, password, auth_db):
+        self.host, self.port, self.user, self.password, self.auth_db = host, port, user, password, auth_db
+        self._config_path = None
+
+    def args(self, tool):
+        args = ["--host={}".format(self.host), "--port={}".format(self.port)]
+        if not (self.user and self.password):
+            return args
+        args.extend(["--username={}".format(self.user), "--authenticationDatabase={}".format(self.auth_db)])
+        if _mongo_tool_takes_config(tool):
+            if self._config_path is None:
+                fd, self._config_path = tempfile.mkstemp(prefix="bbs-mongo-", suffix=".yaml")
+                with os.fdopen(fd, "w") as f:
+                    # A JSON string is a valid YAML double-quoted scalar
+                    f.write("password: {}\n".format(json.dumps(str(self.password))))
+            args.append("--config={}".format(self._config_path))
+        else:
+            args.append("--password={}".format(self.password))
+        return args
+
+    def close(self):
+        if self._config_path:
+            try:
+                os.remove(self._config_path)
+            except OSError:
+                pass
+            self._config_path = None
+
+
+def _mongo_list_databases(shell, host, port, user, password, auth_db, timeout):
+    """Run the shell's listDatabases. With mongosh the credentials travel in
+    the environment and the script builds the connection from them, so the
+    password is not on the command line. The legacy mongo shell cannot read
+    the environment and still gets -p."""
+    script = "JSON.stringify(db.adminCommand('listDatabases').databases.map(d => d.name))"
+    env = None
+    if user and password and shell == "mongosh":
+        addr = "[{}]:{}".format(host, port) if ":" in host and not host.startswith("[") else "{}:{}".format(host, port)
+        env = os.environ.copy()
+        env.update({"BBS_MONGO_USER": str(user), "BBS_MONGO_PASS": str(password),
+                    "BBS_MONGO_ADDR": addr, "BBS_MONGO_AUTHDB": str(auth_db)})
+        cmd = [shell, "--nodb", "--quiet", "--eval",
+               "const e = process.env;"
+               "const m = new Mongo('mongodb://' + encodeURIComponent(e.BBS_MONGO_USER) + ':' + encodeURIComponent(e.BBS_MONGO_PASS)"
+               " + '@' + e.BBS_MONGO_ADDR + '/?authSource=' + encodeURIComponent(e.BBS_MONGO_AUTHDB));"
+               "print(JSON.stringify(m.getDB('admin').adminCommand('listDatabases').databases.map(d => d.name)));"]
+    else:
+        cmd = [shell, "--host", host, "--port", port]
+        if user and password:
+            cmd.extend(["-u", user, "-p", password, "--authenticationDatabase", auth_db])
+        cmd.extend(["--quiet", "--eval", script])
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, env=env)
 
 
 def _find_mongosh():
@@ -1863,7 +3102,7 @@ def _parse_mongo_db_list(raw_output, exclude=None):
 
 def execute_plugin_mongo_dump(config):
     """Dump MongoDB databases before backup using mongodump."""
-    dump_dir = config.get("dump_dir", "/home/bbs/mongodump")
+    dump_dir = _checked_dump_dir(config.get("dump_dir", "/home/bbs/mongodump"))
     os.makedirs(dump_dir, exist_ok=True)
 
     host = config.get("host", "127.0.0.1")
@@ -1885,12 +3124,7 @@ def execute_plugin_mongo_dump(config):
         if not shell:
             raise Exception("Neither mongosh nor mongo found. Install MongoDB Database Tools.")
 
-        list_cmd = [shell, "--host", host, "--port", port]
-        if user and password:
-            list_cmd.extend(["-u", user, "-p", password, "--authenticationDatabase", auth_db])
-        list_cmd.extend(["--quiet", "--eval", "JSON.stringify(db.adminCommand('listDatabases').databases.map(d => d.name))"])
-
-        result = subprocess.run(list_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        result = _mongo_list_databases(shell, host, port, user, password, auth_db, 30)
         if result.returncode != 0:
             raise Exception("Failed to list databases: {}".format(result.stderr.decode('utf-8', errors='replace').strip()))
 
@@ -1901,26 +3135,29 @@ def execute_plugin_mongo_dump(config):
 
     if not databases:
         raise Exception("No databases found to dump")
+    databases = [_checked_db_name(db) for db in databases]
 
     dump_files = []
-    auth_args = _mongo_auth_args(host, port, user, password, auth_db)
+    auth = _MongoAuth(host, port, user, password, auth_db)
+    try:
+        for db in databases:
+            logger.info("Dumping MongoDB database {} to {}".format(db, dump_dir))
 
-    for db in databases:
-        logger.info("Dumping MongoDB database {} to {}".format(db, dump_dir))
+            cmd = ["mongodump"] + auth.args("mongodump") + ["--db={}".format(db), "--out={}".format(dump_dir)]
+            if compress:
+                cmd.append("--gzip")
+            if extra_options:
+                cmd.extend(_checked_extra_options("mongodump", extra_options))
 
-        cmd = ["mongodump"] + auth_args + ["--db={}".format(db), "--out={}".format(dump_dir)]
-        if compress:
-            cmd.append("--gzip")
-        if extra_options:
-            cmd.extend(extra_options.split())
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3600)
+            if r.returncode != 0:
+                raise Exception("mongodump failed for {}: {}".format(db, r.stderr.decode('utf-8', errors='replace')))
 
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3600)
-        if r.returncode != 0:
-            raise Exception("mongodump failed for {}: {}".format(db, r.stderr.decode('utf-8', errors='replace')))
-
-        # mongodump creates dump_dir/db_name/ directory
-        db_dump_path = os.path.join(dump_dir, db)
-        dump_files.append(db_dump_path)
+            # mongodump creates dump_dir/db_name/ directory
+            db_dump_path = os.path.join(dump_dir, db)
+            dump_files.append(db_dump_path)
+    finally:
+        auth.close()
 
     logger.info("MongoDB dump complete: {} database(s) in {}".format(len(databases), dump_dir))
     return {
@@ -1960,18 +3197,368 @@ def test_plugin_mongo_dump(config):
     if not shell:
         raise Exception("Neither mongosh nor mongo found. Install MongoDB Database Tools.")
 
-    cmd = [shell, "--host", host, "--port", port]
-    if user and password:
-        cmd.extend(["-u", user, "-p", password, "--authenticationDatabase", auth_db])
-    cmd.extend(["--quiet", "--eval", "JSON.stringify(db.adminCommand('listDatabases').databases.map(d => d.name))"])
-
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+    result = _mongo_list_databases(shell, host, port, user, password, auth_db, 15)
     if result.returncode != 0:
         raise Exception("Connection failed: {}".format(result.stderr.decode('utf-8', errors='replace').strip()))
 
     raw_output = result.stdout.decode("utf-8", errors="replace").strip()
     dbs = _parse_mongo_db_list(raw_output)
     return "Connection successful. Found {} database(s): {}".format(len(dbs), ', '.join(dbs[:10]))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Microsoft SQL Server plugin (mssql_dump)
+#
+# Backup is T-SQL's own BACKUP DATABASE ... WITH COPY_ONLY, so the .bak files
+# the plugin writes never touch the differential base or the log chain of any
+# other backup tool the customer runs. The command executes inside SQL Server,
+# which writes the file; the agent therefore has to run on the SQL Server
+# machine and the service account needs write access to the dump directory.
+#
+# Nothing is installed on the client for Windows: queries go through the .NET
+# SqlClient that ships with Windows PowerShell. Elsewhere sqlcmd is used.
+# Credentials travel in environment variables, never on a command line.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MSSQL_SYSTEM_DBS = ("master", "model", "msdb", "tempdb")
+
+_MSSQL_PS_SCRIPT = r'''
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+try {
+  $b = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
+  $b['Data Source'] = $env:BBS_MSSQL_SERVER
+  $b['User ID'] = $env:BBS_MSSQL_USER
+  $b['Password'] = $env:BBS_MSSQL_PASS
+  $b['Initial Catalog'] = 'master'
+  $b['Connect Timeout'] = 15
+  $b['Application Name'] = 'BBS Agent'
+  $b['TrustServerCertificate'] = ($env:BBS_MSSQL_TRUST -eq '1')
+  $c = New-Object System.Data.SqlClient.SqlConnection($b.ConnectionString)
+  $c.Open()
+  $cmd = $c.CreateCommand()
+  $cmd.CommandText = $env:BBS_MSSQL_SQL
+  $cmd.CommandTimeout = 0
+  $r = $cmd.ExecuteReader()
+  do {
+    while ($r.Read()) {
+      $vals = @(for ($i = 0; $i -lt $r.FieldCount; $i++) { if ($r.IsDBNull($i)) { '' } else { [string]$r.GetValue($i) } })
+      [Console]::Out.WriteLine(($vals -join "`t"))
+    }
+  } while ($r.NextResult())
+  $r.Close()
+  $c.Close()
+} catch {
+  $ex = $_.Exception
+  while ($ex.InnerException) { $ex = $ex.InnerException }
+  if ($ex.Errors -and $ex.Errors.Count -gt 0) {
+    [Console]::Error.WriteLine((@($ex.Errors | ForEach-Object { $_.Message }) -join ' | '))
+  } else {
+    [Console]::Error.WriteLine($ex.Message)
+  }
+  exit 1
+}
+'''
+
+
+def _mssql_quote_name(name):
+    """[name] for use as a T-SQL identifier."""
+    return "[" + str(name).replace("]", "]]") + "]"
+
+
+def _mssql_quote_str(value):
+    """N'value' for use as a T-SQL string literal."""
+    return "N'" + str(value).replace("'", "''") + "'"
+
+
+def _mssql_checked_db_name(name):
+    name = str(name)
+    if not name or len(name) > 128 or re.search(r"[\x00-\x1f]", name):
+        raise Exception("Refusing unsafe database name {!r}".format(name))
+    return name
+
+
+def _mssql_dump_filename(database):
+    """File name of a database's backup. Must match
+    PluginManager::mssqlDumpFileName() on the server: restore extracts
+    exactly this name from the archive."""
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(database)) + ".bak"
+
+
+def _mssql_server_arg(config):
+    """host[,port] as SQL Server's clients spell it. A named instance
+    (host\\INSTANCE) is found by the SQL Browser, so it takes no port."""
+    host = str(config.get("host") or "localhost").strip()
+    if not re.match(r"^[A-Za-z0-9_.:\\\-\[\]]+$", host) or host.startswith("-"):
+        raise Exception("Invalid SQL Server host {!r}".format(host))
+    if "\\" in host:
+        return host
+    port = str(config.get("port") or "").strip()
+    if port in ("", "0"):
+        return host
+    if not port.isdigit() or not 0 < int(port) < 65536:
+        raise Exception("Invalid SQL Server port {!r}".format(port))
+    return "{},{}".format(host, port)
+
+
+def _mssql_credentials(config):
+    user = str(config.get("user") or "")
+    password = config.get("password")
+    if not user or not password:
+        raise Exception("SQL Server plugin requires user and password")
+    if user.startswith("-") or re.search(r"[\x00-\x1f]", user):
+        raise Exception("Invalid SQL Server user name")
+    return user, str(password)
+
+
+def _mssql_find_sqlcmd():
+    for candidate in (shutil.which("sqlcmd"),
+                      "/opt/mssql-tools18/bin/sqlcmd", "/opt/mssql-tools/bin/sqlcmd",
+                      "/usr/local/bin/sqlcmd"):
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _mssql_find_powershell():
+    found = shutil.which("powershell")
+    if found:
+        return found
+    root = os.environ.get("SystemRoot", r"C:\Windows")
+    candidate = os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    return candidate if os.path.isfile(candidate) else None
+
+
+def _mssql_run(config, sql, timeout=120):
+    """Run T-SQL on the configured server. Returns the rows of every result
+    set as lists of strings; raises with SQL Server's own message on error."""
+    server = _mssql_server_arg(config)
+    user, password = _mssql_credentials(config)
+    trust = _truthy(config.get("trust_cert", True))
+    env = os.environ.copy()
+
+    if IS_WINDOWS:
+        ps = _mssql_find_powershell()
+        if not ps:
+            raise Exception("Windows PowerShell was not found; it is needed to talk to SQL Server")
+        env.update({"BBS_MSSQL_SERVER": server, "BBS_MSSQL_USER": user, "BBS_MSSQL_PASS": password,
+                    "BBS_MSSQL_TRUST": "1" if trust else "0", "BBS_MSSQL_SQL": sql})
+        encoded = base64.b64encode(_MSSQL_PS_SCRIPT.encode("utf-16-le")).decode("ascii")
+        cmd = [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded]
+    else:
+        sqlcmd = _mssql_find_sqlcmd()
+        if not sqlcmd:
+            raise Exception("sqlcmd was not found. Install mssql-tools18 (or go-sqlcmd) on this client.")
+        env["SQLCMDPASSWORD"] = password
+        cmd = [sqlcmd, "-S", server, "-U", user, "-d", "master", "-l", "15",
+               "-b", "-r0", "-h", "-1", "-W", "-s", "\t", "-w", "65535"]
+        if trust:
+            cmd.append("-C")
+        cmd += ["-Q", "SET NOCOUNT ON; " + sql]
+
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=timeout)
+    out = r.stdout.decode("utf-8-sig", errors="replace")
+    err = r.stderr.decode("utf-8-sig", errors="replace").strip()
+    if r.returncode != 0:
+        # sqlcmd prints some failures (login, timeouts) on stdout
+        raise Exception((err or out.strip() or "sqlcmd exited with {}".format(r.returncode))[:2000])
+    rows = []
+    for line in out.splitlines():
+        if not line.strip() or re.match(r"^\(\d+ rows? affected\)$", line.strip()):
+            continue
+        rows.append(line.rstrip("\r").split("\t"))
+    return rows
+
+
+def _mssql_list_databases(config):
+    """Online, accessible, non-snapshot databases other than tempdb."""
+    rows = _mssql_run(config,
+        "SELECT name FROM sys.databases WHERE database_id <> 2 AND state = 0 "
+        "AND source_database_id IS NULL AND HAS_DBACCESS(name) = 1 ORDER BY name", timeout=60)
+    return [r[0] for r in rows if r and r[0]]
+
+
+def _mssql_resolve_databases(config):
+    """The databases this config backs up: '*' or a list, minus exclusions.
+    A named database that is not online is an error, not a silent skip."""
+    available = _mssql_list_databases(config)
+    wanted = config.get("databases", "*")
+    exclude = config.get("exclude_databases", ["tempdb"])
+    if isinstance(exclude, str):
+        exclude = [x.strip() for x in exclude.split(",") if x.strip()]
+    exclude_l = {x.lower() for x in exclude} | {"tempdb"}
+    if isinstance(wanted, str) and wanted.strip() == "*":
+        names = [d for d in available if d.lower() not in exclude_l]
+    else:
+        if isinstance(wanted, str):
+            wanted = [d.strip() for d in wanted.split(",") if d.strip()]
+        by_lower = {d.lower(): d for d in available}
+        names = []
+        for d in wanted:
+            canonical = by_lower.get(str(d).lower())
+            if canonical is None:
+                raise Exception("Database {!r} was not found, is not online, or the login cannot access it".format(d))
+            if canonical.lower() not in exclude_l and canonical not in names:
+                names.append(canonical)
+    # A name the agent cannot handle safely (control characters) is skipped and
+    # reported; it must not cost every other database its backup.
+    safe, skipped = [], []
+    for n in names:
+        try:
+            safe.append(_mssql_checked_db_name(n))
+        except Exception as e:
+            skipped.append(str(e))
+    if not safe:
+        raise Exception("No databases to back up (found on server: {}){}".format(
+            ", ".join(available) or "none", "; " + "; ".join(skipped) if skipped else ""))
+    return safe, skipped
+
+
+# Folders on a Windows machine that are never a dump directory. The agent
+# creates files here and, for a folder it creates itself, replaces its
+# permissions, so system and application folders are refused outright
+# (the Linux path does the same through _checked_dump_dir).
+_MSSQL_WIN_DENIED_TREES = ("windows", "program files", "program files (x86)", "inetpub",
+                           "system volume information", "$recycle.bin", "boot", "recovery")
+_MSSQL_WIN_DENIED_EXACT = ("programdata", "users", "documents and settings", "perflogs")
+
+
+def _mssql_check_windows_dir(path):
+    if not re.match(r"^[A-Za-z]:[\\/]", path):
+        raise Exception("Dump directory must be an absolute folder path such as C:\\ProgramData\\BBS\\mssql: {!r}".format(path))
+    _drive, rest = ntpath.splitdrive(ntpath.normpath(path))
+    parts = [c.lower() for c in rest.split("\\") if c]
+    if (not parts or parts[0] in _MSSQL_WIN_DENIED_TREES
+            or (len(parts) == 1 and parts[0] in _MSSQL_WIN_DENIED_EXACT)):
+        raise Exception("Dump directory {} is a system folder; use a dedicated folder such as "
+                        "C:\\ProgramData\\BBS\\mssql".format(path))
+    return path
+
+
+def _mssql_check_dump_dir(path):
+    path = str(path or "")
+    if IS_WINDOWS:
+        return _mssql_check_windows_dir(path)
+    return _checked_dump_dir(path)
+
+
+def _mssql_prepare_dump_dir(config, dump_dir):
+    """Create the dump directory and let the SQL Server service write to it.
+
+    Permissions are only ever set on a folder this call creates. A folder
+    that already exists belongs to the administrator and is left exactly as
+    it is, so pointing the setting at an existing folder cannot change its
+    ACL; the SQL Server service account must be able to write there.
+    Best effort: when access is missing BACKUP fails with SQL Server's own
+    'operating system error 5', which _mssql_backup_error explains."""
+    if os.path.isdir(dump_dir):
+        return
+    os.makedirs(dump_dir, exist_ok=True)
+    try:
+        if IS_WINDOWS:
+            rows = _mssql_run(config,
+                "SELECT service_account FROM sys.dm_server_services WHERE servicename LIKE 'SQL Server (%'", timeout=30)
+            account = rows[0][0].strip() if rows and rows[0] else ""
+            if not account:
+                return
+            if account.lower() == "localsystem":
+                account = "NT AUTHORITY\\SYSTEM"
+            # Dumps hold the databases' contents: only SYSTEM, Administrators
+            # and the SQL Server service account may read this folder.
+            subprocess.run(["icacls", dump_dir, "/inheritance:r",
+                            "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F",
+                            "/grant", "{}:(OI)(CI)M".format(account)],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        elif hasattr(os, "geteuid") and os.geteuid() == 0:
+            import pwd
+            try:
+                pw = pwd.getpwnam("mssql")
+            except KeyError:
+                return
+            os.chown(dump_dir, pw.pw_uid, pw.pw_gid)
+            os.chmod(dump_dir, 0o750)
+    except Exception as e:
+        logger.warning("SQL Server plugin: could not set permissions on {}: {}".format(dump_dir, e))
+
+
+def _mssql_backup_error(name, err):
+    msg = "BACKUP DATABASE failed for {}: {}".format(name, err)
+    if "operating system error 5" in err.lower() or "access is denied" in err.lower() or "permission denied" in err.lower():
+        msg += (" The SQL Server service account needs write access to the dump directory"
+                " (grant it yourself if the folder already existed; the agent must run on the SQL Server machine).")
+    return msg
+
+
+def _mssql_backup_sql(database, path, compress):
+    return ("BACKUP DATABASE {} TO DISK = {} WITH COPY_ONLY, INIT, FORMAT, CHECKSUM{}"
+            .format(_mssql_quote_name(database), _mssql_quote_str(path), ", COMPRESSION" if compress else ""))
+
+
+def execute_plugin_mssql_dump(config):
+    """Back up SQL Server databases (native COPY_ONLY .bak) before the borg run."""
+    dump_dir = _mssql_check_dump_dir(config.get("dump_dir", r"C:\ProgramData\BBS\mssql"))
+    compress = _truthy(config.get("compress", False))
+    databases, skipped = _mssql_resolve_databases(config)
+    _mssql_prepare_dump_dir(config, dump_dir)
+
+    dump_files, done, failed = [], list(), list(skipped)
+    for db in databases:
+        path = os.path.join(dump_dir, _mssql_dump_filename(db))
+        logger.info("Backing up SQL Server database {} to {}".format(db, path))
+        try:
+            _mssql_run(config, _mssql_backup_sql(db, path, compress), timeout=6 * 3600)
+        except Exception as e:
+            # One bad database must not cost the others their backup.
+            message = _mssql_backup_error(db, str(e))
+            logger.error(message)
+            failed.append(message)
+            continue
+        dump_files.append(path)
+        done.append(db)
+
+    if not done:
+        raise Exception("; ".join(failed))
+    logger.info("SQL Server backup complete: {} database(s) in {}".format(len(done), dump_dir))
+    result = {
+        "dump_files": dump_files,
+        "dump_dir": dump_dir,
+        "databases": done,
+        "per_database": True,
+        "compress": compress,
+    }
+    if failed:
+        result["partial_error"] = "{} of {} database(s) failed: {}".format(
+            len(failed), len(databases) + len(skipped), "; ".join(failed))
+    return result
+
+
+def cleanup_plugin_mssql_dump(config, plugin_result):
+    """Delete the .bak files this run wrote, when cleanup_after is on."""
+    if not _truthy(config.get("cleanup_after", True)):
+        return
+    for path in plugin_result.get("dump_files", []) or []:
+        try:
+            if os.path.isfile(path) and path.lower().endswith(".bak"):
+                os.remove(path)
+        except OSError as e:
+            logger.warning("Could not remove {}: {}".format(path, e))
+
+
+def test_plugin_mssql_dump(config):
+    """Test the connection and list databases, without backing anything up."""
+    _mssql_credentials(config)
+    rows = _mssql_run(config,
+        "SELECT CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion')), "
+        "CONVERT(nvarchar(128), SERVERPROPERTY('Edition')), IS_SRVROLEMEMBER('sysadmin')", timeout=30)
+    version, edition, sysadmin = (rows[0] + ["", "", ""])[:3] if rows else ("?", "?", "0")
+    dbs = _mssql_list_databases(config)
+    shown = ", ".join(dbs[:30]) + (" ..." if len(dbs) > 30 else "")
+    message = ("Connection successful. SQL Server {} ({}){}. Found {} database(s): {}"
+               .format(version, edition, ", login is sysadmin" if sysadmin == "1" else "", len(dbs), shown))
+    # The structured list feeds the "Detect databases" picker in the UI
+    return message, {"databases": dbs}
+
+
 
 
 def execute_plugin_interworx(config):
@@ -2025,9 +3612,25 @@ def execute_plugin_interworx(config):
 
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=7200)
     if r.returncode != 0:
-        stderr = r.stderr.decode("utf-8", errors="replace")
-        stdout = r.stdout.decode("utf-8", errors="replace")
-        raise Exception("InterWorx backup failed (exit {}): {}".format(r.returncode, (stderr or stdout)[:2000]))
+        stderr = r.stderr.decode("utf-8", errors="replace").strip()
+        stdout = r.stdout.decode("utf-8", errors="replace").strip()
+        # backup.pex logs verbose per-domain progress; when one sub-backup
+        # fails it logs the error mid-stream, keeps going, and exits
+        # non-zero at the end — so neither the head nor the tail alone is
+        # guaranteed to contain the failure (#19614). Pull out lines that
+        # look like errors from the FULL output, then append the tail for
+        # context.
+        combined = (stderr + "\n" + stdout).strip()
+        err_re = re.compile(r"error|fail|fatal|unable|cannot|can't|denied|no space|quota|timed? ?out|skip", re.IGNORECASE)
+        err_lines = [ln for ln in combined.splitlines() if ln.strip() and err_re.search(ln)]
+        parts = []
+        if err_lines:
+            parts.append("error lines:\n" + "\n".join(err_lines[:30]))
+        tail_src = stderr or stdout
+        if tail_src:
+            parts.append("output tail:\n…" + tail_src[-1200:] if len(tail_src) > 1200 else "output tail:\n" + tail_src)
+        detail = "\n".join(parts) or "(no output)"
+        raise Exception("InterWorx backup failed (exit {}): {}".format(r.returncode, detail))
 
     # Count backup files created
     backup_files = []
@@ -2084,6 +3687,29 @@ def test_plugin_interworx(config):
             raise Exception("Cannot create output directory {}: {}".format(output_dir, e))
 
     return "InterWorx backup tool found at {}. Output directory {} is ready.".format(backup_pex, output_dir)
+
+
+def _apply_priority(config, job_id, task, command):
+    """Prefix borg with nice/ionice for a plan's priority (#403): low is
+    nice 10 with the best-effort I/O class at its lowest level, idle is
+    nice 19 with the idle I/O class. Windows has neither; macOS has nice
+    only."""
+    priority = (task or {}).get("priority") or "normal"
+    if priority not in ("low", "idle") or IS_WINDOWS or not command:
+        return command
+    prefix = []
+    nice = shutil.which("nice")
+    if nice:
+        prefix += [nice, "-n", "19" if priority == "idle" else "10"]
+    ionice = None if IS_MACOS else shutil.which("ionice")
+    if ionice:
+        prefix += [ionice, "-c", "3"] if priority == "idle" else [ionice, "-c", "2", "-n", "7"]
+    if prefix:
+        what = "nice {}".format("19" if priority == "idle" else "10")
+        if ionice:
+            what += ", {} I/O class".format("idle" if priority == "idle" else "best-effort")
+        log_to_server(config, job_id, "Running at {} priority ({})".format(priority, what))
+    return prefix + list(command)
 
 
 def _popen_new_group_kwargs():
@@ -2156,6 +3782,76 @@ def _parse_script_command(value):
     if not argv:
         return [], ""
     return argv, argv[0]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# What a shell hook may run. The hook field names a script the operator put
+# on this client, with optional arguments. It never went through a shell,
+# but nothing stopped the first word from being /bin/sh, python3 or rm,
+# which turned the field into "run anything as root" for whoever controls
+# the server. The rules below run on the client, where the server cannot
+# change them: the program must be an absolute path to a regular file that
+# is not in a system binary directory and is not an interpreter, shell or
+# destructive utility by name, wherever it lives. A client can go further
+# with hooks_dir in config.ini, which confines hooks to one directory.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_HOOK_SYSTEM_DIRS = (
+    "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib32", "/usr/lib64",
+    "/usr/libexec", "/lib", "/lib32", "/lib64", "/snap", "/usr/share", "/etc/alternatives",
+    "/System", "/usr/libexec", "/opt/homebrew/bin", "/opt/homebrew/sbin", "/opt/local/bin",
+)
+
+_HOOK_DENIED_NAMES = frozenset("""
+    sh bash dash zsh ksh mksh csh tcsh fish ash busybox env sudo su doas runuser
+    python python2 python3 pypy pypy3 perl ruby php node nodejs deno bun lua luajit tclsh
+    awk gawk mawk nawk sed xargs find rm rmdir shred dd mkfs wipefs fdisk sfdisk parted
+    chmod chown chgrp mv cp ln unlink truncate install nice ionice nohup timeout setsid
+    chroot unshare nsenter systemctl service init shutdown reboot halt poweroff telinit
+    kill killall pkill curl wget nc ncat netcat socat ssh scp sftp rsync borg docker podman
+    kubectl at crontab eval exec command xdg-open open osascript launchctl
+    cmd powershell pwsh wscript cscript mshta rundll32 regsvr32 certutil bitsadmin msiexec
+""".split())
+
+
+_AGENT_CONFIG = {}
+
+
+def _hook_command_refusal(exe):
+    """Why `exe`, the program a hook names, may not run; None when it may."""
+    if not exe:
+        return "no program named"
+    if not os.path.isabs(exe):
+        return "the program must be an absolute path"
+    try:
+        real = os.path.realpath(exe)
+    except Exception:
+        real = exe
+    base = os.path.basename(real).lower()
+    stem = base
+    for suffix in (".exe", ".bat", ".cmd", ".ps1", ".com"):
+        if stem.endswith(suffix):
+            stem = stem[:-len(suffix)]
+    # python3.12, php8.4, perl5.36 name the same interpreters.
+    stem = re.sub(r"[0-9][0-9.]*$", "", stem)
+    if stem in _HOOK_DENIED_NAMES or base in _HOOK_DENIED_NAMES:
+        return "{} is a shell, interpreter or system utility; hooks must name a script of your own".format(base)
+    if IS_WINDOWS:
+        sysroot = (os.environ.get("SystemRoot") or "C:\\Windows").rstrip("\\").lower()
+        if real.lower().startswith(sysroot + "\\"):
+            return "programs under {} cannot be used as hooks".format(sysroot)
+    else:
+        for d in _HOOK_SYSTEM_DIRS:
+            if real == d or real.startswith(d + "/"):
+                return "programs under {} cannot be used as hooks; put your script elsewhere (for example /usr/local/bin or /etc/bbs-agent/hooks)".format(d)
+    hooks_dir = _AGENT_CONFIG.get("hooks_dir")
+    if hooks_dir:
+        root = os.path.realpath(hooks_dir).rstrip(os.sep) + os.sep
+        if not real.startswith(root):
+            return "this client only runs hooks from {} (hooks_dir in config.ini)".format(hooks_dir)
+    if os.path.isdir(real):
+        return "{} is a directory".format(exe)
+    return None
 
 
 def _diagnose_script_path(exe_path):
@@ -2365,6 +4061,14 @@ def execute_plugin_shell_hook(config, task=None):
 
     pre_argv, pre_exe = _parse_script_command(pre_script)
 
+    refusal = _hook_command_refusal(pre_exe)
+    if refusal:
+        msg = "Pre-script refused: {}".format(refusal)
+        if abort_on_failure:
+            raise Exception(msg)
+        logger.warning(msg)
+        return result
+
     problem = _diagnose_script_path(pre_exe)
     if problem:
         msg = "Pre-script cannot run: {}\n{}".format(pre_exe, problem)
@@ -2414,15 +4118,30 @@ def execute_plugin_shell_hook(config, task=None):
     return result
 
 
-def cleanup_plugin_shell_hook(config, plugin_result, task=None, backup_result=None):
-    """Run post-backup shell script hook."""
+def cleanup_plugin_shell_hook(config, plugin_result, task=None, backup_result=None, forced=False):
+    """Run post-backup shell script hook.
+
+    When the config asks for it to run after all repository jobs, this is not
+    the moment: prune and offsite sync happen on the server after the client
+    finishes sending data. The server sends the script back as its own job once
+    that work is done, and that job calls in here with forced=True.
+    """
     post_script = config.get("post_script", "").strip()
     timeout = int(config.get("timeout", 300))
 
     if not post_script:
         return None
 
+    if not forced and config.get("post_script_timing", "backup") == "repo_jobs":
+        logger.info("Shell hook: post-script deferred until repository jobs finish")
+        return "post-script deferred until prune and offsite sync finish"
+
     post_argv, post_exe = _parse_script_command(post_script)
+
+    refusal = _hook_command_refusal(post_exe)
+    if refusal:
+        logger.warning("Post-script refused: {}".format(refusal))
+        return "Post-script refused: {}".format(refusal)
 
     problem = _diagnose_script_path(post_exe)
     if problem:
@@ -2476,6 +4195,9 @@ def test_plugin_shell_hook(config):
             results.append("{}: not configured (skipped)".format(label))
             continue
         argv, exe = _parse_script_command(value)
+        refusal = _hook_command_refusal(exe)
+        if refusal:
+            raise Exception("{} refused: {}".format(label, refusal))
         if not os.path.isfile(exe):
             raise Exception("{} not found: {}".format(label, exe))
         if not os.access(exe, os.X_OK):
@@ -2508,6 +4230,8 @@ def execute_restore_pg(config, task):
     command = task.get("command", [])
     if command and command[0] == "borg" and BORG_PATH:
         command[0] = BORG_PATH
+    if _refuse_unsafe_command(config, job_id, command):
+        return
     env_vars = task.get("env", {})
     cwd = task.get("cwd")
     databases = task.get("databases", [])
@@ -2535,7 +4259,7 @@ def execute_restore_pg(config, task):
             normalized_key = remote_ssh_key.replace("\r\n", "\n").replace("\r", "\n").rstrip() + "\n"
             if IS_WINDOWS:
                 _clear_stale_key_windows(remote_key_path)
-            with open(remote_key_path, "w") as kf:
+            with open(remote_key_path, "w", newline="\n") as kf:  # LF endings — CRLF keys are rejected by ssh (#347)
                 kf.write(normalized_key)
             if IS_WINDOWS:
                 _lockdown_key_windows(remote_key_path)
@@ -2719,11 +4443,18 @@ def execute_restore_pg(config, task):
 
 
 def execute_restore_mysql(config, task):
+    with _mysql_login(task.get("mysql_config", {}).get("password")) as login:
+        return _execute_restore_mysql(config, task, login)
+
+
+def _execute_restore_mysql(config, task, login):
     """Restore MySQL databases from a borg archive."""
     job_id = task.get("job_id")
     command = task.get("command", [])
     if command and command[0] == "borg" and BORG_PATH:
         command[0] = BORG_PATH
+    if _refuse_unsafe_command(config, job_id, command):
+        return
     env_vars = task.get("env", {})
     cwd = task.get("cwd")
     databases = task.get("databases", [])
@@ -2752,7 +4483,7 @@ def execute_restore_mysql(config, task):
             normalized_key = remote_ssh_key.replace("\r\n", "\n").replace("\r", "\n").rstrip() + "\n"
             if IS_WINDOWS:
                 _clear_stale_key_windows(remote_key_path)
-            with open(remote_key_path, "w") as kf:
+            with open(remote_key_path, "w", newline="\n") as kf:  # LF endings — CRLF keys are rejected by ssh (#347)
                 kf.write(normalized_key)
             if IS_WINDOWS:
                 _lockdown_key_windows(remote_key_path)
@@ -2840,8 +4571,8 @@ def execute_restore_mysql(config, task):
         })
 
         try:
-            mysql_base = ["mysql", "--host={}".format(host), "--port={}".format(port), "--user={}".format(user), "--password={}".format(password)]
-            mysqldump_base = ["mysqldump", "--host={}".format(host), "--port={}".format(port), "--user={}".format(user), "--password={}".format(password), "--single-transaction", "--quick"]
+            mysql_base = ["mysql", login, "--host={}".format(host), "--port={}".format(port), "--user={}".format(user)]
+            mysqldump_base = ["mysqldump", login, "--host={}".format(host), "--port={}".format(port), "--user={}".format(user), "--single-transaction", "--quick"]
 
             # Safety backup: dump the current database before replacing it
             if mode == "replace":
@@ -2961,6 +4692,8 @@ def execute_restore_mongo(config, task):
     command = task.get("command", [])
     if command and command[0] == "borg" and BORG_PATH:
         command[0] = BORG_PATH
+    if _refuse_unsafe_command(config, job_id, command):
+        return
     env_vars = task.get("env", {})
     cwd = task.get("cwd")
     databases = task.get("databases", [])
@@ -2982,7 +4715,7 @@ def execute_restore_mongo(config, task):
             normalized_key = remote_ssh_key.replace("\r\n", "\n").replace("\r", "\n").rstrip() + "\n"
             if IS_WINDOWS:
                 _clear_stale_key_windows(remote_key_path)
-            with open(remote_key_path, "w") as kf:
+            with open(remote_key_path, "w", newline="\n") as kf:  # LF endings — CRLF keys are rejected by ssh (#347)
                 kf.write(normalized_key)
             if IS_WINDOWS:
                 _lockdown_key_windows(remote_key_path)
@@ -3038,64 +4771,67 @@ def execute_restore_mongo(config, task):
                 pass
 
     # Step 2: Restore each database using mongorestore
-    auth_args = _mongo_auth_args(host, port, user, password, auth_db)
+    auth = _MongoAuth(host, port, user, password, auth_db)
     imported = []
     errors = []
     total = len(databases)
-    for i, db_entry in enumerate(databases):
-        db_name = db_entry.get("database")
-        mode = db_entry.get("mode", "replace")
-        target_db = db_entry.get("target_name", "{}_copy".format(db_name)) if mode == "rename" else db_name
+    try:
+        for i, db_entry in enumerate(databases):
+            db_name = db_entry.get("database")
+            mode = db_entry.get("mode", "replace")
+            target_db = db_entry.get("target_name", "{}_copy".format(db_name)) if mode == "rename" else db_name
 
-        # mongodump creates dump_dir/db_name/ directory
-        db_dump_path = os.path.join(dump_dir, db_name)
-        if not os.path.isdir(db_dump_path):
-            errors.append("{}: dump directory not found at {}".format(db_name, db_dump_path))
-            continue
-
-        logger.info("Job #{}: Restoring {} as {} ({}/{})".format(job_id, db_name, target_db, i + 1, total))
-
-        # Report progress
-        api_request(config, "/api/agent/progress", method="POST", data={
-            "job_id": job_id,
-            "files_processed": i,
-            "files_total": total,
-            "output_log": "Restoring {} as {}...".format(db_name, target_db),
-        })
-
-        try:
-            # Safety backup: dump the current database before replacing it
-            if mode == "replace":
-                safety_path = os.path.join(dump_dir, "{}_pre_restore".format(target_db))
-                logger.info("Job #{}: Creating safety backup of {} to {}".format(job_id, target_db, safety_path))
-                try:
-                    safety_cmd = ["mongodump"] + auth_args + ["--db={}".format(target_db), "--out={}".format(dump_dir + "/_pre_restore")]
-                    if compress:
-                        safety_cmd.append("--gzip")
-                    r_safety = subprocess.run(safety_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3600)
-                    if r_safety.returncode != 0:
-                        logger.warning("Job #{}: Safety backup of {} failed (continuing anyway): {}".format(
-                            job_id, target_db, r_safety.stderr.decode("utf-8", errors="replace")[:200]))
-                    else:
-                        logger.info("Job #{}: Safety backup saved to {}/_pre_restore/{}".format(job_id, dump_dir, target_db))
-                except Exception as e:
-                    logger.warning("Job #{}: Safety backup of {} failed (continuing anyway): {}".format(job_id, target_db, e))
-
-            cmd = ["mongorestore"] + auth_args + ["--db={}".format(target_db), "--drop"]
-            if compress:
-                cmd.append("--gzip")
-            cmd.append(db_dump_path)
-
-            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3600)
-            if r.returncode != 0:
-                stderr = r.stderr.decode('utf-8', errors='replace')[:500]
-                errors.append("{}: restore failed: {}".format(db_name, stderr))
+            # mongodump creates dump_dir/db_name/ directory
+            db_dump_path = os.path.join(dump_dir, db_name)
+            if not os.path.isdir(db_dump_path):
+                errors.append("{}: dump directory not found at {}".format(db_name, db_dump_path))
                 continue
 
-            imported.append("{} -> {}".format(db_name, target_db))
+            logger.info("Job #{}: Restoring {} as {} ({}/{})".format(job_id, db_name, target_db, i + 1, total))
 
-        except Exception as e:
-            errors.append("{}: {}".format(db_name, e))
+            # Report progress
+            api_request(config, "/api/agent/progress", method="POST", data={
+                "job_id": job_id,
+                "files_processed": i,
+                "files_total": total,
+                "output_log": "Restoring {} as {}...".format(db_name, target_db),
+            })
+
+            try:
+                # Safety backup: dump the current database before replacing it
+                if mode == "replace":
+                    safety_path = os.path.join(dump_dir, "{}_pre_restore".format(target_db))
+                    logger.info("Job #{}: Creating safety backup of {} to {}".format(job_id, target_db, safety_path))
+                    try:
+                        safety_cmd = ["mongodump"] + auth.args("mongodump") + ["--db={}".format(target_db), "--out={}".format(dump_dir + "/_pre_restore")]
+                        if compress:
+                            safety_cmd.append("--gzip")
+                        r_safety = subprocess.run(safety_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3600)
+                        if r_safety.returncode != 0:
+                            logger.warning("Job #{}: Safety backup of {} failed (continuing anyway): {}".format(
+                                job_id, target_db, r_safety.stderr.decode("utf-8", errors="replace")[:200]))
+                        else:
+                            logger.info("Job #{}: Safety backup saved to {}/_pre_restore/{}".format(job_id, dump_dir, target_db))
+                    except Exception as e:
+                        logger.warning("Job #{}: Safety backup of {} failed (continuing anyway): {}".format(job_id, target_db, e))
+
+                cmd = ["mongorestore"] + auth.args("mongorestore") + ["--db={}".format(target_db), "--drop"]
+                if compress:
+                    cmd.append("--gzip")
+                cmd.append(db_dump_path)
+
+                r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3600)
+                if r.returncode != 0:
+                    stderr = r.stderr.decode('utf-8', errors='replace')[:500]
+                    errors.append("{}: restore failed: {}".format(db_name, stderr))
+                    continue
+
+                imported.append("{} -> {}".format(db_name, target_db))
+
+            except Exception as e:
+                errors.append("{}: {}".format(db_name, e))
+    finally:
+        auth.close()
 
     # Report final status
     if errors and not imported:
@@ -3116,6 +4852,257 @@ def execute_restore_mongo(config, task):
     if imported:
         status_data["output_log"] = "Imported: {}".format(', '.join(imported))
 
+    report_status(config, status_data)
+
+
+def _mssql_default_dirs(config):
+    """(data directory, log directory) for databases restored under a new name."""
+    rows = _mssql_run(config,
+        "SELECT CONVERT(nvarchar(4000), SERVERPROPERTY('InstanceDefaultDataPath')), "
+        "CONVERT(nvarchar(4000), SERVERPROPERTY('InstanceDefaultLogPath')), "
+        "(SELECT physical_name FROM sys.master_files WHERE database_id = 1 AND file_id = 1), "
+        "(SELECT physical_name FROM sys.master_files WHERE database_id = 1 AND file_id = 2)", timeout=30)
+    cols = (rows[0] + ["", "", "", ""])[:4] if rows else ["", "", "", ""]
+
+    def parent(p):
+        mod = ntpath if "\\" in p else posixpath
+        return mod.dirname(p)
+    data = cols[0] or (parent(cols[2]) if cols[2] else "")
+    log = cols[1] or (parent(cols[3]) if cols[3] else "") or data
+    if not data:
+        raise Exception("Could not determine SQL Server's default data directory")
+    return data, log
+
+
+def _mssql_join(directory, name):
+    mod = ntpath if "\\" in directory else posixpath
+    return mod.join(directory, name)
+
+
+def _mssql_prune_safety_backups(safety_dir, keep_days, keep_file):
+    """Delete safety backups older than keep_days (0 keeps them all). Only
+    files named like the ones this agent writes are ever touched."""
+    try:
+        days = int(keep_days)
+    except (TypeError, ValueError):
+        days = 7
+    if days <= 0:
+        return
+    cutoff = time.time() - days * 86400
+    try:
+        for name in os.listdir(safety_dir):
+            path = os.path.join(safety_dir, name)
+            if (path != keep_file and re.search(r"_\d{8}_\d{6}\.bak$", name)
+                    and os.path.isfile(path) and os.path.getmtime(path) < cutoff):
+                try:
+                    os.remove(path)
+                    logger.info("Removed old SQL Server safety backup {}".format(path))
+                except OSError as e:
+                    logger.warning("Could not remove {}: {}".format(path, e))
+    except OSError:
+        pass
+
+
+def _mssql_restore_one(mssql, dump_dir, db_name, mode, target, safety_dir, job_id):
+    """Restore one database from its extracted .bak. Returns a one-line summary."""
+    bak = os.path.join(dump_dir, _mssql_dump_filename(db_name))
+    if not os.path.isfile(bak):
+        raise Exception("backup file not found at {}".format(bak))
+    if mode == "replace" and target.lower() in _MSSQL_SYSTEM_DBS:
+        raise Exception("system database {} cannot be replaced from here; restore it manually "
+                        "(or restore it under a new name)".format(target))
+
+    q_target = _mssql_quote_name(target)
+    # CASE, not a bare DB_ID: for a missing database DB_ID is NULL, which the
+    # PowerShell client prints as an empty line (no row at all after parsing)
+    rows = _mssql_run(mssql, "SELECT CASE WHEN DB_ID({}) IS NULL THEN 0 ELSE 1 END".format(_mssql_quote_str(target)), timeout=30)
+    exists = bool(rows) and rows[0][0].strip() == "1"
+
+    if mode == "rename" and exists:
+        raise Exception("a database named {} already exists on the server; pick another name".format(target))
+
+    # Safety copy of what is about to be overwritten, outside the dump
+    # directory so the next backup does not archive it.
+    note = ""
+    if exists and mode == "replace" and _truthy(mssql.get("safety_backup", True)):
+        # This copy is the only way back, so when it cannot be made the
+        # database is left alone (turn the option off to replace anyway).
+        try:
+            _mssql_check_dump_dir(safety_dir)
+            _mssql_prepare_dump_dir(mssql, safety_dir)
+            safety = os.path.join(safety_dir, "{}_{}.bak".format(
+                _mssql_dump_filename(target)[:-4], time.strftime("%Y%m%d_%H%M%S")))
+            _mssql_run(mssql, _mssql_backup_sql(target, safety, _truthy(mssql.get("compress"))), timeout=6 * 3600)
+        except Exception as e:
+            raise Exception("the safety backup of {} failed, so it was not replaced: {} "
+                            "(switch off 'Safety backup before Replace' in the plugin configuration "
+                            "to restore without it)".format(target, e))
+        note = " (previous version saved to {})".format(safety)
+        _mssql_prune_safety_backups(safety_dir, mssql.get("safety_keep_days", 7), safety)
+
+    move = ""
+    if mode == "rename" or not exists:
+        files = _mssql_run(mssql, "RESTORE FILELISTONLY FROM DISK = {}".format(_mssql_quote_str(bak)), timeout=300)
+        data_dir, log_dir = _mssql_default_dirs(mssql)
+        clauses = []
+        for row in files:
+            logical, physical, ftype = row[0], row[1], (row[2] if len(row) > 2 else "D")
+            base = ntpath.basename(physical) if "\\" in physical else posixpath.basename(physical)
+            if mode == "rename":
+                stem, ext = os.path.splitext(base)
+                base = "{}_{}{}".format(target, re.sub(r"[^A-Za-z0-9_]", "_", logical), ext)
+            clauses.append("MOVE {} TO {}".format(_mssql_quote_str(logical),
+                           _mssql_quote_str(_mssql_join(log_dir if ftype == "L" else data_dir, base))))
+        move = ", " + ", ".join(clauses)
+
+    single_user = exists and mode == "replace"
+    try:
+        sql = "RESTORE DATABASE {} FROM DISK = {} WITH {}RECOVERY{}".format(
+            q_target, _mssql_quote_str(bak), "REPLACE, " if exists else "", move)
+        if single_user:
+            # One batch on one connection: as separate calls another client
+            # (an app pool, SQL Agent) could take the single-user slot in
+            # between and the RESTORE would fail with "database in use".
+            # XACT_ABORT stops the batch if the ALTER fails.
+            sql = "SET XACT_ABORT ON; ALTER DATABASE {} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; {}".format(q_target, sql)
+        _mssql_run(mssql, sql, timeout=6 * 3600)
+    finally:
+        if single_user:
+            try:
+                _mssql_run(mssql, "ALTER DATABASE {} SET MULTI_USER".format(q_target), timeout=300)
+            except Exception as e:
+                logger.error("Job #{}: could not set {} back to MULTI_USER: {}".format(job_id, target, e))
+    return "{} -> {}{}".format(db_name, target, note)
+
+
+def _mssql_restore_borg_env(env_vars):
+    """Environment for the borg extract of a SQL Server restore: what
+    execute_task builds for a file restore. On Windows the server's BORG_RSH
+    names Unix paths (/tmp/bbs-remote-ssh-key, /etc/bbs-agent/ssh_key) and
+    the system ssh; without translating them ssh cannot find its key and
+    the connection is closed."""
+    env = os.environ.copy()
+    env.update(env_vars)
+    if IS_WINDOWS and "BORG_RSH" in env:
+        env["BORG_RSH"] = _translate_borg_rsh_windows(env["BORG_RSH"])
+    if IS_DROPBEAR and "BORG_RSH" in env:
+        env["BORG_RSH"] = _rewrite_borg_rsh_for_dropbear(env["BORG_RSH"])
+    elif "BORG_RSH" in env:
+        env["BORG_RSH"] = env["BORG_RSH"].replace("LogLevel=ERROR", "LogLevel=INFO")
+    env["BORG_RELOCATED_REPO_ACCESS_IS_OK"] = "yes"
+    env["BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK"] = "yes"
+    if not IS_WINDOWS and ("LC_ALL" not in env or not env["LC_ALL"].endswith("UTF-8")):
+        env["LC_ALL"] = "C.UTF-8"
+        env["LANG"] = "C.UTF-8"
+    return env
+
+
+def execute_restore_mssql(config, task):
+    """Restore SQL Server databases from a borg archive."""
+    job_id = task.get("job_id")
+    command = task.get("command", [])
+    if command and command[0] == "borg" and BORG_PATH:
+        command[0] = BORG_PATH
+    if _refuse_unsafe_command(config, job_id, command):
+        return
+    env_vars = task.get("env", {})
+    cwd = task.get("cwd")
+    databases = task.get("databases", [])
+    mssql = task.get("mssql_config", {})
+    dump_dir = mssql.get("dump_dir", r"C:\ProgramData\BBS\mssql")
+
+    try:
+        _mssql_credentials(mssql)
+        dump_dir = _mssql_check_dump_dir(dump_dir)
+    except Exception as e:
+        report_status(config, {"job_id": job_id, "result": "failed", "error_log": str(e)})
+        return
+
+    remote_ssh_key = task.get("remote_ssh_key")
+    remote_key_path = REMOTE_KEY_PATH
+    if remote_ssh_key:
+        try:
+            normalized_key = remote_ssh_key.replace("\r\n", "\n").replace("\r", "\n").rstrip() + "\n"
+            if IS_WINDOWS:
+                _clear_stale_key_windows(remote_key_path)
+            with open(remote_key_path, "w", newline="\n") as kf:
+                kf.write(normalized_key)
+            if IS_WINDOWS:
+                _lockdown_key_windows(remote_key_path)
+            else:
+                os.chmod(remote_key_path, 0o600)
+        except Exception as e:
+            report_status(config, {"job_id": job_id, "result": "failed",
+                                   "error_log": "Failed to write remote SSH key: {}".format(e)})
+            return
+
+    # Created (and locked down) here, before borg can create it with
+    # default permissions; an existing folder is left as it is.
+    try:
+        _mssql_prepare_dump_dir(mssql, dump_dir)
+    except Exception as e:
+        logger.warning("Job #{}: could not prepare {}: {}".format(job_id, dump_dir, e))
+
+    api_request(config, "/api/agent/progress", method="POST", data={
+        "job_id": job_id, "output_log": "Extracting database backups from archive...",
+    })
+
+    # Step 1: extract the .bak files back to the dump directory
+    logger.info("Job #{}: Extracting SQL Server backups from archive".format(job_id))
+    if cwd:
+        os.makedirs(cwd, exist_ok=True)
+    env = _mssql_restore_borg_env(env_vars)
+    try:
+        proc = subprocess.run(command, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=6 * 3600)
+        if proc.returncode > 1:
+            report_status(config, {"job_id": job_id, "result": "failed",
+                                   "error_log": "borg extract failed: {}".format(proc.stderr.decode("utf-8", errors="replace")[:5000])})
+            return
+    except Exception as e:
+        report_status(config, {"job_id": job_id, "result": "failed", "error_log": "borg extract error: {}".format(e)})
+        return
+    finally:
+        if remote_ssh_key and os.path.exists(remote_key_path):
+            try:
+                os.unlink(remote_key_path)
+            except Exception:
+                pass
+
+    # Step 2: RESTORE DATABASE for each selected database
+    safety_dir = os.path.normpath(dump_dir).rstrip("\\/") + "_pre_restore"
+    imported, errors = [], []
+    total = len(databases)
+    for i, entry in enumerate(databases):
+        db_name = entry.get("database")
+        mode = entry.get("mode", "replace")
+        target = entry.get("target_name") or "{}_copy".format(db_name) if mode == "rename" else db_name
+        api_request(config, "/api/agent/progress", method="POST", data={
+            "job_id": job_id, "files_processed": i, "files_total": total,
+            "output_log": "Restoring {} as {}...".format(db_name, target),
+        })
+        try:
+            imported.append(_mssql_restore_one(mssql, dump_dir, _mssql_checked_db_name(db_name),
+                                               mode, _mssql_checked_db_name(target), safety_dir, job_id))
+        except Exception as e:
+            errors.append("{}: {}".format(db_name, e))
+
+    # The extracted copies are not needed any more
+    if _truthy(mssql.get("cleanup_after", True)):
+        for entry in databases:
+            try:
+                os.remove(os.path.join(dump_dir, _mssql_dump_filename(entry.get("database", ""))))
+            except OSError:
+                pass
+
+    if errors and not imported:
+        result, error_log = "failed", "; ".join(errors)
+    else:
+        result, error_log = "completed", "; ".join(errors) if errors else None
+    status_data = {"job_id": job_id, "result": result, "files_total": total, "files_processed": len(imported)}
+    if error_log:
+        status_data["error_log"] = error_log[:10000]
+    if imported:
+        status_data["output_log"] = "Restored: {}".format(", ".join(imported))
     report_status(config, status_data)
 
 
@@ -3177,6 +5164,427 @@ def _allow_sleep(state):
             pass
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Filesystem snapshots for backups
+#
+# With a plan's "Back up from a snapshot" option on, the agent takes a
+# snapshot of every volume that holds one of the plan's directories, mounts
+# the snapshots under a private tree that mirrors the live layout, and runs
+# borg from inside that tree with the directories made relative. Borg stores
+# paths without the leading slash, so "home/alice" backed up from the tree is
+# stored exactly as a live backup of /home/alice would be: the catalog, the
+# file browser and restores need no special handling. Volumes that cannot be
+# snapshotted (no LVM free space, ext4 on a plain partition) are bind-mounted
+# into the tree read-only so the backup is still complete; the job log says
+# which volumes were live.
+#
+# Supported: LVM logical volumes (needs free space in the volume group),
+# btrfs subvolumes, ZFS datasets. Linux only.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SNAPSHOT_PSEUDO_FS = frozenset([
+    "proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "cgroup", "cgroup2", "pstore",
+    "securityfs", "debugfs", "tracefs", "configfs", "fusectl", "mqueue", "hugetlbfs",
+    "bpf", "autofs", "binfmt_misc", "efivarfs", "rpc_pipefs", "nsfs", "squashfs",
+    "ramfs", "overlay", "fuse.gvfsd-fuse", "fuse.portal", "fuse.lxcfs",
+])
+
+
+def _snapshot_tool(name):
+    for d in ("/usr/sbin", "/sbin", "/usr/bin", "/bin", "/usr/local/sbin", "/usr/local/bin"):
+        p = os.path.join(d, name)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def _run_quiet(argv, timeout=60):
+    """Run a command; return (rc, stdout, stderr) as text."""
+    try:
+        p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, "", str(e)
+
+
+def _read_mounts():
+    """Real filesystems from /proc/self/mountinfo: [{mount, source, fstype}],
+    longest mount point first so a path's owner is the first match."""
+    mounts = []
+    try:
+        with open("/proc/self/mountinfo") as f:
+            for line in f:
+                parts = line.split()
+                if "-" not in parts:
+                    continue
+                sep = parts.index("-")
+                mount = parts[4].replace("\\040", " ")
+                fstype = parts[sep + 1]
+                source = parts[sep + 2].replace("\\040", " ")
+                if fstype in _SNAPSHOT_PSEUDO_FS or fstype.startswith("fuse.") and fstype != "fuse.zfs":
+                    continue
+                mounts.append({"mount": mount, "source": source, "fstype": fstype})
+    except OSError:
+        return []
+    # One entry per mount point: the last one in mountinfo is the visible one.
+    seen = {}
+    for m in mounts:
+        seen[m["mount"]] = m
+    return sorted(seen.values(), key=lambda m: -len(m["mount"]))
+
+
+def _lvm_info(source):
+    """(vg, lv, lv_size_bytes, vg_free_bytes) for a device that is a logical
+    volume, else None."""
+    lvs = _snapshot_tool("lvs")
+    if not lvs or not source.startswith("/dev/"):
+        return None
+    rc, out, _ = _run_quiet([lvs, "--noheadings", "--nosuffix", "--units", "b",
+                             "-o", "vg_name,lv_name,lv_size,vg_free", source], timeout=30)
+    if rc != 0:
+        return None
+    fields = out.split()
+    if len(fields) != 4:
+        return None
+    try:
+        return fields[0], fields[1], int(float(fields[2])), int(float(fields[3]))
+    except ValueError:
+        return None
+
+
+def _snapshot_method(mount):
+    """How a mount could be snapshotted: ('lvm'|'btrfs'|'zfs', detail) or
+    (None, reason)."""
+    fstype = mount["fstype"]
+    if fstype == "btrfs":
+        return ("btrfs", None) if _snapshot_tool("btrfs") else (None, "btrfs tools not installed")
+    if fstype == "zfs":
+        return ("zfs", None) if _snapshot_tool("zfs") else (None, "zfs tools not installed")
+    info = _lvm_info(mount["source"])
+    if info:
+        vg, lv, lv_size, vg_free = info
+        if vg_free < 64 * 1024 * 1024:
+            return (None, "LVM volume group {} has no free space for a snapshot".format(vg))
+        return ("lvm", info)
+    return (None, "{} on {} is not a snapshot-capable volume".format(fstype, mount["source"]))
+
+
+def get_snapshot_support():
+    """What this host can snapshot, for the server's plan editor. Windows and
+    macOS report not capable; Linux lists each real volume with its method."""
+    if IS_WINDOWS or IS_MACOS or not hasattr(os, "geteuid"):
+        return {"capable": False, "methods": [], "volumes": [], "reason": "snapshots need Linux with LVM, btrfs or ZFS"}
+    volumes = []
+    methods = set()
+    for m in _read_mounts():
+        if m["mount"].startswith(("/run", "/dev", "/sys", "/proc", "/snap/")) or m["mount"] == "/boot/efi":
+            continue
+        method, detail = _snapshot_method(m)
+        entry = {"mount": m["mount"], "fstype": m["fstype"], "method": method}
+        if method == "lvm":
+            entry["vg_free"] = detail[3]
+        elif method is None:
+            entry["reason"] = detail
+        if method:
+            methods.add(method)
+        volumes.append(entry)
+    volumes.sort(key=lambda v: v["mount"])
+    reason = None
+    if not methods:
+        reasons = [v.get("reason") for v in volumes if v.get("reason")]
+        reason = reasons[0] if reasons else "no snapshot-capable volumes found"
+    if os.geteuid() != 0:
+        methods = set()
+        reason = "the agent must run as root to take snapshots"
+    return {"capable": bool(methods), "methods": sorted(methods), "volumes": volumes, "reason": reason}
+
+
+class SnapshotSession(object):
+    """Snapshots and mounts for one backup job. prepare() builds the tree and
+    returns the rewritten borg argv and the cwd to run it from; cleanup()
+    always follows, from a finally block."""
+
+    def __init__(self, config, job_id, plan_id=None):
+        self.config = config
+        self.job_id = job_id
+        # The tree lives at a per-plan path, not a per-job one. Borg's files
+        # cache keys every entry on its absolute path, so a root that changed
+        # with the job ID made every run miss the cache and re-read, re-chunk
+        # every file: incremental backups took as long as full ones (#557).
+        # Runs of one plan never overlap, so the path is free between them.
+        key = "plan-{}".format(int(plan_id)) if plan_id else str(job_id)
+        self.root = "/run/bbs-agent/snap-{}".format(key)
+        self.tree = os.path.join(self.root, "tree")
+        self.mounted = []      # mount points inside the tree, in mount order
+        self.snapshots = []    # (method, identifier) to remove
+        self.live = []         # mounts that were bind-mounted live
+        self.notes = []
+
+    def _log(self, message, level="info"):
+        self.notes.append(message)
+        logger.info("Job #{} snapshot: {}".format(self.job_id, message))
+        log_to_server(self.config, self.job_id, message, level)
+
+    def _sh(self, argv, what, timeout=120):
+        rc, out, err = _run_quiet(argv, timeout=timeout)
+        if rc != 0:
+            raise RuntimeError("{} failed: {}".format(what, (err or out).strip()[:300]))
+        return out
+
+    def prepare(self, command, directories):
+        """Snapshot the volumes behind `directories`, mount them under the
+        tree, and return (command, cwd) with the paths made relative."""
+        if not hasattr(os, "geteuid") or os.geteuid() != 0:
+            raise RuntimeError("snapshots need the agent to run as root")
+        dirs = [d for d in (directories or "").splitlines() if d.strip()]
+        dirs = [os.path.normpath(d.strip()) for d in dirs]
+        if not dirs:
+            raise RuntimeError("no directories to snapshot")
+        mounts = _read_mounts()
+        if not mounts:
+            raise RuntimeError("could not read the mount table")
+
+        def owner(path):
+            for m in mounts:
+                mp = m["mount"]
+                if path == mp or path.startswith(mp.rstrip("/") + "/"):
+                    return m
+            return None
+
+        # Volumes to bring into the tree: the one each directory lives on,
+        # plus any real mount below a directory, so the backup covers what a
+        # live run of the same directories would. With --one-file-system in
+        # the plan's options, borg would NOT cross into those sub-mounts, so
+        # neither do we — otherwise a CIFS or vfat mount nested under /home
+        # got pulled in against the user's wishes (#498).
+        one_fs = "--one-file-system" in command
+        wanted = {}
+        for d in dirs:
+            if not os.path.isdir(d):
+                raise RuntimeError("directory does not exist: {}".format(d))
+            m = owner(d)
+            if m is None:
+                raise RuntimeError("no mount found for {}".format(d))
+            wanted[m["mount"]] = m
+            if one_fs:
+                continue
+            for sub in mounts:
+                if sub["mount"] != d and sub["mount"].startswith(d.rstrip("/") + "/"):
+                    wanted[sub["mount"]] = sub
+        order = sorted(wanted.values(), key=lambda m: len(m["mount"]))
+
+        # A run that died mid-backup can leave its mounts under the same
+        # path; take them down before building the tree again.
+        if os.path.isdir(self.root):
+            self._log("removing a leftover snapshot tree at {}".format(self.root), "warning")
+            _teardown_snapshot_root(self.root)
+        os.makedirs(self.tree, exist_ok=True)
+        n = 0
+        for m in order:
+            n += 1
+            target = os.path.join(self.tree, m["mount"].lstrip("/")) if m["mount"] != "/" else self.tree
+            os.makedirs(target, exist_ok=True)
+            method, detail = _snapshot_method(m)
+            name = "bbs-snap-{}-{}".format(self.job_id, n)
+            if method == "lvm":
+                vg, lv, lv_size, vg_free = detail
+                size = max(512 * 1024 * 1024, lv_size // 10)
+                size = min(size, vg_free)
+                # lvcreate wants whole 512-byte sectors (#498).
+                size -= size % 512
+                self._sh([_snapshot_tool("lvcreate"), "-s", "-n", name, "-L", "{}b".format(size),
+                          "{}/{}".format(vg, lv)], "lvcreate for {}".format(m["mount"]))
+                self.snapshots.append(("lvm", "{}/{}".format(vg, name)))
+                opts = "ro,nouuid" if m["fstype"] == "xfs" else "ro"
+                self._sh([_snapshot_tool("mount") or "mount", "-o", opts,
+                          "/dev/{}/{}".format(vg, name), target], "mount of LVM snapshot for {}".format(m["mount"]))
+                self.mounted.append(target)
+                self._log("LVM snapshot {} of {} ({} for copy-on-write), mounted read-only".format(
+                    name, m["mount"], _human_bytes(size)))
+            elif method == "btrfs":
+                snap = os.path.join(m["mount"], ".{}".format(name))
+                self._sh([_snapshot_tool("btrfs"), "subvolume", "snapshot", "-r", m["mount"], snap],
+                         "btrfs snapshot of {}".format(m["mount"]))
+                self.snapshots.append(("btrfs", snap))
+                self._bind(snap, target, m["mount"])
+                self._log("btrfs snapshot of {} taken, mounted read-only".format(m["mount"]))
+            elif method == "zfs":
+                snapname = "{}@{}".format(m["source"], name)
+                self._sh([_snapshot_tool("zfs"), "snapshot", snapname], "zfs snapshot of {}".format(m["mount"]))
+                self.snapshots.append(("zfs", snapname))
+                snapdir = os.path.join(m["mount"], ".zfs", "snapshot", name)
+                if not os.path.isdir(snapdir):
+                    raise RuntimeError("zfs snapshot directory {} is not visible; is snapdir=visible?".format(snapdir))
+                self._bind(snapdir, target, m["mount"])
+                self._log("ZFS snapshot {} taken, mounted read-only".format(snapname))
+            else:
+                self._bind(m["mount"], target, m["mount"])
+                self.live.append(m["mount"])
+                self._log("{} backed up live: {}".format(m["mount"], detail), "warning")
+
+        # Rewrite the borg argv: paths after "--" become relative to the tree.
+        # An older server sends no "--"; then everything after the archive
+        # operand is a path.
+        new_cmd = list(command)
+        try:
+            start = new_cmd.index("--") + 1
+        except ValueError:
+            start = next((i + 1 for i, t in enumerate(new_cmd) if "::" in t), len(new_cmd))
+        for i in range(start, len(new_cmd)):
+            rel = new_cmd[i].lstrip("/")
+            new_cmd[i] = rel if rel else "."
+        return new_cmd, self.tree
+
+    def _bind(self, source, target, label):
+        mount = _snapshot_tool("mount") or "mount"
+        self._sh([mount, "--bind", source, target], "bind mount of {}".format(label))
+        self.mounted.append(target)
+        # A bind mount inherits the source's read/write state; make it read-only.
+        rc, _, err = _run_quiet([mount, "-o", "remount,bind,ro", target])
+        if rc != 0:
+            logger.warning("Could not make {} read-only: {}".format(target, err.strip()[:200]))
+
+    def cleanup(self):
+        """Unmount and remove everything, in reverse. Never raises."""
+        umount = _snapshot_tool("umount") or "umount"
+        for target in reversed(self.mounted):
+            rc, _, err = _run_quiet([umount, target])
+            if rc != 0:
+                _run_quiet([umount, "-l", target])
+        for method, ident in reversed(self.snapshots):
+            if method == "lvm":
+                rc, _, err = _run_quiet([_snapshot_tool("lvremove"), "-f", ident])
+            elif method == "btrfs":
+                rc, _, err = _run_quiet([_snapshot_tool("btrfs"), "subvolume", "delete", ident])
+            else:
+                rc, _, err = _run_quiet([_snapshot_tool("zfs"), "destroy", ident])
+            if rc != 0:
+                self._log("could not remove snapshot {}: {}".format(ident, err.strip()[:200]), "warning")
+        if self.snapshots or self.mounted:
+            self._log("snapshots removed")
+        try:
+            if os.path.isdir(self.root):
+                shutil.rmtree(self.root, ignore_errors=True)
+        except Exception:
+            pass
+        self.mounted, self.snapshots = [], []
+
+
+def _human_bytes(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return "{:.0f} {}".format(n, unit) if unit == "B" else "{:.1f} {}".format(n, unit)
+        n /= 1024.0
+
+
+def _teardown_snapshot_root(root):
+    """Unmount everything under one snapshot tree, deepest first, and remove
+    the directory. Used for trees a crashed run left behind."""
+    umount = _snapshot_tool("umount") or "umount"
+    targets = []
+    for m in _read_mounts():
+        if m["mount"].startswith(root + "/"):
+            targets.append(m["mount"])
+    for t in sorted(targets, key=len, reverse=True):
+        _run_quiet([umount, "-l", t])
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def cleanup_stale_snapshots():
+    """Remove anything a crashed job left behind: mounts under our snapshot
+    root, LVM snapshots named bbs-snap-*, btrfs and ZFS snapshots with the
+    same prefix. Runs once at agent start."""
+    if IS_WINDOWS or IS_MACOS or not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return
+    base = "/run/bbs-agent"
+    try:
+        stale = [d for d in os.listdir(base) if d.startswith("snap-")] if os.path.isdir(base) else []
+    except OSError:
+        stale = []
+    for d in stale:
+        root = os.path.join(base, d)
+        _teardown_snapshot_root(root)
+        logger.warning("Removed stale snapshot tree {}".format(root))
+    lvs, lvremove = _snapshot_tool("lvs"), _snapshot_tool("lvremove")
+    if lvs and lvremove:
+        rc, out, _ = _run_quiet([lvs, "--noheadings", "-o", "vg_name,lv_name"])
+        if rc == 0:
+            for line in out.splitlines():
+                f = line.split()
+                if len(f) == 2 and f[1].startswith("bbs-snap-"):
+                    _run_quiet([lvremove, "-f", "{}/{}".format(f[0], f[1])])
+                    logger.warning("Removed stale LVM snapshot {}/{}".format(f[0], f[1]))
+    zfs = _snapshot_tool("zfs")
+    if zfs:
+        rc, out, _ = _run_quiet([zfs, "list", "-H", "-t", "snapshot", "-o", "name"])
+        if rc == 0:
+            for name in out.split():
+                if "@bbs-snap-" in name:
+                    _run_quiet([zfs, "destroy", name])
+                    logger.warning("Removed stale ZFS snapshot {}".format(name))
+    btrfs = _snapshot_tool("btrfs")
+    if btrfs:
+        for m in _read_mounts():
+            if m["fstype"] != "btrfs":
+                continue
+            try:
+                for entry in os.listdir(m["mount"]):
+                    if entry.startswith(".bbs-snap-"):
+                        _run_quiet([btrfs, "subvolume", "delete", os.path.join(m["mount"], entry)])
+                        logger.warning("Removed stale btrfs snapshot {}".format(os.path.join(m["mount"], entry)))
+            except OSError:
+                pass
+
+
+# borg options that make it run a program: --content-from-command and
+# --paths-from-command turn the PATH arguments into a command line, and
+# --rsh names the program used to reach a remote repository. The server never
+# sends these for a plan (it allowlists advanced options and puts "--" before
+# the paths), so their presence means a tampered payload or an outdated
+# server. Refused here regardless, because this process usually runs as root
+# (GHSA-w6m3-j4cx-8m67).
+_FORBIDDEN_BORG_OPTIONS = ("--content-from-command", "--paths-from-command",
+                           "--paths-from-stdin", "--rsh")
+
+
+# A repository URL's user and host go on borg's ssh command line with no
+# "--" in front, so one starting with "-" would be read as an ssh option
+# (-oProxyCommand=...). Same rules the server applies when a host is saved.
+_SSH_URL_RE = re.compile(r"^ssh://(?:([^@/]*)@)?(\[[^\]]*\]|[^/:]*)")
+_SSH_USER_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._-]*$")
+_SSH_HOST_RE = re.compile(r"^[A-Za-z0-9._:\[\]][A-Za-z0-9._:\[\]-]*$")
+
+
+def _unsafe_borg_command(command):
+    """Return why a task's borg argv must not run, or None if it may."""
+    if not command:
+        return None
+    for tok in command[1:]:
+        if not isinstance(tok, str):
+            return "argv contains a non-string argument"
+        if tok == "--":
+            break  # everything after is a path by definition
+        name = tok.split("=", 1)[0]
+        if name in _FORBIDDEN_BORG_OPTIONS:
+            return "refusing to run borg with {}: it would execute a command on this host".format(name)
+        if tok.startswith("ssh://"):
+            m = _SSH_URL_RE.match(tok)
+            user, host = (m.group(1), m.group(2)) if m else (None, "")
+            if not _SSH_HOST_RE.match(host or "") or (user is not None and not _SSH_USER_RE.match(user)):
+                return "refusing to run borg: the repository URL has an invalid SSH user or host"
+    return None
+
+
+def _refuse_unsafe_command(config, job_id, command):
+    """Report and return True when the command must not run."""
+    reason = _unsafe_borg_command(command)
+    if reason is None:
+        return False
+    logger.error("Job #{}: {}".format(job_id, reason))
+    report_status(config, {"job_id": job_id, "result": "failed", "error_log": reason})
+    return True
+
+
 def execute_task(config, task):
     """Execute a borg task and report progress/status."""
     job_id = task.get("job_id")
@@ -3192,6 +5600,8 @@ def execute_task(config, task):
     # it may not be in PATH on systems using SCL or non-standard installs)
     if command and command[0] == "borg" and BORG_PATH:
         command[0] = BORG_PATH
+    if _refuse_unsafe_command(config, job_id, command):
+        return
 
     logger.info("Executing {} job #{}: {}".format(task_type, job_id, ' '.join(command)))
 
@@ -3361,6 +5771,79 @@ def _build_list_dir_tree(task):
     return _walk(path.rstrip("/") or "/", depth)
 
 
+def _upload_dry_run_list(list_file, path, job_id):
+    """Send a dry run's full file list to the server over the same SSH
+    channel the catalog uses (#414); the server keeps it for a day. Returns
+    True when it arrived. Never fails the job: the summary still stands."""
+    try:
+        list_file.close()
+    except Exception:
+        pass
+    try:
+        ssh_info = load_ssh_info()
+        if not (ssh_info and ssh_info.get("ssh_unix_user") and ssh_info.get("server_host")):
+            logger.info("SSH info not available, dry run list not uploaded")
+            return False
+        with open(path, "rb") as fh:
+            r = subprocess.run(
+                [SSH_CMD, "-i", SSH_KEY_PATH, "-p", str(ssh_info.get("ssh_port", 22))]
+                + _ssh_common_opts()
+                + ["{}@{}".format(ssh_info["ssh_unix_user"], ssh_info["server_host"]),
+                   "dryrun-write {}".format(int(job_id))],
+                stdin=fh, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800)
+        if r.returncode != 0:
+            logger.warning("Dry run list upload failed: {}".format(
+                r.stderr.decode("utf-8", errors="replace").strip()[:300]))
+            return False
+        return True
+    except Exception as e:
+        logger.warning("Dry run list upload failed: {}".format(e))
+        return False
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _read_catalog_ssh_errors(errfile):
+    """Read what ssh wrote to its stderr file, if anything."""
+    if not errfile:
+        return ""
+    try:
+        errfile.flush()
+        with open(errfile.name, "r", errors="replace") as fh:
+            return fh.read().strip()[-2000:]
+    except (OSError, IOError):
+        return ""
+
+
+def _read_borg_stdout(handle):
+    """Read back what borg wrote to its stdout file, then leave it for cleanup."""
+    if handle is None:
+        return ""
+    try:
+        handle.flush()
+        with open(handle.name, "rb") as fh:
+            return fh.read().decode("utf-8", errors="replace")
+    except (OSError, IOError) as e:
+        logger.warning("Could not read borg stdout file: {}".format(e))
+        return ""
+
+
+def _cleanup_borg_stdout(handle):
+    if handle is None:
+        return
+    try:
+        handle.close()
+    except Exception:
+        pass
+    try:
+        os.unlink(handle.name)
+    except (OSError, IOError):
+        pass
+
+
 def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
                         archive_name, directories, plugins, cwd):
     """Inner task execution logic, wrapped by execute_task for sleep inhibition."""
@@ -3392,9 +5875,13 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
         if test_func:
             try:
                 result_msg = test_func(cfg)
-                report_status(config, {
-                    "job_id": job_id, "result": "completed", "output_log": result_msg,
-                })
+                status = {"job_id": job_id, "result": "completed"}
+                if isinstance(result_msg, tuple):
+                    # (message, structured data) - e.g. the databases found
+                    result_msg, structured = result_msg
+                    status["task_result"] = json.dumps(structured)
+                status["output_log"] = result_msg
+                report_status(config, status)
             except Exception as e:
                 report_status(config, {
                     "job_id": job_id, "result": "failed", "error_log": str(e),
@@ -3403,6 +5890,29 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
             report_status(config, {
                 "job_id": job_id, "result": "failed",
                 "error_log": "No test handler for plugin: {}".format(slug),
+            })
+        return
+
+    if task_type == "plugin_post":
+        # The deferred half of a shell hook: everything the repository needed
+        # is done, so the post-script can finally run (#402).
+        plugin_data = task.get("plugin", {})
+        cfg = plugin_data.get("config", {})
+        if plugin_data.get("slug") != "shell_hook":
+            report_status(config, {
+                "job_id": job_id, "result": "failed",
+                "error_log": "plugin_post is only supported for shell hooks",
+            })
+            return
+        try:
+            result_msg = cleanup_plugin_shell_hook(cfg, {}, task=task, backup_result="completed", forced=True)
+            report_status(config, {
+                "job_id": job_id, "result": "completed",
+                "output_log": result_msg or "No post-script configured",
+            })
+        except Exception as e:
+            report_status(config, {
+                "job_id": job_id, "result": "failed", "error_log": str(e),
             })
         return
 
@@ -3421,19 +5931,39 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
         execute_restore_mongo(config, task)
         return
 
+    # Handle SQL Server database restore
+    if task_type == "restore_mssql":
+        execute_restore_mssql(config, task)
+        return
+
     # Report running immediately so the UI shows activity
     api_request(config, "/api/agent/progress", method="POST", data={
         "job_id": job_id,
         "status_message": "Starting task...",
     })
 
+    # Database dumps streamed into the archive instead of written to disk
+    # first, when the plan asks for it and this run can (see DumpStreams).
+    streams = None
+    if task_type == "backup" and plugins and task.get("stream_db_dumps"):
+        if IS_WINDOWS:
+            log_to_server(config, job_id, "Streaming database dumps is not available on Windows; dumping to disk")
+        elif task.get("snapshot"):
+            log_to_server(config, job_id, "Streaming database dumps does not work with snapshots; dumping to disk")
+        else:
+            streams = DumpStreams(config, job_id)
+
     # Execute pre-backup plugins
-    plugin_results = {}
+    plugin_runs = []
     if task_type == "backup" and plugins:
         try:
             logger.info("Running {} pre-backup plugin(s)".format(len(plugins)))
-            plugin_results = execute_plugins(plugins, config, job_id, task=task)
+            plugin_runs = execute_plugins(plugins, config, job_id, task=task, streams=streams)
         except Exception as e:
+            # Only reached when a plugin config has abort_on_failure set —
+            # otherwise execute_plugins() records the failure and continues.
+            if streams is not None:
+                streams.finish()
             logger.error("Pre-backup plugin failed: {}".format(e))
             report_status(config, {
                 "job_id": job_id,
@@ -3442,16 +5972,39 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
             })
             return
 
-    # Pre-count files for progress
+    # Plugins that failed without aborting: the backup goes ahead, but the job
+    # is flagged so it doesn't read as a clean success.
+    plugin_failures = [r for r in plugin_runs if r.get("error")]
+    # A plugin that finished but not completely (some databases failed)
+    # reports it in its result; the run stays usable, the job is flagged.
+    plugin_failures += [dict(r, error=r["result"]["partial_error"]) for r in plugin_runs
+                        if not r.get("error") and isinstance(r.get("result"), dict) and r["result"].get("partial_error")]
+
+    # Work out a denominator for the progress bar.
+    #
+    # The server sends what the last backup of this plan actually stored, which
+    # is both free and correct. Walking the tree is the fallback for a plan's
+    # first run only: the walk cannot see the plan's exclude patterns, so on a
+    # plan that excludes a large tree it counts files borg will never touch and
+    # the progress bar reads a fraction of a percent all the way through (#407).
     files_total = 0
+    precount_estimated = False
     if task_type == "backup" and directories:
-        api_request(config, "/api/agent/progress", method="POST", data={
-            "job_id": job_id,
-            "status_message": "Counting files...",
-        })
-        one_fs = "--one-file-system" in command
-        files_total = count_files(directories, one_file_system=one_fs)
-        logger.info("Pre-counted {} files to backup".format(files_total))
+        expected = int(task.get("expected_files") or 0)
+        if expected > 0:
+            files_total = expected
+            logger.info("Progress target {} files (what the last backup stored)".format(files_total))
+        elif task.get("precount_files", True):
+            api_request(config, "/api/agent/progress", method="POST", data={
+                "job_id": job_id,
+                "status_message": "Counting files...",
+            })
+            one_fs = "--one-file-system" in command
+            files_total = count_files(directories, one_file_system=one_fs)
+            precount_estimated = True
+            logger.info("Pre-counted {} files (estimate — excludes are not applied to this walk)".format(files_total))
+        else:
+            logger.info("File pre-count disabled; progress will show a count without a total")
 
     # Report initial progress with file count
     api_request(config, "/api/agent/progress", method="POST", data={
@@ -3466,22 +6019,8 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
     env.update(env_vars)
 
     # On Windows, translate Unix SSH paths in BORG_RSH to local paths
-    # Use forward slashes - Windows SSH accepts them and backslashes get
-    # stripped as escape characters when passed through subprocess/shell
     if IS_WINDOWS and "BORG_RSH" in env:
-        # Note: "/dev/null" in UserKnownHostsFile is intentionally NOT rewritten
-        # to "NUL". The bundled MinGit/MSYS2 ssh maps "/dev/null" to the real
-        # null device but would create a literal, undeletable reserved-name file
-        # named NUL for "NUL" (#300).
-        env["BORG_RSH"] = env["BORG_RSH"].replace(
-            "/etc/bbs-agent/ssh_key", SSH_KEY_PATH.replace("\\", "/")
-        ).replace(
-            "/tmp/bbs-remote-ssh-key", REMOTE_KEY_PATH.replace("\\", "/")
-        )
-        # Replace bare "ssh" command with our bundled ssh.exe to avoid the
-        # Windows built-in OpenSSH stdin forwarding bug that hangs borg.
-        if SSH_CMD != "ssh" and env["BORG_RSH"].startswith("ssh "):
-            env["BORG_RSH"] = '"' + SSH_CMD + '"' + env["BORG_RSH"][3:]
+        env["BORG_RSH"] = _translate_borg_rsh_windows(env["BORG_RSH"])
 
     # Server-built BORG_RSH carries OpenSSH-only `-o` options. Dropbear logs
     # "Ignoring unknown configuration option" warnings for each one (#247).
@@ -3489,6 +6028,12 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
     # skips hostkey verification.
     if IS_DROPBEAR and "BORG_RSH" in env:
         env["BORG_RSH"] = _rewrite_borg_rsh_for_dropbear(env["BORG_RSH"])
+    elif "BORG_RSH" in env:
+        # The server sends LogLevel=ERROR, which hides ssh's own reason for
+        # dropping a connection ("Timeout, server ... not responding" is
+        # INFO). Raise it here, where the routine notices it also lets
+        # through are filtered out below; older agents keep ERROR (#521).
+        env["BORG_RSH"] = env["BORG_RSH"].replace("LogLevel=ERROR", "LogLevel=INFO")
 
     # Always allow relocated repos - common after S3 restore or copying repositories
     # This prevents "repository was previously located at X" interactive prompts
@@ -3518,12 +6063,47 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
     last_progress_time = time.time()
     catalog_count = 0
     catalog_ssh = None  # SSH subprocess for streaming catalog to server
+    borg_stdout_file = None  # borg's stdout, a file rather than a pipe (see below)
+    catalog_ssh_errfile = None  # its stderr, a file rather than a pipe (see below)
     catalog_pipe_failed = False
+
+    # Dry-run tallies (#257): counts + capped path samples returned as the
+    # job's task_result so the UI can show what would be backed up
+    dry_included = 0
+    dry_excluded = 0
+    dry_included_sample = []
+    dry_excluded_sample = []
+    # The full list goes to a local file and is uploaded to the server when
+    # borg is done (#414); the samples above stay for the job page.
+    dry_bytes = 0
+    dry_list_file = None
+    dry_list_path = None
+    if task_type == "backup_dry_run":
+        # mkstemp + open(fd): NamedTemporaryFile only takes errors= from
+        # Python 3.8, and agents run on interpreters back to 3.4.
+        try:
+            fd, dry_list_path = tempfile.mkstemp(prefix="bbs-dryrun-", suffix=".txt")
+            dry_list_file = open(fd, "w", encoding="utf-8", errors="replace")
+        except Exception as e:
+            logger.warning("Could not create dry run list file: {}".format(e))
+            dry_list_file = None
 
     if task_type == "backup":
         ssh_info = load_ssh_info()
         if ssh_info and ssh_info.get("ssh_unix_user") and ssh_info.get("server_host"):
             try:
+                # stdout/stderr go to a file and /dev/null rather than pipes.
+                # Nothing reads them while the backup runs, and an OS pipe
+                # only holds ~64KB: once ssh or the remote fills one, ssh
+                # stops draining its stdin, our catalog write blocks, the
+                # borg read loop below stops, borg blocks on ITS stderr, and
+                # the whole backup freezes with no output and no timeout
+                # (#380, #394 — the same shape as the prune stall in #384).
+                # A file has no such limit, and we can still read the
+                # diagnostics afterwards.
+                catalog_ssh_errfile = tempfile.NamedTemporaryFile(
+                    prefix="bbs-catalog-ssh-", suffix=".log", delete=False
+                )
                 catalog_ssh = subprocess.Popen(
                     [SSH_CMD, "-i", SSH_KEY_PATH, "-p", str(ssh_info.get("ssh_port", 22))]
                     + _ssh_common_opts()
@@ -3532,8 +6112,14 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
                         "catalog-write {}".format(job_id),
                     ],
                     stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=catalog_ssh_errfile,
+                    # Own process group, like the borg subprocess: without
+                    # this, killing a hung pipe via _kill_process_tree()
+                    # killpg'd the agent's own group — the agent SIGKILLed
+                    # itself, and a finished backup was reported abandoned
+                    # by the restarted agent (#461).
+                    **_popen_new_group_kwargs()
                 )
                 logger.info("Catalog SSH pipe opened for job {}".format(job_id))
             except Exception as e:
@@ -3543,7 +6129,7 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
             logger.info("SSH info not available, catalog streaming disabled")
 
     # For restore tasks, create and use the target directory
-    if cwd:
+    if cwd and task_type not in ("backup", "backup_dry_run"):
         os.makedirs(cwd, exist_ok=True)
 
     # Write temporary SSH key for remote SSH repos (key provided by server in task payload)
@@ -3555,7 +6141,7 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
             normalized_key = remote_ssh_key.replace("\r\n", "\n").replace("\r", "\n").rstrip() + "\n"
             if IS_WINDOWS:
                 _clear_stale_key_windows(remote_key_path)
-            with open(remote_key_path, "w") as kf:
+            with open(remote_key_path, "w", newline="\n") as kf:  # LF endings — CRLF keys are rejected by ssh (#347)
                 kf.write(normalized_key)
             if IS_WINDOWS:
                 _lockdown_key_windows(remote_key_path)
@@ -3564,20 +6150,57 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
             logger.info("Wrote temporary SSH key for remote repo")
         except Exception as e:
             logger.error("Failed to write remote SSH key: {}".format(e))
+            if streams is not None:
+                streams.finish()
             report_status(config, {
                 "job_id": job_id, "result": "failed",
                 "error_log": "Failed to write remote SSH key: {}".format(e),
             })
             return
 
+    # Snapshot-backed backup: snapshot the volumes, mount them under a private
+    # tree and run borg from there with relative paths (see SnapshotSession).
+    snapshot_session = None
+    if task_type in ("backup", "backup_dry_run") and task.get("snapshot"):
+        snapshot_session = SnapshotSession(config, job_id, task.get("backup_plan_id"))
+        try:
+            command, cwd = snapshot_session.prepare(command, directories)
+        except Exception as e:
+            snapshot_session.cleanup()
+            logger.error("Job #{}: snapshot failed: {}".format(job_id, e))
+            report_status(config, {
+                "job_id": job_id, "result": "failed",
+                "error_log": "Snapshot failed, backup not run: {}".format(e),
+            })
+            return
+        logger.info("Executing {} job #{} from snapshot tree {}: {}".format(task_type, job_id, cwd, ' '.join(command)))
+
+    if streams is not None and streams.streams:
+        command = _prepare_streaming(config, job_id, command, directories, streams)
+
     try:
+        # borg's stdout goes to a FILE, not a pipe.
+        #
+        # We read stderr to EOF in the loop below, then wait() and only then
+        # read stdout. An OS pipe holds ~64KB: once borg's final --json output
+        # exceeds that, borg blocks writing it, so it never exits, so wait()
+        # never returns and nothing ever drains the pipe. The comment that
+        # used to sit on that read — "safe, borg exited normally" — assumed
+        # the thing the deadlock prevents (#394).
+        #
+        # A file has no such limit. Diagnosed by @ArbiterGR, who traced it and
+        # confirmed the fix against the exclusion list that triggered it.
+        borg_stdout_file = tempfile.NamedTemporaryFile(
+            prefix="bbs-borg-stdout-", suffix=".json", delete=False
+        )
         popen_kwargs = {
-            "stdout": subprocess.PIPE,
+            "stdout": borg_stdout_file,
             "stderr": subprocess.PIPE,
             "env": env,
             "cwd": cwd,
         }
         popen_kwargs.update(_popen_new_group_kwargs())
+        command = _apply_priority(config, job_id, task, command)
         proc = subprocess.Popen(command, **popen_kwargs)
         global current_borg_proc
         current_borg_proc = proc
@@ -3593,6 +6216,9 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
             try:
                 entry = json.loads(line)
                 msg_type = entry.get("type", "")
+
+                if streams is not None and streams.streams and msg_type in ("file_status", "file_item"):
+                    streams.note_listed(entry.get("path", ""), entry.get("status") or "")
 
                 if msg_type == "archive_progress":
                     files_processed = entry.get("nfiles", files_processed)
@@ -3668,7 +6294,58 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
                             })
                             last_progress_time = now
 
+                elif msg_type in ("file_status", "file_item") and task_type == "backup_dry_run":
+                    # Tally what borg WOULD do: 'x' = excluded by a pattern,
+                    # 'd' = directory (not counted), anything else = a file
+                    # that would be backed up (#257)
+                    dr_status = (entry.get("status") or "-")[0].lower()
+                    dr_path = entry.get("path", "")
+                    if dr_status == "x":
+                        dry_excluded += 1
+                        if len(dry_excluded_sample) < 200:
+                            dry_excluded_sample.append(dr_path)
+                    elif dr_status != "d":
+                        dry_included += 1
+                        if len(dry_included_sample) < 200:
+                            dry_included_sample.append(dr_path)
+                        # Size on disk of what would be backed up, before
+                        # compression and deduplication. borg reads no file
+                        # contents in a dry run, so it can't report one.
+                        try:
+                            full = dr_path if os.path.isabs(dr_path) else os.path.join(cwd or os.sep, dr_path)
+                            dry_bytes += os.lstat(full).st_size
+                        except (OSError, ValueError):
+                            pass
+                    if dry_list_file is not None and dr_status != "d":
+                        try:
+                            dry_list_file.write("{} {}\n".format(
+                                "excluded" if dr_status == "x" else "included",
+                                dr_path.replace("\\", "\\\\").replace("\n", "\\n")))
+                        except Exception:
+                            # Stop writing; the partial file is removed at the end
+                            dry_list_file = None
+                    files_processed = dry_included + dry_excluded
+                    now = time.time()
+                    if now - last_progress_time >= 5:
+                        api_request(config, "/api/agent/progress", method="POST", data={
+                            "job_id": job_id,
+                            "files_processed": files_processed,
+                            "status_message": "Dry run: scanned {:,} files ({:,} excluded)...".format(
+                                dry_included + dry_excluded, dry_excluded),
+                        })
+                        last_progress_time = now
+
                 elif msg_type in ("file_status", "file_item") and task_type == "backup" and catalog_ssh:
+                    # Excluded ('x') and unreadable ('e') items are not in the
+                    # archive — skip them before doing any work. borg emits one
+                    # file_status event per EXCLUDED file too, so broad exclude
+                    # patterns (**\Cache etc.) produce millions of events; the
+                    # per-event stat + SSH write + flush below froze Windows
+                    # backups for hours and could deadlock the whole pipeline
+                    # when the catalog pipe backed up (#380).
+                    fstatus = (entry.get("status") or "U")[0].upper()
+                    if fstatus in ("X", "E"):
+                        continue
                     # Stream file entry to server via SSH pipe
                     fpath = entry.get("path", "")
                     fsize = 0
@@ -3681,12 +6358,14 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
                                 stat_path = "/" + fpath if not fpath.startswith("/") else fpath
                             st = os.stat(stat_path)
                             fsize = st.st_size
+                            if streams is not None and stat.S_ISFIFO(st.st_mode):
+                                fsize = streams.size_of(st) or fsize  # a pipe has no size of its own
                             fmtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
                         except (OSError, UnicodeEncodeError):
                             pass
                     line = json.dumps({
                         "path": fpath,
-                        "status": entry.get("status", "U")[0].upper(),
+                        "status": fstatus,
                         "size": fsize,
                         "mtime": fmtime,
                     }) + "\n"
@@ -3694,10 +6373,7 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
                         catalog_ssh.stdin.write(line.encode("utf-8"))
                         catalog_ssh.stdin.flush()
                     except (BrokenPipeError, OSError):
-                        try:
-                            broken_stderr = catalog_ssh.stderr.read().decode("utf-8", errors="replace").strip()
-                        except Exception:
-                            broken_stderr = ""
+                        broken_stderr = _read_catalog_ssh_errors(catalog_ssh_errfile)
                         logger.error("Catalog SSH pipe broken, catalog streaming stopped{}".format(
                             " — " + broken_stderr if broken_stderr else ""))
                         catalog_ssh = None
@@ -3708,8 +6384,11 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
                     log_level = entry.get("levelname", "INFO")
                     message = entry.get("message", "")
                     if log_level in ("WARNING", "ERROR", "CRITICAL"):
-                        error_output += message + "\n"
-                        logger.warning("borg: {}".format(message))
+                        if _is_ssh_routine_notice(message):
+                            logger.debug("borg: {}".format(message))
+                        else:
+                            error_output += message + "\n"
+                            logger.warning("borg: {}".format(message))
                     elif (entry.get("name") == "borg.output.list"
                           and task_type != "backup"):
                         # borg extract --list writes one INFO log_message
@@ -3739,35 +6418,28 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
         job_cancelled = (error_output == "Cancelled by user")
         if not job_cancelled:
             proc.wait(timeout=86400)  # 24h timeout
-            # Safe to read here — borg exited normally so all pipe writers are gone.
-            stdout_output = proc.stdout.read().decode("utf-8", errors="replace")
+            stdout_output = _read_borg_stdout(borg_stdout_file)
         else:
-            # After a cancel kill, never block on stdout.read(): if borg's ssh
-            # transport child somehow survived the group kill it would still
-            # hold the pipe writer end and read() would hang the agent forever
-            # (hangs were observed pre-2.24.1 leaving the agent stuck until
-            # service restart). Drain via communicate() with a hard timeout.
+            # After a cancel kill, wait briefly for the tree to go away. stdout
+            # is a file now, so reading it can never block on a surviving
+            # child holding the writer end — the hang this branch was written
+            # to avoid is no longer reachable through stdout.
             try:
-                drained_stdout, _ = proc.communicate(timeout=10)
-                if isinstance(drained_stdout, bytes):
-                    stdout_output = drained_stdout.decode("utf-8", errors="replace")
-                else:
-                    stdout_output = drained_stdout or ""
+                proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                logger.warning("Job #{}: stdout drain timed out after cancel — re-killing tree".format(job_id))
+                logger.warning("Job #{}: borg still running after cancel — re-killing tree".format(job_id))
                 _kill_process_tree(proc)
                 try:
                     proc.wait(timeout=5)
                 except Exception:
                     pass
-                # Close pipes manually so the agent loop doesn't get stuck
-                for pipe in (proc.stdout, proc.stderr, proc.stdin):
+                for pipe in (proc.stderr, proc.stdin):
                     try:
                         if pipe is not None:
                             pipe.close()
                     except Exception:
                         pass
-                stdout_output = ""
+            stdout_output = _read_borg_stdout(borg_stdout_file)
 
         # Parse borg info from stdout if available
         if stdout_output:
@@ -3796,7 +6468,12 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
                 logger.error("Job #{} failed: nothing extracted".format(job_id))
             else:
                 result = "completed"
-                if task_type == "backup":
+                if task_type == "backup_dry_run":
+                    logger.info(
+                        "Job #{} dry run completed: {} items would be backed up, {} excluded".format(
+                            job_id, dry_included, dry_excluded)
+                    )
+                elif task_type == "backup":
                     logger.info(
                         "Job #{} completed: {} files, "
                         "{} bytes original, {} bytes dedup".format(job_id, files_processed, original_size, deduplicated_size)
@@ -3815,7 +6492,7 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
             # silently skipped, #203). For restore (and any other op)
             # exit 1 means at least one file failed to extract — fail
             # the job outright.
-            if task_type == "backup":
+            if task_type in ("backup", "backup_dry_run"):
                 result = "completed"
                 # Routine borg/SSH warnings that fire on every backup of
                 # an active system aren't actionable and shouldn't trip
@@ -3911,14 +6588,24 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
     finally:
         current_borg_proc = None
 
+        if streams is not None:
+            streams.finish()
+
+        if snapshot_session is not None:
+            snapshot_session.cleanup()
+
         # Close the catalog SSH pipe
         catalog_ssh_error = ""
         if catalog_ssh:
             try:
                 catalog_ssh.stdin.close()
-                catalog_ssh.wait(timeout=30)
+                # Closing stdin tells the remote the catalog is complete; it
+                # then finishes writing and exits. Generous but BOUNDED — the
+                # backup itself is already safely stored by this point, so a
+                # catalog that won't finish must never hold the job open.
+                catalog_ssh.wait(timeout=120)
                 if catalog_ssh.returncode != 0:
-                    catalog_ssh_error = catalog_ssh.stderr.read().decode("utf-8", errors="replace").strip()
+                    catalog_ssh_error = _read_catalog_ssh_errors(catalog_ssh_errfile)
                     logger.error("Catalog SSH pipe exited with code {} — {}".format(
                         catalog_ssh.returncode, catalog_ssh_error or "no stderr"))
                     catalog_pipe_failed = True
@@ -3927,14 +6614,21 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
             except Exception as e:
                 logger.error("Error closing catalog SSH pipe: {}".format(e))
                 catalog_pipe_failed = True
+                # Kill FIRST. Reading before killing is what hung the job at
+                # the end of a backup: a still-running process never closes
+                # its stderr, so the read never returns (#394).
                 try:
-                    catalog_ssh_error = catalog_ssh.stderr.read().decode("utf-8", errors="replace").strip()
+                    _kill_process_tree(catalog_ssh)
                 except Exception:
                     pass
-                try:
-                    catalog_ssh.kill()
-                except Exception:
-                    pass
+                catalog_ssh_error = _read_catalog_ssh_errors(catalog_ssh_errfile)
+        if catalog_ssh_errfile:
+            try:
+                catalog_ssh_errfile.close()
+                os.unlink(catalog_ssh_errfile.name)
+            except (OSError, IOError):
+                pass
+        _cleanup_borg_stdout(borg_stdout_file)
 
     # Catalog pipe failure is non-critical — the backup data is safely stored.
     # Log a warning but don't override a successful backup result.
@@ -3952,8 +6646,11 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
     # meaningful since borg extract doesn't emit archive stats.
     if task_type == "backup":
         status_data = {
+            # borg's own count is what the archive holds. The pre-count was a
+            # guess for the progress bar and must not be reported as the size
+            # of the archive.
+            "files_total": files_processed if files_processed else files_total,
             "job_id": job_id,
-            "files_total": files_total if files_total else files_processed,
             "files_processed": files_processed,
             "original_size": original_size,
             "deduplicated_size": deduplicated_size,
@@ -3969,39 +6666,73 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
             "bytes_processed": bytes_processed,
         }
 
+    if task_type == "backup_dry_run":
+        full_list = False
+        if dry_list_path is not None:
+            if result == "completed" and dry_list_file is not None:
+                full_list = _upload_dry_run_list(dry_list_file, dry_list_path, job_id)
+            else:
+                try:
+                    if dry_list_file is not None:
+                        dry_list_file.close()
+                except Exception:
+                    pass
+                try:
+                    os.unlink(dry_list_path)
+                except OSError:
+                    pass
+        status_data["task_result"] = json.dumps({
+            "dry_run": True,
+            "would_backup": dry_included,
+            "would_backup_bytes": dry_bytes,
+            "excluded": dry_excluded,
+            "included_sample": dry_included_sample,
+            "excluded_sample": dry_excluded_sample,
+            "full_list": full_list,
+        })
+
     if archive_name:
         status_data["archive_name"] = archive_name
     if error_output:
         status_data["error_log"] = error_output[:10000]  # Limit size
+    if streams is not None and streams.streams and result == "completed":
+        plugin_failures = plugin_failures + streams.report(plugin_runs)
+    if plugin_failures:
+        had_warnings = True
+        summary = "; ".join(
+            "{} ({}) failed: {}".format(f.get("slug"), f.get("config_name") or "unnamed", f.get("error"))
+            for f in plugin_failures
+        )
+        note = "Backup completed, but {} plugin(s) failed: {}".format(len(plugin_failures), summary)
+        status_data["error_log"] = (note + "\n\n" + status_data.get("error_log", "")).strip()[:10000]
+
     if had_warnings:
         status_data["had_warnings"] = True
 
-    # Report backed-up databases from mysql_dump plugin
-    if result == "completed" and task_type == "backup" and plugin_results.get("mysql_dump"):
-        mysql_result = plugin_results["mysql_dump"]
-        status_data["databases_backed_up"] = {
-            "databases": mysql_result.get("databases", []),
-            "per_database": mysql_result.get("per_database", True),
-            "compress": mysql_result.get("compress", True),
-        }
-
-    # Report backed-up databases from pg_dump plugin
-    if result == "completed" and task_type == "backup" and plugin_results.get("pg_dump"):
-        pg_result = plugin_results["pg_dump"]
-        status_data["databases_backed_up"] = {
-            "databases": pg_result.get("databases", []),
-            "per_database": True,
-            "compress": pg_result.get("compress", True),
-        }
-
-    # Report backed-up databases from mongo_dump plugin
-    if result == "completed" and task_type == "backup" and plugin_results.get("mongo_dump"):
-        mongo_result = plugin_results["mongo_dump"]
-        status_data["databases_backed_up"] = {
-            "databases": mongo_result.get("databases", []),
-            "per_database": mongo_result.get("per_database", True),
-            "compress": mongo_result.get("compress", True),
-        }
+    # Report backed-up databases as one group per database-engine config that
+    # ran, so two servers (even with same-named databases) can be restored
+    # independently (#382). Format v2: {"version":2, "groups":[...]}.
+    if result == "completed" and task_type == "backup":
+        db_groups = []
+        for run in plugin_runs:
+            if run.get("slug") not in ("mysql_dump", "pg_dump", "mongo_dump", "mssql_dump"):
+                continue
+            if run.get("error"):
+                continue  # failed dump — nothing was written, don't claim a group
+            r = run.get("result", {}) or {}
+            if not r.get("databases"):
+                continue  # every streamed database failed
+            db_groups.append({
+                "config_id": run.get("config_id"),
+                "config_name": run.get("config_name"),
+                "engine": run.get("slug"),
+                "dump_dir": r.get("dump_dir", ""),
+                "databases": r.get("databases", []),
+                "per_database": r.get("per_database", True),
+                "compress": r.get("compress", True),
+            })
+        if db_groups:
+            status_data["databases_backed_up"] = {"version": 2, "groups": db_groups}
 
     # Report final status to server. For completed backups with catalog,
     # the server will detect and import the catalog file from disk.
@@ -4011,7 +6742,7 @@ def _execute_task_inner(config, task, job_id, task_type, command, env_vars,
     # Run post-backup plugin cleanup (always run shell_hook post-scripts to
     # restart services even if backup failed; other cleanup only on success)
     if task_type == "backup" and plugins:
-        cleanup_plugins(plugins, plugin_results, config, job_id, backup_result=result, task=task)
+        cleanup_plugins(plugin_runs, config, job_id, backup_result=result, task=task)
 
     # Clean up temporary SSH key for remote repos
     if remote_ssh_key and os.path.exists(remote_key_path):
@@ -4031,13 +6762,21 @@ def clear_stale_cache_locks():
     Older borg used %LOCALAPPDATA%\\borg\\Cache on Windows. Forceful kills
     (cancel, service stop, crash) leave lock.exclusive behind; borg's own
     stale-PID detection is unreliable on Windows, so the next run hits a
-    lock timeout. We check both paths plus BORG_CACHE_DIR if set.
+    lock timeout. We check both paths plus the locations borg derives from
+    BORG_CACHE_DIR, XDG_CACHE_HOME and BORG_BASE_DIR. The Docker agent sets
+    BORG_BASE_DIR, so its cache lives under /etc/bbs-agent/borg/.cache (#517).
     """
     import shutil
     candidates = []
     env_cache = os.environ.get("BORG_CACHE_DIR")
     if env_cache:
         candidates.append(env_cache)
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache:
+        candidates.append(os.path.join(xdg_cache, "borg"))
+    base_dir = os.environ.get("BORG_BASE_DIR")
+    if base_dir:
+        candidates.append(os.path.join(base_dir, ".cache", "borg"))
     candidates.append(os.path.expanduser("~/.cache/borg"))
     if IS_WINDOWS:
         local_appdata = os.environ.get("LOCALAPPDATA")
@@ -4092,7 +6831,8 @@ def heartbeat_thread(config):
                     # Handle stall check — server says these jobs have no progress
                     stalled_ids = resp.get("check_jobs", [])
                     if stalled_ids and current_job_id in stalled_ids and current_borg_proc is not None:
-                        logger.warning("Server reports job #{} stalled (no progress >10min) — killing borg".format(current_job_id))
+                        logger.warning("Server reports job #{} stalled (no progress for {} min) — killing borg".format(
+                            current_job_id, resp.get("stall_minutes", "too many")))
                         _kill_process_tree(current_borg_proc)
 
                     # Handle cancel signal relayed through heartbeat
@@ -4131,6 +6871,12 @@ def main():
         signal.signal(signal.SIGTERM, signal_handler)
 
     config = load_config()
+    global _AGENT_CONFIG
+    _AGENT_CONFIG = config
+    try:
+        cleanup_stale_snapshots()
+    except Exception as e:
+        logger.warning("Stale snapshot sweep failed: {}".format(e))
 
     # Register with server
     if not register(config):
@@ -4171,7 +6917,7 @@ def main():
 
             if time.time() - last_info_report >= info_report_interval:
                 try:
-                    api_request(config, "/api/agent/info", method="POST", data=get_system_info())
+                    api_request(config, "/api/agent/info", method="POST", data=get_system_info(config))
                 except Exception as e:
                     logger.debug("Periodic info report failed: {}".format(e))
                 last_info_report = time.time()
@@ -4233,3 +6979,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+# bbs-signature: v1 slrwxMLSHgekVGN590TKmU5KZGwByubk474U2NuQ/g9w6un7wtEnPG8lh3BVhoplTdLbmoduGBlkNSb+NJDCAQ==

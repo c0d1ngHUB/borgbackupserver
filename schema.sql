@@ -12,6 +12,7 @@ CREATE TABLE users (
     password_hash VARCHAR(255) NOT NULL,
     role ENUM('admin', 'user') NOT NULL DEFAULT 'user',
     all_clients TINYINT(1) NOT NULL DEFAULT 0,
+    can_create_clients TINYINT(1) NOT NULL DEFAULT 0,
     timezone VARCHAR(50) NOT NULL DEFAULT 'America/New_York',
     time_format VARCHAR(3) NOT NULL DEFAULT '12h',
     theme VARCHAR(10) NOT NULL DEFAULT 'dark',
@@ -58,9 +59,12 @@ CREATE TABLE password_resets (
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
--- Default admin user (password: admin)
+-- Default admin user. The hash matches no password: the installer sets the
+-- real one (the setup wizard replaces this row, Docker sets a random password).
+-- The address is on the reserved .invalid domain, so no mail is ever sent
+-- anywhere until the admin enters a real one.
 INSERT INTO users (username, email, password_hash, role) VALUES
-('admin', 'admin@borgbackupserver.com', '$2y$12$OMFE1ma3aKDFjEYAP24eTuIznogvlOD2k3Emh0Hmvdckirgu73U2m', 'admin');
+('admin', 'admin@localhost.invalid', '!', 'admin');
 
 -- --------------------------------------------------------
 -- User Permissions & Client Access
@@ -98,11 +102,13 @@ CREATE TABLE agents (
     name VARCHAR(100) NOT NULL,
     hostname VARCHAR(255) DEFAULT NULL,
     ip_address VARCHAR(45) DEFAULT NULL,
+    mac_address VARCHAR(17) DEFAULT NULL,
     api_key VARCHAR(64) DEFAULT NULL,
     api_key_hash CHAR(64) DEFAULT NULL,
     api_key_encrypted TEXT DEFAULT NULL,
     INDEX idx_api_key_hash (api_key_hash),
     os_info VARCHAR(255) DEFAULT NULL,
+    location VARCHAR(100) DEFAULT NULL,
     borg_version VARCHAR(20) DEFAULT NULL,
     borg_install_method ENUM('package','binary','pip','unknown') DEFAULT 'unknown',
     borg_source ENUM('official','server','unknown') DEFAULT 'unknown',
@@ -111,15 +117,29 @@ CREATE TABLE agents (
     platform VARCHAR(20) DEFAULT NULL,
     architecture VARCHAR(20) DEFAULT NULL,
     agent_version VARCHAR(20) DEFAULT NULL,
+    snapshot_capable TINYINT(1) DEFAULT NULL,
+    snapshot_support JSON DEFAULT NULL,
+    -- 0 when the agent manages its own updates (containers ship the agent in
+    -- the image), so the server neither offers nor queues an update for it.
+    auto_update_enabled TINYINT(1) NOT NULL DEFAULT 1,
     ssh_unix_user VARCHAR(100) DEFAULT NULL,
     ssh_public_key TEXT DEFAULT NULL,
     ssh_private_key_encrypted TEXT DEFAULT NULL,
     ssh_home_dir VARCHAR(255) DEFAULT NULL,
     server_host_override VARCHAR(255) DEFAULT NULL,
+    wol_enabled TINYINT(1) NOT NULL DEFAULT 0,
+    offline_alerts TINYINT(1) NOT NULL DEFAULT 1,
+    wol_mac VARCHAR(17) DEFAULT NULL,
+    wol_broadcast VARCHAR(45) DEFAULT NULL,
+    wol_timeout_minutes INT NOT NULL DEFAULT 5,
     ssh_port_override INT DEFAULT NULL,
+    notes TEXT DEFAULT NULL,
+    notes_updated_by INT DEFAULT NULL,
+    notes_updated_at DATETIME DEFAULT NULL,
     status ENUM('setup', 'online', 'offline', 'error') NOT NULL DEFAULT 'setup',
     last_heartbeat DATETIME DEFAULT NULL,
     user_id INT DEFAULT NULL,
+    client_profile_id INT DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
 );
@@ -132,8 +152,37 @@ CREATE TABLE storage_locations (
     id INT AUTO_INCREMENT PRIMARY KEY,
     label VARCHAR(100) NOT NULL,
     path VARCHAR(500) NOT NULL,
+    -- Stated capacity for mounts whose real size df cannot see (#415), e.g.
+    -- WebDAV. NULL means measure it, which is right for any ordinary path.
+    capacity_bytes BIGINT DEFAULT NULL,
+    -- Jobs that may touch this disk at once (#154). NULL means no limit of
+    -- its own; the global max_queue setting always caps it.
+    max_concurrent TINYINT UNSIGNED DEFAULT NULL,
     is_default TINYINT(1) NOT NULL DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+-- One BorgBase account: API token, the SSH key BBS registered there, and
+-- the plan's limits. Locations reference it via remote_ssh_configs.
+CREATE TABLE borgbase_accounts (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    username VARCHAR(255) DEFAULT NULL,
+    api_token_encrypted TEXT DEFAULT NULL,
+    can_write TINYINT(1) DEFAULT NULL,
+    ssh_private_key_encrypted TEXT DEFAULT NULL,
+    ssh_public_key TEXT DEFAULT NULL,
+    borgbase_ssh_key_id VARCHAR(32) DEFAULT NULL,
+    plan_name VARCHAR(100) DEFAULT NULL,
+    plan_max_repos INT DEFAULT NULL,
+    plan_max_size_gb INT DEFAULT NULL,
+    plan_included_gb INT DEFAULT NULL,
+    usage_bytes BIGINT DEFAULT NULL,
+    remote_repo_count INT DEFAULT NULL,
+    checked_at DATETIME DEFAULT NULL,
+    check_error VARCHAR(255) DEFAULT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
 
 CREATE TABLE remote_ssh_configs (
@@ -147,16 +196,20 @@ CREATE TABLE remote_ssh_configs (
     ssh_private_key_encrypted TEXT NOT NULL,
     borg_remote_path VARCHAR(255) DEFAULT NULL,
     append_repo_name TINYINT(1) NOT NULL DEFAULT 1,
+    max_concurrent TINYINT UNSIGNED DEFAULT NULL,
     disk_total_bytes BIGINT DEFAULT NULL,
     disk_used_bytes BIGINT DEFAULT NULL,
     disk_free_bytes BIGINT DEFAULT NULL,
     disk_checked_at DATETIME DEFAULT NULL,
+    disk_check_error VARCHAR(255) DEFAULT NULL,
     borgbase_api_key_encrypted TEXT DEFAULT NULL,
     borgbase_repo_name VARCHAR(255) DEFAULT NULL,
     borgbase_manual_quota_gb DECIMAL(12,3) DEFAULT NULL,
     borgbase_usage_source VARCHAR(20) DEFAULT NULL,
+    borgbase_account_id INT DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (borgbase_account_id) REFERENCES borgbase_accounts(id) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 CREATE TABLE repositories (
@@ -173,6 +226,12 @@ CREATE TABLE repositories (
     archive_count INT NOT NULL DEFAULT 0,
     borg_version_created VARCHAR(20) DEFAULT NULL,
     borg_version_last VARCHAR(20) DEFAULT NULL,
+    notes TEXT DEFAULT NULL,
+    notes_updated_by INT DEFAULT NULL,
+    notes_updated_at DATETIME DEFAULT NULL,
+    -- Copies restored from an offsite sync are read-only (#523)
+    read_only TINYINT(1) NOT NULL DEFAULT 0,
+    copy_detached_at DATETIME DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
     FOREIGN KEY (storage_location_id) REFERENCES storage_locations(id)
@@ -186,6 +245,9 @@ CREATE TABLE backup_plans (
     directories TEXT NOT NULL,
     excludes TEXT DEFAULT NULL,
     advanced_options TEXT DEFAULT NULL,
+    snapshot TINYINT(1) NOT NULL DEFAULT 0,
+    stream_db_dumps TINYINT(1) NOT NULL DEFAULT 0,
+    priority VARCHAR(10) NOT NULL DEFAULT 'normal',
     prune_minutes INT NOT NULL DEFAULT 0,
     prune_hours INT NOT NULL DEFAULT 0,
     prune_days INT NOT NULL DEFAULT 7,
@@ -193,6 +255,9 @@ CREATE TABLE backup_plans (
     prune_months INT NOT NULL DEFAULT 6,
     prune_years INT NOT NULL DEFAULT 0,
     enabled TINYINT(1) NOT NULL DEFAULT 1,
+    notes TEXT DEFAULT NULL,
+    notes_updated_by INT DEFAULT NULL,
+    notes_updated_at DATETIME DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
     FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE
@@ -203,14 +268,15 @@ CREATE TABLE schedules (
     backup_plan_id INT NOT NULL,
     frequency VARCHAR(30) NOT NULL DEFAULT 'daily',
     times VARCHAR(255) DEFAULT NULL,
-    day_of_week TINYINT DEFAULT NULL,
+    day_of_week VARCHAR(20) DEFAULT NULL,
     day_of_month VARCHAR(20) DEFAULT NULL,
     timezone VARCHAR(64) NOT NULL DEFAULT 'UTC',
     enabled TINYINT(1) NOT NULL DEFAULT 1,
     next_run DATETIME DEFAULT NULL,
     last_run DATETIME DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (backup_plan_id) REFERENCES backup_plans(id) ON DELETE CASCADE
+    FOREIGN KEY (backup_plan_id) REFERENCES backup_plans(id) ON DELETE CASCADE,
+    UNIQUE KEY uniq_schedule_plan (backup_plan_id)
 );
 
 -- --------------------------------------------------------
@@ -223,8 +289,10 @@ CREATE TABLE backup_jobs (
     agent_id INT NOT NULL,
     repository_id INT DEFAULT NULL,
     source_repository_id INT DEFAULT NULL,
-    task_type ENUM('backup', 'prune', 'restore', 'restore_mysql', 'restore_pg', 'restore_mongo', 'check', 'compact', 'update_borg', 'update_agent', 'plugin_test', 's3_sync', 'repo_check', 'repo_repair', 'break_lock', 's3_restore', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete', 'list_dir') NOT NULL DEFAULT 'backup',
+    task_type ENUM('backup', 'backup_dry_run', 'prune', 'restore', 'restore_mysql', 'restore_pg', 'restore_mongo', 'restore_mssql', 'check', 'compact', 'update_borg', 'update_agent', 'plugin_test', 'plugin_post', 's3_sync', 'repo_check', 'repo_repair', 'break_lock', 's3_restore', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete', 'list_dir', 'archive_lock') NOT NULL DEFAULT 'backup',
     plugin_config_id INT DEFAULT NULL,
+    -- Frozen at dispatch: what this backup actually ran with (#452)
+    directories TEXT DEFAULT NULL,
     status ENUM('queued', 'sent', 'running', 'completed', 'failed', 'cancelled') NOT NULL DEFAULT 'queued',
     files_total INT DEFAULT NULL,
     files_processed INT DEFAULT NULL,
@@ -235,6 +303,7 @@ CREATE TABLE backup_jobs (
     task_result MEDIUMTEXT DEFAULT NULL,
     had_warnings TINYINT(1) NOT NULL DEFAULT 0,
     retry_count INT NOT NULL DEFAULT 0,
+    not_before DATETIME DEFAULT NULL,
     parent_job_id INT DEFAULT NULL,
     status_message VARCHAR(255) DEFAULT NULL,
     restore_archive_id INT DEFAULT NULL,
@@ -245,6 +314,10 @@ CREATE TABLE backup_jobs (
     started_at DATETIME DEFAULT NULL,
     completed_at DATETIME DEFAULT NULL,
     last_progress_at DATETIME DEFAULT NULL,
+    -- The process running a server-side job, so a worker that died can be told
+    -- apart from one still working (#438).
+    worker_pid INT DEFAULT NULL,
+    worker_host VARCHAR(64) DEFAULT NULL,
     FOREIGN KEY (backup_plan_id) REFERENCES backup_plans(id) ON DELETE SET NULL,
     FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
 );
@@ -257,6 +330,7 @@ CREATE TABLE archives (
     file_count INT NOT NULL DEFAULT 0,
     original_size BIGINT NOT NULL DEFAULT 0,
     deduplicated_size BIGINT NOT NULL DEFAULT 0,
+    locked TINYINT(1) NOT NULL DEFAULT 0,
     databases_backed_up JSON DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
@@ -279,9 +353,12 @@ CREATE TABLE server_log (
     backup_job_id INT DEFAULT NULL,
     level ENUM('info', 'warning', 'error') NOT NULL DEFAULT 'info',
     message TEXT NOT NULL,
+    resolved_at DATETIME DEFAULT NULL,
+    resolved_by INT DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE SET NULL,
     FOREIGN KEY (backup_job_id) REFERENCES backup_jobs(id) ON DELETE SET NULL,
+    FOREIGN KEY (resolved_by) REFERENCES users(id) ON DELETE SET NULL,
     INDEX idx_level (level),
     INDEX idx_created (created_at)
 );
@@ -317,6 +394,14 @@ INSERT INTO settings (`key`, `value`) VALUES
     ('s3_secret_key', ''),
     ('s3_path_prefix', ''),
     ('s3_sync_server_backups', '0'),
+    ('s3_max_concurrent', '4'),
+    -- Monitoring endpoints: off until an operator opens them (see
+    -- migrations/124_metrics_access.sql for why the default is loopback-only).
+    ('metrics_enabled', '0'),
+    ('metrics_acl', '[{"cidr":"127.0.0.1/32","token":true,"note":"localhost"},{"cidr":"::1/128","token":true,"note":"localhost"}]'),
+    ('metrics_trusted_proxies', '[]'),
+    ('metrics_cache_seconds', '30'),
+    ('metrics_rate_per_minute', '12'),
     ('ssh_port', '22'),
     ('apprise_urls', ''),
     ('apprise_on_backup_failed', '1'),
@@ -325,7 +410,11 @@ INSERT INTO settings (`key`, `value`) VALUES
     ('apprise_on_missed_schedule', '0'),
     ('self_backup_enabled', '1'),
     ('self_backup_retention', '7'),
-    ('self_backup_catalogs', '0');
+    ('self_backup_catalogs', '0'),
+    ('job_offline_grace_minutes', '5'),
+    ('precount_files', '1'),
+    ('backup_overdue_hours', '48'),
+    ('auto_retry_backoff_minutes', '5');
 
 -- --------------------------------------------------------
 -- Notifications
@@ -341,6 +430,7 @@ CREATE TABLE notifications (
     message TEXT NOT NULL,
     occurrence_count INT NOT NULL DEFAULT 1,
     last_emailed_at DATETIME DEFAULT NULL,
+    last_pushed_at DATETIME DEFAULT NULL,
     first_occurred_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_occurred_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     read_at DATETIME DEFAULT NULL,
@@ -402,6 +492,9 @@ CREATE TABLE plugin_configs (
     plugin_id INT NOT NULL,
     name VARCHAR(100) NOT NULL,
     config JSON NOT NULL,
+    notes TEXT DEFAULT NULL,
+    notes_updated_by INT DEFAULT NULL,
+    notes_updated_at DATETIME DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
@@ -421,7 +514,7 @@ CREATE TABLE backup_plan_plugins (
     FOREIGN KEY (backup_plan_id) REFERENCES backup_plans(id) ON DELETE CASCADE,
     FOREIGN KEY (plugin_id) REFERENCES plugins(id) ON DELETE CASCADE,
     FOREIGN KEY (plugin_config_id) REFERENCES plugin_configs(id) ON DELETE SET NULL,
-    UNIQUE KEY unique_plan_plugin (backup_plan_id, plugin_id)
+    UNIQUE KEY unique_plan_config (backup_plan_id, plugin_config_id)
 ) ENGINE=InnoDB;
 
 -- Repository-level S3 sync configuration (decoupled from backup plans)
@@ -441,9 +534,10 @@ INSERT INTO plugins (slug, name, description, plugin_type) VALUES
 ('mysql_dump', 'MySQL Backup/Restore', 'Dumps MySQL databases before each backup, storing them in the repository for easy one-click restore back to the server.', 'pre_backup'),
 ('pg_dump', 'PostgreSQL Backup/Restore', 'Dumps PostgreSQL databases before each backup, storing them in the repository for easy one-click restore back to the server.', 'pre_backup'),
 ('mongo_dump', 'MongoDB Backup/Restore', 'Dumps MongoDB databases using mongodump before backup. Supports per-database dumps with optional gzip compression and automatic cleanup. Restore via mongorestore.', 'pre_backup'),
+('mssql_dump', 'Microsoft SQL Server Backup/Restore', 'Backs up Microsoft SQL Server databases (native COPY_ONLY .bak, no impact on existing backup chains) before each backup, storing them in the repository for one-click restore back to the server.', 'pre_backup'),
 ('interworx', 'InterWorx Backup', 'Runs InterWorx control panel backups before each borg archive. Supports full, partial (web/mail/db), and structure-only backup modes for all domains.', 'pre_backup'),
 ('shell_hook', 'Shell Script Hook', 'Runs custom shell scripts on the client before and/or after backup. Useful for application quiescing, cache clearing, notifications, or custom integrations.', 'pre_backup'),
-('s3_sync', 'S3 Offsite Sync', 'Automatic sync of repositories to any S3-compatible storage after backup and prune operations. Stores a manifest for fast restore without long borg operations.', 'post_backup');
+('s3_sync', 'Offsite Sync', 'Copies each repository to another storage after backup and prune: an S3-compatible bucket, a host over SSH (SFTP), or a second local disk. Keeps a manifest beside the copy for fast restore.', 'post_backup');
 
 -- --------------------------------------------------------
 -- API Tokens (admin API authentication)
@@ -456,8 +550,64 @@ CREATE TABLE api_tokens (
     can_read_secrets TINYINT(1) NOT NULL DEFAULT 0,
     token_hash VARCHAR(64) NOT NULL UNIQUE,
     user_id INT NOT NULL,
+    device_name VARCHAR(100) DEFAULT NULL,
+    device_id VARCHAR(64) DEFAULT NULL,
+    expires_at DATETIME DEFAULT NULL,
+    last_seen_ip VARCHAR(45) DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     last_used_at DATETIME DEFAULT NULL,
+    INDEX idx_kind_user (kind, user_id),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- Push notification device registrations.
+-- One row per (user, device); re-registration updates the device token.
+CREATE TABLE push_tokens (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    device_id VARCHAR(64) NOT NULL,
+    push_token VARCHAR(512) NOT NULL,
+    platform VARCHAR(16) NOT NULL DEFAULT 'ios',
+    device_name VARCHAR(100) DEFAULT NULL,
+    -- Per-device event preferences, materialised at registration so nothing
+    -- has to interpret "absent" at query time.
+    events JSON NOT NULL,
+    enabled TINYINT(1) NOT NULL DEFAULT 1,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    -- One row per device: the app holds a single session, so signing in as
+    -- another user moves the device rather than adding a second row.
+    UNIQUE KEY unique_device (device_id),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- --------------------------------------------------------
+-- Outbound push queue
+-- --------------------------------------------------------
+CREATE TABLE push_queue (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    device_id VARCHAR(64) NOT NULL,
+    user_id INT NOT NULL,
+    event VARCHAR(50) NOT NULL,
+    job_id INT NOT NULL DEFAULT 0,
+    client_id INT NOT NULL DEFAULT 0,
+    attempts INT NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_pending (device_id, event, job_id),
+    KEY idx_created (created_at)
+) ENGINE=InnoDB;
+
+-- Short-lived single-use secrets for stateless mobile auth flows:
+-- the 2FA challenge between password and TOTP verification, and the
+-- OIDC exchange code between the browser redirect and token exchange.
+CREATE TABLE auth_challenges (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    kind ENUM('2fa', 'oidc_exchange', '2fa_setup') NOT NULL,
+    challenge_hash CHAR(64) NOT NULL UNIQUE,
+    user_id INT NOT NULL,
+    payload TEXT DEFAULT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
@@ -486,6 +636,40 @@ INSERT INTO backup_templates (name, description, directories, excludes) VALUES
 ('Docker Host', 'Docker/container host', '/opt\n/srv\n/home\n/etc\n/var/lib/docker/volumes', '*.tmp\n*.log\n/var/lib/docker/overlay2'),
 ('Minimal (System Config)', 'Essential system configuration only', '/etc\n/root\n/home\n/var/spool/cron', '*.tmp\n*.log\n*.cache');
 
+CREATE TABLE client_profiles (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    description VARCHAR(255) NOT NULL DEFAULT '',
+    template_id INT DEFAULT NULL,
+    frequency VARCHAR(30) NOT NULL DEFAULT 'daily',
+    times VARCHAR(255) DEFAULT '02:00',
+    -- The zone those run hours are in. Null = the server's (#411).
+    timezone VARCHAR(64) DEFAULT NULL,
+    day_of_week TINYINT DEFAULT NULL,
+    day_of_month VARCHAR(20) DEFAULT NULL,
+    prune_minutes INT NOT NULL DEFAULT 0,
+    prune_hours INT NOT NULL DEFAULT 0,
+    prune_days INT NOT NULL DEFAULT 7,
+    prune_weeks INT NOT NULL DEFAULT 4,
+    prune_months INT NOT NULL DEFAULT 6,
+    prune_years INT NOT NULL DEFAULT 0,
+    -- Null means "use the server-wide setting" rather than zero.
+    auto_retry_max_attempts INT DEFAULT NULL,
+    job_offline_grace_minutes INT DEFAULT NULL,
+    auto_retry_backoff_minutes INT DEFAULT NULL,
+    -- How long a client may go without a successful backup before health
+    -- calls it overdue. Null follows the server-wide setting (#409).
+    backup_overdue_hours INT DEFAULT NULL,
+    is_default TINYINT(1) NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_profile_name (name),
+    FOREIGN KEY (template_id) REFERENCES backup_templates(id) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+INSERT INTO client_profiles (name, description, is_default)
+VALUES ('Default', 'Every client starts here until it is given a profile of its own.', 1);
+
 -- --------------------------------------------------------
 -- Borg Version Management
 -- --------------------------------------------------------
@@ -510,6 +694,7 @@ CREATE TABLE borg_version_assets (
     asset_name VARCHAR(100) NOT NULL,
     download_url VARCHAR(500) NOT NULL,
     file_size BIGINT DEFAULT NULL,
+    sha256 CHAR(64) DEFAULT NULL,
     FOREIGN KEY (borg_version_id) REFERENCES borg_versions(id) ON DELETE CASCADE,
     UNIQUE KEY unique_asset (borg_version_id, platform, architecture, glibc_version)
 ) ENGINE=InnoDB;
@@ -518,5 +703,6 @@ CREATE TABLE borg_version_assets (
 -- Foreign Keys (added after all tables created)
 -- --------------------------------------------------------
 
+ALTER TABLE agents ADD FOREIGN KEY (client_profile_id) REFERENCES client_profiles(id) ON DELETE SET NULL;
 ALTER TABLE user_agents ADD FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE;
 ALTER TABLE user_permissions ADD FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE;

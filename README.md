@@ -1,18 +1,19 @@
 # Borg Backup Server
 
-<img width="100%" alt="Borg Backup Server Dashboard" src="https://github.com/user-attachments/assets/6e3cee15-6a2d-428b-be25-d150a38c787a" />
+<img width="100%" alt="borg backup server gui" src="https://github.com/user-attachments/assets/c623708f-65b6-4f88-a786-a570c51d60a4" />
+
 
 
 A self-hosted web application for centrally managing [BorgBackup](https://borgbackup.readthedocs.io/) across multiple endpoints (Linux, Mac and Windows). A lightweight agent polls the server for tasks over HTTPS, backs up over SSH to the server, and reports progress back. No inbound connections to endpoints from the server — this works behind firewalls and NAT from where the server is providing easy provisioning. Includes a setup wizard for simple installation or a Docker image to start up in 30 seconds.
 
-**View Demo**
+**View Demo **
 The developer has made a system for provisioning Demos at no cost here: [Borg Backup Server](https://www.borgbackupserver.com/)
 
 ## Features
 
 - **Agent-based architecture** — endpoints check-in with the server for tasks, the server doesn't need ssh access to the agent
 - **SSH with append-only security** — agents can only backup or restore, can't delete or prune
-- **Encrypted Borg repositories** — backup encryption is configured per repository; protect databases, metadata, and host storage separately
+- **FULL Encryption** - Software keeps everything encrypted at rest for enhanced security
 - **Setup wizard** — browser-based installer configures database, admin account, and storage quicky
 - **Real-time progress** — live progress bars during backups with detailed logging
 - **File-level restore** — catalog data is saved in ClickHouse DB for fast search and file-tree without having to lock the borg repo
@@ -38,53 +39,35 @@ The developer has made a system for provisioning Demos at no cost here: [Borg Ba
 
 ## Quick Start
 
-Start with a fresh **Ubuntu 22.04+** server, then run:
+Both installation paths are documented step by step on the Wiki — start there rather than piecing it together:
 
-```bash
-curl -sO https://raw.githubusercontent.com/marcpope/borgbackupserver/main/bin/bbs-install
-sudo bash bbs-install --hostname backups.example.com
-```
-
-The installer handles everything — packages, Apache, MySQL, SSL, and cron. When it finishes, open the URL and the setup wizard walks you through the rest.
-
-See the **[full documentation on the Wiki](https://github.com/marcpope/borgbackupserver/wiki)** for installation details, agent setup, configuration, and usage guides.
-
----
-
-## Docker
-
-This fork ships the upstream deployment recipe. The default Compose service pulls
-`marcpope/borgbackupserver:latest`; it does not build code from this checkout.
-For a clone, copy [`.env.example`](.env.example) to `.env`, set `APP_URL` to the
-address reachable by agents, and run `docker compose config --quiet` before
-starting. Optional UID/GID and `ADMIN_PASS` entries also need their matching
-`environment` lines enabled in [`docker-compose.yml`](docker-compose.yml).
-Compose's `.env` is separate from the application's
-[`config/.env.example`](config/.env.example).
-
-
-Pre-built images are published to [Docker Hub](https://hub.docker.com/r/marcpope/borgbackupserver) on every release:
-
-```bash
-curl -sO https://raw.githubusercontent.com/marcpope/borgbackupserver/main/docker-compose.yml
-docker compose up -d
-```
-
-Get admin credentials from the container logs:
-
-```bash
-docker compose logs bbs
-```
-
-Open `http://localhost:8080` and log in. See the **[Docker Installation guide](https://github.com/marcpope/borgbackupserver/wiki/Docker-Installation)** for full configuration, storage, reverse proxy, and update documentation.
+- **[Bare Metal / VM installation](https://github.com/marcpope/borgbackupserver/wiki/Installation)** — a fresh Ubuntu server (22.04, 24.04, and 26.04 LTS are supported) and one installer command; the guide covers prerequisites, SSL, the setup wizard, and what the installer changes.
+- **[Docker installation](https://github.com/marcpope/borgbackupserver/wiki/Docker-Installation)** — pre-built images on [Docker Hub](https://hub.docker.com/r/marcpope/borgbackupserver) for every release; the guide covers compose configuration, storage, reverse proxy setup, and updates.
 
 **Unraid:** a Community Applications template is included at [`unraid/borgbackupserver.xml`](unraid/borgbackupserver.xml) — add it via *Docker → Add Container → Template* (or your CA templates repo). It maps the web/SSH ports and the `/var/bbs` data path, and defaults `APP_URL`/`SSH_PORT` to the host.
 
 ---
 
+### Hinweis zu diesem Fork
+
+This fork ships the upstream deployment recipe. The default Compose service pulls
+`marcpope/borgbackupserver:latest`; it does not build code from this checkout.
+For a clone, copy [`.env.example`](.env.example) to `.env`, set `APP_URL` to the
+address reachable by agents, and run `docker compose config --quiet` before
+starting. Optional `ADMIN_PASS` and UID/GID entries also need their matching
+`environment` lines enabled in [`docker-compose.yml`](docker-compose.yml).
+Compose's `.env` is separate from the application's
+[`config/.env.example`](config/.env.example).
+
+## 📱 BBS Manager is here
+
+**[BBS Manager](https://www.borgbackupserver.com/bbs-manager/) is now available on the Apple App Store** — manage your Borg Backup Server from your phone, with native push notifications for failed backups, server status, and more. It's an optional companion app; see the [announcement](https://github.com/marcpope/borgbackupserver/discussions/460) for details and how to connect it under **Settings → Push Service**. Update to the latest release for the best experience with the app.
+
+---
+
 ## Documentation
 
-User guides live on the **[GitHub Wiki](https://github.com/marcpope/borgbackupserver/wiki)**:
+All documentation lives on the **[GitHub Wiki](https://github.com/marcpope/borgbackupserver/wiki)**:
 
 - [System Requirements](https://github.com/marcpope/borgbackupserver/wiki/System-Requirements)
 - [Installation](https://github.com/marcpope/borgbackupserver/wiki/Installation)
@@ -97,7 +80,58 @@ User guides live on the **[GitHub Wiki](https://github.com/marcpope/borgbackupse
 - [Settings](https://github.com/marcpope/borgbackupserver/wiki/Settings)
 - [CLI Reference](https://github.com/marcpope/borgbackupserver/wiki/CLI-Reference)
 - [Troubleshooting](https://github.com/marcpope/borgbackupserver/wiki/Troubleshooting)
-- [Contributing](CONTRIBUTING.md)
+- [Contributing](docs/CONTRIBUTING.md)
+
+---
+
+## Monitoring (Prometheus)
+
+`GET /metrics` serves the exposition format, alongside the JSON at `/api/v1/metrics`.
+Turn it on in **Settings → API → Monitoring**, where you choose which addresses may
+read it and whether each range must also present a token. Create the token there too,
+with type **Monitoring (read-only)** — it opens the monitoring endpoints and nothing
+else, so it is safe to leave in a scrape configuration.
+
+```yaml
+scrape_configs:
+  - job_name: bbs
+    scrape_interval: 60s
+    static_configs:
+      - targets: ['bbs.example.com']
+    authorization:
+      # A file, not the token inline: scrape configs end up in Git.
+      credentials_file: /etc/prometheus/bbs.token
+```
+
+Four alerts cover most of what goes wrong. Each one fires whether BBS is healthy or
+not, which is the point of evaluating them outside BBS:
+
+```yaml
+# Each plan carries its own threshold — the one BBS itself uses, client
+# profile included — so a two-hourly plan and a laptop backed up on Mondays
+# do not need the same number.
+- alert: BackupOverdue
+  expr: |
+    (time() - bbs_plan_last_success_timestamp_seconds)
+      > on (instance, client, plan, repo) bbs_plan_overdue_seconds
+- alert: BackupNeverRan
+  expr: bbs_plan_enabled == 1 unless bbs_plan_last_success_timestamp_seconds
+- alert: BackupNotClean        # 1 failed, 2 completed with warnings (e.g. a plugin failed)
+  expr: bbs_plan_last_run_status > 0
+- alert: OffsiteCopyOverdue
+  expr: time() - bbs_repo_last_sync_timestamp_seconds > 86400
+- alert: SchedulerStopped
+  expr: time() - bbs_scheduler_last_run_timestamp_seconds > 300
+- alert: BorgUnusable          # agent reporting in, borg not runnable
+  expr: bbs_client_info{borg_version=""} == 1
+- alert: QueueNotDraining
+  expr: bbs_queue_oldest_seconds > 3600
+```
+
+A value that is not known is omitted rather than zeroed, so a plan that has never
+succeeded has no `bbs_plan_last_success_timestamp_seconds` series at all — alert on
+`absent()` for those. Rendered snapshots are cached (30s by default) because the
+queries behind them read the whole job history.
 
 ---
 

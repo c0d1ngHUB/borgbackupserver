@@ -40,13 +40,15 @@
 :root {
     --bs-body-font-family: 'Inter', system-ui, -apple-system, sans-serif;
     --bs-box-shadow-sm: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.375);
-    --bbs-nav-bg: #2c3e50;
-    --bbs-nav-color: rgba(255, 255, 255, 0.7);
-    --bbs-nav-hover-bg: rgba(255, 255, 255, 0.1);
-    --bbs-nav-hover-color: #fff;
+    /* The top bar and sidebar are the same in both themes — only the content
+       area changes with the theme. These match the dark block below. */
+    --bbs-nav-bg: #151a1f;
+    --bbs-nav-color: rgba(255, 255, 255, 0.5);
+    --bbs-nav-hover-bg: rgba(255, 255, 255, 0.06);
+    --bbs-nav-hover-color: rgba(255, 255, 255, 0.9);
     --bbs-nav-active-bg: #e67e22;
     --bbs-nav-active-color: #fff;
-    --bbs-topbar-bg: #2c3e50;
+    --bbs-topbar-bg: #101417;
 }
 
 /* Muted Bootstrap color overrides — buttons and badges only */
@@ -187,7 +189,7 @@ html, body {
 
 /* Sidebar */
 .sidebar {
-    width: 98px;
+    width: 192px;
     height: calc(100vh - 64px);
     background-color: var(--bbs-nav-bg);
     position: fixed;
@@ -198,8 +200,8 @@ html, body {
 }
 
 /* Version pill at the bottom of the sidebar. The sidebar background is
-   always dark navy regardless of theme (--bbs-nav-bg = #2c3e50 light /
-   #16191d dark), so the pill uses light-on-dark colors hardcoded. The
+   the same dark #151a1f in both themes, so the pill uses light-on-dark
+   colors hardcoded. The
    previous Bootstrap text-body-secondary token resolved to a midtone
    gray in light mode, which read as illegible against the dark navy. */
 .sidebar-version-pill {
@@ -214,20 +216,93 @@ html, body {
 
 .sidebar-link {
     color: var(--bbs-nav-color) !important;
-    padding: 10px 8px 6px !important;
-    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 14px !important;
+    margin-bottom: 1px;
     border-radius: 0 !important;
-    transition: all 0.2s;
-    line-height: 1;
+    transition: background-color 0.15s, color 0.15s;
+    line-height: 1.2;
+    font-size: 0.875rem;
+    white-space: nowrap;
 }
 
-.sidebar-link i.d-block {
-    margin-bottom: 2px !important;
-    font-size: 1.2rem !important;
+/* Fixed-width icon column so every label starts on the same vertical line,
+   whatever glyph precedes it. */
+.sidebar-link > i:first-child {
+    font-size: 0.95rem;
+    width: 18px;
+    text-align: center;
+    flex-shrink: 0;
 }
 
-.sidebar-link .small {
-    font-size: 0.75rem !important;
+.sidebar-link .sidebar-label {
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Group headings — quiet, since they are labels rather than destinations. */
+.sidebar-section {
+    color: rgba(255, 255, 255, 0.38);
+    font-size: 0.63rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 13px 14px 5px;
+    margin: 0;
+}
+
+/* Settings is a destination-sized row like Users, not a section label — it
+   just happens to expand. Width and background reset because it is a <button>
+   wearing a link's clothes. */
+.sidebar-group-toggle {
+    width: 100%;
+    background: none;
+    border: 0;
+    cursor: pointer;
+    text-align: left;
+}
+
+.sidebar-group-caret {
+    margin-left: auto;
+    font-size: 0.7rem;
+    opacity: 0.6;
+    transition: transform 0.15s;
+}
+
+.sidebar-group-toggle[aria-expanded="false"] .sidebar-group-caret {
+    transform: rotate(-90deg);
+}
+
+/* Children hang off a rail so the nesting reads without indentation alone. */
+.sidebar-sub {
+    list-style: none;
+    margin: 0 0 0 27px;
+    padding: 0;
+    border-left: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.sidebar-sub .sidebar-link {
+    padding: 5px 10px 5px 14px !important;
+    font-size: 0.8125rem;
+    margin-bottom: 0;
+    position: relative;
+}
+
+/* The short tick joining a child to the rail. */
+.sidebar-sub .sidebar-link::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 50%;
+    width: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.sidebar-sub .sidebar-link.active::before {
+    border-top-color: var(--bbs-nav-active-color);
 }
 
 .sidebar-link:hover {
@@ -238,6 +313,13 @@ html, body {
 .sidebar-link.active {
     color: var(--bbs-nav-active-color) !important;
     background-color: var(--bbs-nav-active-bg) !important;
+    box-shadow: inset 3px 0 0 var(--bbs-nav-active-color);
+}
+
+.sidebar-sub .sidebar-link.active {
+    box-shadow: none;
+    background-color: transparent !important;
+    font-weight: 600;
 }
 
 /* Topbar */
@@ -290,23 +372,34 @@ html, body {
 }
 
 .topbar-logo {
-    width: 98px;
+    /* Matches the sidebar so the logo sits over its column rather than
+       floating short of it. */
+    width: 192px;
     overflow: visible;
 }
 
-/* Mascot logo. Width-anchored at ~97px so it sits close to the 90px
-   sidebar column with just a few pixels of overflow on the right.
-   At the artwork's 3:2 aspect this gives ~65px tall — barely past
-   the 64px topbar, so the robot's hands appear to brush the edge
-   between the topbar and the page content without dominating.
-   pointer-events: none keeps the navbar-brand link clickable. */
+@media (max-width: 767.98px) {
+    /* No sidebar to align to on mobile — keep the old narrow box so the page
+       title still has room beside it. */
+    .topbar-logo {
+        width: 98px;
+    }
+}
+
+/* Mascot logo. Contained inside the topbar and centred in the logo column,
+   which is the width of the sidebar. */
 .topbar-mascot {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 115px;
-    height: auto;
-    z-index: 1031;
+    /* The artwork is a full lockup — wordmark and mascot — sized for the wider
+       sidebar column, so it is contained within the topbar rather than
+       overhanging it the way the old mascot-only image deliberately did. A
+       wordmark hanging below the bar reads as a mistake, not as character. */
+    /* Fills the bar: full 64px height, no padding. At 650x266 that lands it
+       about 156px wide in the 192px column, so it is height-bound — the
+       remaining slack is horizontal and the lockup stays undistorted. */
+    height: 64px;
+    width: auto;
+    max-width: 192px;
+    object-fit: contain;
     pointer-events: none;
 }
 
@@ -314,106 +407,40 @@ html, body {
    default mascot's "peek over the edge of the topbar" geometry. They get
    constrained to the navbar height and contained without distortion (#261). */
 .topbar-brand-logo {
-    max-height: 58px;
-    max-width: 92px;
+    /* Matches the slot the branding page now advertises: the full 64px bar
+       height and the width of the logo column. The previous 92px cap was
+       sized for the old 98px column and left a custom logo marooned in the
+       middle of the new one. */
+    max-height: 64px;
+    max-width: 192px;
     height: auto;
     width: auto;
-    padding: 3px;
     object-fit: contain;
     z-index: 1031;
     pointer-events: none;
 }
 
-/* Mobile bottom navigation */
-.mobile-bottom-nav {
-    position: fixed;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    background-color: var(--bbs-nav-bg);
-    display: flex;
-    justify-content: space-around;
-    align-items: center;
-    z-index: 1040;
-    padding: 4px 0;
-    padding-bottom: calc(4px + env(safe-area-inset-bottom));
-    /* Thin lighter top border for definition against the page, plus a
-       stronger upward shadow so the bar clearly separates from content. */
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
-    box-shadow: 0 -4px 14px rgba(0, 0, 0, 0.35), 0 -1px 0 rgba(255, 255, 255, 0.04);
-}
-
-.mobile-nav-item {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    text-decoration: none;
-    color: var(--bbs-nav-color);
-    padding: 4px 8px;
-    font-size: 0.65rem;
-    line-height: 1;
-    transition: color 0.2s;
-    flex: 1;
-    text-align: center;
-    /* Reset <button> defaults so the More trigger looks identical to the <a> items */
-    background: transparent;
-    border: 0;
-    font-family: inherit;
-}
-
-.mobile-nav-item i {
-    font-size: 1.25rem;
-    margin-bottom: 2px;
-}
-
-.mobile-nav-item.active {
-    color: var(--bbs-nav-active-bg);
-}
-
-.mobile-nav-item:hover {
-    color: var(--bbs-nav-hover-color);
-}
-
-/* Mobile "More" bottom sheet — auto-size to content so it doesn't grab the
-   whole screen for just a handful of items. Extra padding at the bottom
-   keeps the last row above the phone's home indicator. */
-.offcanvas-bottom.mobile-more-sheet {
-    height: auto;
-    max-height: 70vh;
-    border-top-left-radius: 12px;
-    border-top-right-radius: 12px;
-}
-.offcanvas-bottom.mobile-more-sheet .offcanvas-body {
-    padding-bottom: env(safe-area-inset-bottom);
-}
-.offcanvas-bottom.mobile-more-sheet .list-group-item {
-    padding: 0.85rem 1rem;
-    border-left: 0;
-    border-right: 0;
-}
-
 /* Offset main content for fixed sidebar on desktop */
 @media (min-width: 768px) {
     .main-content {
-        margin-left: 98px;
+        margin-left: 192px;
     }
 }
 
-/* Add padding at bottom for mobile nav */
 @media (max-width: 767.98px) {
     .main-content {
-        padding-bottom: 64px;
+        /* No bottom bar to clear any more — the drawer overlays instead. */
         min-width: 0;
         overflow-x: hidden;
     }
-    /* Hide the logo entirely on mobile — bottom-nav handles navigation
-       and the page-title gets the full topbar width. */
+    /* Logo stays hidden on a phone: the hamburger and the page title need the
+       width more than a mark that only repeats what the tab already says. */
     .topbar .navbar-brand,
     .topbar-logo {
         display: none !important;
     }
     .topbar .navbar-text {
-        margin-left: 0.75rem !important;
+        margin-left: 0.25rem !important;
     }
 }
 
@@ -972,17 +999,20 @@ body.bg-body-secondary {
 
 /* Dark mode — low-contrast palette */
 [data-bs-theme="dark"] {
-    --bs-body-bg: #1a1d21;
+    /* Three surfaces, deliberately separated: topbar, sidebar, canvas. They
+       used to sit within a couple of points of each other, which read as one
+       flat plane with lines drawn on it. */
+    --bs-body-bg: #1a1f25;
     --bs-body-color: #b0b8c1;
     --bs-secondary-color: #8b929a;
     --bs-secondary-bg: #23272b;
     --bs-tertiary-bg: #23272b;
     --bs-border-color: rgba(255, 255, 255, 0.08);
-    --bbs-nav-bg: #16191d;
+    --bbs-nav-bg: #151a1f;
     --bbs-nav-color: rgba(255, 255, 255, 0.5);
     --bbs-nav-hover-bg: rgba(255, 255, 255, 0.06);
     --bbs-nav-hover-color: rgba(255, 255, 255, 0.9);
-    --bbs-topbar-bg: #111315;
+    --bbs-topbar-bg: #101417;
 }
 
 [data-bs-theme="dark"] .card {
@@ -1111,9 +1141,386 @@ body.bg-body-secondary {
 .release-notes-md pre { background: var(--bs-tertiary-bg); padding: 0.75rem; border-radius: 6px; font-size: 0.8rem; overflow-x: auto; }
 .release-notes-md pre code { background: none; padding: 0; }
 .release-notes-md *:last-child { margin-bottom: 0; }
+/* A cap before the script runs, so the panel never flashes at full height on
+   a long set of notes. JS then matches it to the column beside it. */
+@media (min-width: 992px) {
+    /* Close to what the script computes, so the panel only ever shrinks when
+       it runs — growing after load made the scrollbar flicker. */
+    .release-notes-md { max-height: calc(100vh - 230px); overflow-y: auto; }
+}
+/* Screenshots in release notes arrive at their original pixel size, which is
+   wider than the panel. */
+.release-notes-img {
+    max-width: 100%;
+    height: auto;
+    display: block;
+    margin: 0.5rem 0;
+    border: 1px solid var(--bs-border-color);
+    border-radius: 6px;
+}
 
 [data-bs-theme="dark"] .release-notes-md code { background: rgba(255,255,255,0.08); }
 
 [data-bs-theme="dark"] body.bg-body-secondary {
     background-color: #1a1d21 !important;
+}
+
+
+/* ── Settings rows ────────────────────────────────────────────────────────
+   A settings page is a list of decisions, not a stack of boxes. Each row is
+   label + explanation, the control, and the default.
+
+   The typography carries the hierarchy: page title, section, setting name,
+   description, metadata — five weights of emphasis rather than five shades of
+   the same grey. Tokens so light mode isn't a hardcoded dark palette. */
+
+:root {
+    --bbs-set-title:   #1f2429;   /* page + section headings */
+    --bbs-set-label:   #2c333b;   /* the setting's name */
+    --bbs-set-desc:    #6b7581;   /* what it does */
+    --bbs-set-meta:    #7f8895;   /* the default */
+    --bbs-set-rule:    rgba(0, 0, 0, 0.07);
+    --bbs-set-control-bg: #fff;
+    --bbs-set-control-border: #ced4da;
+    --bbs-set-control-hover-bg: #fff;
+    --bbs-set-control-hover-border: #adb5bd;
+    --bbs-set-control-color: #212529;
+}
+
+[data-bs-theme="dark"] {
+    --bbs-set-title:   #e5e9ef;
+    --bbs-set-label:   #d8dde5;
+    --bbs-set-desc:    #88919d;
+    --bbs-set-meta:    #7f8895;
+    /* Faint on purpose: rows are separated by air, and the rule only
+       reinforces it. A full-strength line per row reads as a spreadsheet. */
+    --bbs-set-rule:    rgba(255, 255, 255, 0.055);
+    --bbs-set-control-bg: #1d2228;
+    --bbs-set-control-border: #343b45;
+    --bbs-set-control-hover-bg: #20262d;
+    --bbs-set-control-hover-border: #46505c;
+    --bbs-set-control-color: #dce2ea;
+}
+
+/* Page heading — the level above the sections, so a page reads
+   page → section → setting → description rather than starting mid-hierarchy. */
+.settings-page-title {
+    font-size: 1.4rem;
+    font-weight: 650;
+    color: var(--bbs-set-title);
+    margin: 0 0 4px;
+}
+
+.settings-page-lede {
+    color: var(--bbs-set-desc);
+    font-size: 0.875rem;
+    margin: 0 0 26px;
+    /* No measure cap: the lede sits inside a full-width band now, and text
+       wrapping at 45% of a wide panel reads as a mistake rather than as
+       considered line length. */
+}
+
+.settings-group {
+    font-size: 17px;
+    font-weight: 650;
+    color: var(--bbs-set-title);
+    margin: 30px 0 8px;
+}
+
+.settings-group:first-of-type {
+    margin-top: 4px;
+}
+
+/* Section copy that explains a group rather than one setting. */
+.settings-group-note {
+    color: var(--bbs-set-desc);
+    font-size: 13px;
+    line-height: 1.45;
+    max-width: 70ch;
+    margin: -2px 0 10px;
+}
+
+.settings-row {
+    display: grid;
+    /* Proportional, not fixed minimums. Hard minima (480 + 300 + 140 plus the
+       gaps) came to 992px, which a 1280px window cannot give once the sidebar
+       and the canvas padding are taken out — so the grid overflowed and ate the
+       right-hand padding. minmax(0, …) lets every column shrink instead. */
+    grid-template-columns: minmax(0, 1.9fr) minmax(0, 1fr) minmax(0, 0.62fr);
+    column-gap: 36px;
+    align-items: center;
+    min-height: 82px;
+    padding: 17px 0;
+    border-bottom: 1px solid var(--bbs-set-rule);
+}
+
+.settings-row:last-child {
+    border-bottom: 0;
+}
+
+.settings-row-label {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--bbs-set-label);
+    margin-bottom: 3px;
+}
+
+.settings-row-help {
+    color: var(--bbs-set-desc);
+    font-size: 13px;
+    font-weight: 400;
+    line-height: 1.45;
+    margin: 0;
+}
+
+.settings-row-control {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+/* Controls sit on a slightly raised surface so they read as things you can
+   act on, rather than dissolving into the page. */
+.settings-row-control .form-control,
+.settings-row-control .form-select {
+    max-width: 190px;
+    background-color: var(--bbs-set-control-bg);
+    border: 1px solid var(--bbs-set-control-border);
+    border-radius: 6px;
+    color: var(--bbs-set-control-color);
+}
+
+.settings-row-control .form-control:hover,
+.settings-row-control .form-select:hover {
+    background-color: var(--bbs-set-control-hover-bg);
+    border-color: var(--bbs-set-control-hover-border);
+}
+
+.settings-row-control .form-control:focus,
+.settings-row-control .form-select:focus {
+    border-color: #2684ff;
+    box-shadow: 0 0 0 2px rgba(38, 132, 255, 0.12);
+}
+
+.settings-row-control .form-control-narrow {
+    max-width: 110px;
+}
+
+.settings-row-unit {
+    color: var(--bbs-set-desc);
+    font-size: 13px;
+}
+
+.settings-row-default {
+    color: var(--bbs-set-meta);
+    font-size: 13px;
+    text-align: left;
+}
+
+.settings-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 10px;
+    padding-top: 26px;
+    margin-top: 10px;
+    border-top: 1px solid var(--bbs-set-rule);
+}
+
+/* Below the grid's natural width the three columns stack, and the default
+   sits under the control it describes rather than stranded on its own line. */
+@media (max-width: 991.98px) {
+    .settings-row {
+        grid-template-columns: 1fr;
+        gap: 10px;
+        min-height: 0;
+        padding: 18px 0;
+    }
+}
+
+
+/* Page canvas — the padding around every page's content.
+   Horizontal is deliberately larger than vertical: content that runs to the
+   window edge reads as unfinished, and the settings rows in particular need
+   the label column to start somewhere other than hard against the sidebar. */
+.page-canvas {
+    padding: 20px 14px;
+}
+
+@media (min-width: 768px) {
+    .page-canvas {
+        padding: 26px 24px;
+    }
+}
+
+@media (min-width: 1400px) {
+    .page-canvas {
+        padding: 30px 28px;
+    }
+}
+
+
+/* ── Apprise URL examples ─────────────────────────────────────────────────
+   Reference material, so it reads as a lookup table: the service name in a
+   fixed column with its URL beside it, rather than "Label: value" run
+   together on one line where the eye has to find each label again. */
+.url-example-panel {
+    border: 1px solid var(--bbs-set-rule);
+    border-radius: 8px;
+    padding: 18px 22px;
+    background-color: var(--bs-tertiary-bg);
+}
+
+.url-example {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    padding: 6px 0;
+    font-family: var(--bs-font-monospace, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 0.82rem;
+}
+
+.url-example-label {
+    flex: 0 0 92px;
+    font-weight: 600;
+    color: #6ea8fe;
+}
+
+[data-bs-theme="light"] .url-example-label {
+    color: #0d6efd;
+}
+
+.url-example-value {
+    color: var(--bbs-set-desc);
+    background: none;
+    padding: 0;
+    word-break: break-all;
+}
+
+/* Table headers on the settings pages: quiet column labels rather than a
+   filled bar competing with the section heading above them. */
+.settings-table thead th {
+    background: none;
+    border-bottom: 1px solid var(--bbs-set-rule);
+    color: var(--bbs-set-meta);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding-bottom: 10px;
+}
+
+.settings-table tbody td {
+    border-bottom: 1px solid var(--bbs-set-rule);
+    padding-top: 14px;
+    padding-bottom: 14px;
+}
+
+
+/* Mobile navigation drawer — replaces the bottom bar, which could only ever
+   show four destinations and pushed the rest behind "More". */
+.mobile-nav-drawer {
+    width: 270px;
+}
+
+.mobile-nav-drawer .list-group-item {
+    border: 0;
+    padding: 9px 18px;
+    font-size: 0.9rem;
+}
+
+.mobile-nav-drawer .mobile-nav-heading {
+    padding: 13px 18px 5px;
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--bs-secondary-color);
+}
+
+.topbar-burger:focus {
+    box-shadow: none;
+}
+
+
+/* A long unbroken value — an Apprise URL, a token, a repo path — must wrap
+   rather than widen its column and shove the page out from under its own
+   right-hand padding. */
+.settings-row,
+.settings-row-control,
+.settings-row-label,
+.settings-row-help {
+    min-width: 0;
+}
+
+.settings-row-control .form-control,
+.settings-row-control .form-select {
+    max-width: 100%;
+}
+
+
+/* Settings page headline band.
+   A faint blue cast so the top of the page has somewhere to start, rather than
+   a title floating on the same flat surface as everything under it. Kept very
+   low contrast — this is a backdrop, not a callout, and it must not compete
+   with the warning and info alerts that appear directly below it on some
+   pages. */
+.settings-page-head {
+    background: linear-gradient(180deg,
+        rgba(38, 132, 255, 0.055) 0%,
+        rgba(38, 132, 255, 0.02) 100%);
+    border-bottom: 1px solid rgba(38, 132, 255, 0.10);
+    margin-bottom: 26px;
+
+    /* Full bleed: pulled out to the edges of the content area by exactly the
+       canvas padding, then given that padding back on the inside — so the band
+       reaches the edges while its text stays on the same line as everything
+       below it. The values track .page-canvas at each breakpoint; change one
+       and change the other. */
+    margin-top: -20px;
+    margin-left: -14px;
+    margin-right: -14px;
+    padding: 20px 14px;
+}
+
+@media (min-width: 768px) {
+    .settings-page-head {
+        margin-top: -26px;
+        margin-left: -24px;
+        margin-right: -24px;
+        padding: 26px 24px;
+    }
+}
+
+@media (min-width: 1400px) {
+    .settings-page-head {
+        margin-top: -30px;
+        margin-left: -28px;
+        margin-right: -28px;
+        padding: 30px 28px;
+    }
+}
+
+[data-bs-theme="light"] .settings-page-head {
+    background: linear-gradient(180deg,
+        rgba(13, 110, 253, 0.045) 0%,
+        rgba(13, 110, 253, 0.015) 100%);
+    border-bottom-color: rgba(13, 110, 253, 0.11);
+}
+
+.settings-page-head .settings-page-title,
+.settings-page-head .settings-page-lede {
+    margin-bottom: 0;
+}
+
+.settings-page-head .settings-page-title {
+    margin-bottom: 4px;
+}
+
+/* The first section heading sits closer to the band than it would to a bare
+   title, since the band already provides the separation. */
+.settings-page-head + .settings-group,
+.settings-page-head + div > .settings-group:first-of-type {
+    margin-top: 0;
 }

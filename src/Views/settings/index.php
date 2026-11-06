@@ -7,446 +7,592 @@ if ($activeTab === 'borg') { $activeTab = 'updates'; $updatesSection = 'borg'; }
 if ($activeTab === 'updates') { $updatesSection = $updatesSection ?? ($_GET['section'] ?? 'software'); }
 ?>
 
-<!-- Tab Navigation -->
+
+
+
+<!-- Agent Tab -->
+<?php if ($activeTab === 'agent'): ?>
+<div class="settings-page-head">
+    <h1 class="settings-page-title">Agent</h1>
+    <p class="settings-page-lede mb-0">How clients check in, how their backups are watched, and what happens when one drops out.</p>
+</div>
+
 <?php
-$updateService = new \BBS\Services\UpdateService();
-$updateAvailable = $updateService->isUpdateAvailable();
+$dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+$compactDay  = (int) ($settings['auto_compact_day'] ?? 6);
+$compactHour = (int) ($settings['auto_compact_hour'] ?? 2);
+// The zone the compact day/hour are read in. Installs from before 2.99.4
+// have none stored and still run in UTC until the schedule is saved again;
+// a save stamps the schedule with the saving admin's profile zone (#556).
+$compactTz   = (string) ($settings['auto_compact_timezone'] ?? '');
+$viewerTz    = (string) ($_SESSION['timezone'] ?? 'UTC');
 ?>
-<ul class="nav nav-pills client-tabs mb-0 flex-wrap">
-    <li class="nav-item">
-        <a class="nav-link <?= $activeTab === 'general' ? 'active' : '' ?>" href="/settings?tab=general">
-            <i class="bi bi-gear me-1"></i><span class="tab-label">General</span>
-        </a>
-    </li>
-    <li class="nav-item">
-        <a class="nav-link <?= $activeTab === 'notifications' ? 'active' : '' ?>" href="/settings?tab=notifications">
-            <i class="bi bi-envelope me-1"></i><span class="tab-label"><span class="d-none d-sm-inline">Email Settings</span><span class="d-sm-none">Email</span></span>
-        </a>
-    </li>
-    <li class="nav-item">
-        <a class="nav-link <?= $activeTab === 'push' ? 'active' : '' ?>" href="/settings?tab=push">
-            <i class="bi bi-megaphone me-1"></i><span class="tab-label"><span class="d-none d-sm-inline">Push Notifications</span><span class="d-sm-none">Push</span></span>
-        </a>
-    </li>
-    <li class="nav-item">
-        <a class="nav-link <?= $activeTab === 'templates' ? 'active' : '' ?>" href="/settings?tab=templates">
-            <i class="bi bi-clipboard-check me-1"></i><span class="tab-label">Templates</span>
-        </a>
-    </li>
-    <li class="nav-item">
-        <a class="nav-link <?= $activeTab === 'auth' ? 'active' : '' ?>" href="/settings?tab=auth">
-            <i class="bi bi-shield-lock me-1"></i><span class="tab-label">Authentication</span>
-        </a>
-    </li>
-    <li class="nav-item">
-        <a class="nav-link <?= $activeTab === 'branding' ? 'active' : '' ?>" href="/settings?tab=branding">
-            <i class="bi bi-palette me-1"></i><span class="tab-label">Branding</span>
-        </a>
-    </li>
-    <li class="nav-item">
-        <a class="nav-link <?= $activeTab === 'api' ? 'active' : '' ?>" href="/settings?tab=api">
-            <i class="bi bi-key me-1"></i><span class="tab-label">API</span>
-        </a>
-    </li>
-    <li class="nav-item">
-        <a class="nav-link <?= $activeTab === 'updates' ? 'active' : '' ?>" href="/settings?tab=updates">
-            <i class="bi bi-cloud-arrow-down me-1"></i><span class="tab-label">Updates</span>
-            <?php if ($updateAvailable): ?>
-                <span class="badge bg-warning text-dark ms-1">New</span>
-            <?php endif; ?>
-        </a>
-    </li>
-    <li class="nav-item d-sm-none">
-        <a class="nav-link" href="/storage-locations">
-            <i class="bi bi-hdd-stack me-1"></i><span class="tab-label">Storage</span>
-        </a>
-    </li>
-</ul>
-<div class="client-tab-content border rounded-bottom p-4 mb-4 shadow-sm">
+<form method="POST" action="/settings">
+    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+    <input type="hidden" name="_tab" value="agent">
+    <input type="hidden" name="_checkboxes" value="auto_retry_failed_backups,auto_update_agents,precount_files">
+
+    <h5 class="settings-group">Agent Communication</h5>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Agent Poll Interval</div>
+            <p class="settings-row-help">How often clients check in for new work.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="number" class="form-control form-control-narrow" name="agent_poll_interval"
+                   value="<?= (int) ($settings['agent_poll_interval'] ?? 30) ?>" min="10" max="300">
+            <span class="settings-row-unit">seconds</span>
+        </div>
+        <div class="settings-row-default">Default: 30 seconds</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Notify When Agent Offline</div>
+            <p class="settings-row-help">How long a client must be gone before an offline notification is sent. Brief network blips and short laptop suspends never become alerts; the client still shows offline immediately.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="number" class="form-control form-control-narrow" name="agent_offline_notify_minutes"
+                   value="<?= htmlspecialchars($settings['agent_offline_notify_minutes'] ?? '5') ?>" min="1" max="60">
+            <span class="settings-row-unit">minutes</span>
+        </div>
+        <div class="settings-row-default">Default: 5 minutes</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Auto-update agents when BBS updates</div>
+            <p class="settings-row-help">Queue an agent update for every outdated, online client after BBS updates, so agents stay in step with the server. Turning this off may have unexpected results.</p>
+        </div>
+        <div class="settings-row-control">
+            <div class="form-check form-switch mb-0">
+                <input class="form-check-input" type="checkbox" role="switch" name="auto_update_agents" value="1"
+                       id="autoUpdateAgents" <?= (($settings['auto_update_agents'] ?? '1') === '1') ? 'checked' : '' ?>>
+                <label class="form-check-label" for="autoUpdateAgents"
+                       data-on="On" data-off="Off"><?= (($settings['auto_update_agents'] ?? '1') === '1') ? 'On' : 'Off' ?></label>
+            </div>
+        </div>
+        <div class="settings-row-default">Default: On</div>
+    </div>
+
+    <h5 class="settings-group">Backup Monitoring</h5>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Stall Detection Timeout</div>
+            <p class="settings-row-help">Kill a backup that has reported no progress for this long. Raise it for very large files.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="number" class="form-control form-control-narrow" name="stall_timeout_minutes"
+                   value="<?= htmlspecialchars($settings['stall_timeout_minutes'] ?? '120') ?>" min="10" max="1440">
+            <span class="settings-row-unit">minutes</span>
+        </div>
+        <div class="settings-row-default">Default: 120 minutes</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Count files before a backup starts</div>
+            <p class="settings-row-help">Only affects a plan's first backup — after that the progress bar uses what the previous backup stored, which is exact. The first-run walk ignores the plan's exclude patterns, so on a plan that excludes a large directory it over-counts.</p>
+        </div>
+        <div class="settings-row-control">
+            <div class="form-check form-switch mb-0">
+                <input class="form-check-input" type="checkbox" role="switch" name="precount_files" value="1"
+                       id="precountFiles" <?= (($settings['precount_files'] ?? '1') === '1') ? 'checked' : '' ?>>
+                <label class="form-check-label" for="precountFiles"
+                       data-on="On" data-off="Off"><?= (($settings['precount_files'] ?? '1') === '1') ? 'On' : 'Off' ?></label>
+            </div>
+        </div>
+        <div class="settings-row-default">Default: On</div>
+    </div>
+
+    <h5 class="settings-group">Failure Recovery</h5>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Auto-retry backups when a client goes offline</div>
+            <p class="settings-row-help">Re-queue a backup that failed because the client disconnected mid-run. Real errors — a missing borg, a locked repository — are never retried.</p>
+        </div>
+        <div class="settings-row-control">
+            <div class="form-check form-switch mb-0">
+                <input class="form-check-input" type="checkbox" role="switch" name="auto_retry_failed_backups" value="1"
+                       id="autoRetryFailed" <?= (($settings['auto_retry_failed_backups'] ?? '1') === '1') ? 'checked' : '' ?>>
+                <label class="form-check-label" for="autoRetryFailed"
+                       data-on="On" data-off="Off"><?= (($settings['auto_retry_failed_backups'] ?? '1') === '1') ? 'On' : 'Off' ?></label>
+            </div>
+        </div>
+        <div class="settings-row-default">Default: On</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Max Retry Attempts</div>
+            <p class="settings-row-help">Cap on those retries per plan. Once exhausted a final email is sent, bypassing dedup, so a persistent failure is never hidden.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="number" class="form-control form-control-narrow" name="auto_retry_max_attempts"
+                   value="<?= htmlspecialchars($settings['auto_retry_max_attempts'] ?? '3') ?>" min="1" max="10">
+            <span class="settings-row-unit">attempts</span>
+        </div>
+        <div class="settings-row-default">Default: 3 attempts</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Give Up On Running Jobs After</div>
+            <p class="settings-row-help">How long a client must be silent <em>and</em> report no progress before its running backup is treated as dead. A busy client is hard to tell from a disconnected one, and a backup killed at the wrong moment restarts from the beginning.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="number" class="form-control form-control-narrow" name="job_offline_grace_minutes"
+                   value="<?= htmlspecialchars($settings['job_offline_grace_minutes'] ?? '5') ?>" min="1" max="120">
+            <span class="settings-row-unit">minutes</span>
+        </div>
+        <div class="settings-row-default">Default: 5 minutes</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Retry Backoff</div>
+            <p class="settings-row-help">Wait before the first retry, doubling each attempt and capped at an hour, so retries don't stack up while the client is still struggling.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="number" class="form-control form-control-narrow" name="auto_retry_backoff_minutes"
+                   value="<?= htmlspecialchars($settings['auto_retry_backoff_minutes'] ?? '5') ?>" min="1" max="60">
+            <span class="settings-row-unit">minutes</span>
+        </div>
+        <div class="settings-row-default">Default: 5 minutes</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Backup Overdue After</div>
+            <p class="settings-row-help">How long a client may go without a successful backup before health monitoring reports it as overdue. A client profile can override this per kind of machine &mdash; a laptop that is off for the weekend is not a fault, a database server silent for a day is.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="number" class="form-control form-control-narrow" name="backup_overdue_hours"
+                   value="<?= htmlspecialchars($settings['backup_overdue_hours'] ?? '48') ?>" min="1" max="8760">
+            <span class="settings-row-unit">hours</span>
+        </div>
+        <div class="settings-row-default">Default: 48 hours</div>
+    </div>
+
+    <h5 class="settings-group">Repository Maintenance</h5>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Weekly Compact Schedule</div>
+            <p class="settings-row-help">When repositories are auto-compacted to reclaim freed space. Runs at or after this time on the chosen day, so storage that isn't powered on around the clock still gets compacted.</p>
+            <p class="settings-row-help" id="compactTzNote">
+                <?php if ($compactTz !== ''): ?>
+                Time is in <strong><?= htmlspecialchars($compactTz) ?></strong><?= $compactTz !== $viewerTz ? '; changing it stores the time in your zone, ' . htmlspecialchars($viewerTz) : '' ?>.
+                <?php else: ?>
+                Time is in <strong>UTC</strong> until saved; saving stores it in your zone, <?= htmlspecialchars($viewerTz) ?>.
+                <?php endif; ?>
+            </p>
+        </div>
+        <div class="settings-row-control">
+            <input type="hidden" name="auto_compact_timezone" id="autoCompactTimezone" value="<?= htmlspecialchars($compactTz !== '' ? $compactTz : $viewerTz) ?>">
+            <select class="form-select" name="auto_compact_day" style="max-width:150px;" onchange="document.getElementById('autoCompactTimezone').value=<?= json_encode($viewerTz) ?>">
+                <?php foreach ($dayNames as $i => $dn): ?>
+                <option value="<?= $i ?>" <?= $compactDay === $i ? 'selected' : '' ?>><?= $dn ?></option>
+                <?php endforeach; ?>
+            </select>
+            <select class="form-select" name="auto_compact_hour" style="max-width:120px;" onchange="document.getElementById('autoCompactTimezone').value=<?= json_encode($viewerTz) ?>">
+                <?php for ($h = 0; $h < 24; $h++): ?>
+                <option value="<?= $h ?>" <?= $compactHour === $h ? 'selected' : '' ?>><?= sprintf('%02d:00', $h) ?></option>
+                <?php endfor; ?>
+            </select>
+        </div>
+        <div class="settings-row-default">Default: Saturday 02:00</div>
+    </div>
+
+    <div class="settings-actions">
+        <a href="/settings?tab=agent" class="btn btn-sm btn-outline-secondary">Cancel</a>
+        <button type="submit" class="btn btn-sm btn-primary">
+            <i class="bi bi-save me-1"></i> Save Changes
+        </button>
+    </div>
+</form>
+<?php endif; ?>
 
 <!-- General Tab -->
 <?php if ($activeTab === 'general'): ?>
+<div class="settings-page-head">
+    <h1 class="settings-page-title">General</h1>
+    <p class="settings-page-lede mb-0">Core configuration for this Borg Backup Server instance.</p>
+</div>
+
+<?php
+$mmOn = ($settings['maintenance_mode'] ?? '0') === '1';
+$sslEnabled = str_starts_with(\BBS\Core\Config::get('APP_URL', 'https://'), 'https://');
+?>
 <form method="POST" action="/settings">
     <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
     <input type="hidden" name="_tab" value="general">
+    <?php
+    // Declared dynamically: the debug row only renders with ?debug=1, and
+    // naming a toggle that isn't on screen is exactly the bug this mechanism
+    // exists to prevent — saving General would switch debug mode off.
+    $generalToggles = ['force_2fa', 'maintenance_mode', 'self_backup_catalogs', 'self_backup_enabled', 'telemetry_opt_out'];
+    $showDebugRow = isset($_GET['debug']) && $_GET['debug'] === '1';
+    if ($showDebugRow) { $generalToggles[] = 'debug_mode'; }
+    ?>
+    <input type="hidden" name="_checkboxes" value="<?= implode(',', $generalToggles) ?>">
 
-    <div class="row g-4">
-        <div class="col-lg-6">
-            <div class="card border-0 shadow-sm">
-                <div class="card-header fw-semibold">
-                    <i class="bi bi-server me-1"></i> Server
-                </div>
-                <div class="card-body">
-                    <?php $mmOn = ($settings['maintenance_mode'] ?? '0') === '1'; ?>
-                    <div class="rounded p-3 mb-3 d-flex align-items-center justify-content-between <?= $mmOn ? 'bg-warning bg-opacity-10 border border-warning' : 'bg-body-tertiary' ?>">
-                        <div>
-                            <div class="form-check form-switch mb-0">
-                                <input class="form-check-input" type="checkbox" role="switch" name="maintenance_mode" id="maintenance_mode" value="1" <?= $mmOn ? 'checked' : '' ?>>
-                                <label class="form-check-label fw-semibold" for="maintenance_mode">Maintenance Mode</label>
-                            </div>
-                            <div class="form-text mb-0">Pauses all new backup jobs. Existing running jobs will complete.</div>
-                        </div>
-                        <?php if ($mmOn): ?>
-                        <span class="badge bg-warning text-dark"><i class="bi bi-exclamation-triangle-fill me-1"></i>Active</span>
-                        <?php endif; ?>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label fw-semibold">Max Concurrent Jobs</label>
-                        <input type="number" class="form-control" name="max_queue" value="<?= htmlspecialchars($settings['max_queue'] ?? '4') ?>" min="1" max="20">
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label fw-semibold">Server Host / IP</label>
-                        <?php $currentUrl = \BBS\Core\Config::get('APP_URL', 'https://'); $sslEnabled = str_starts_with($currentUrl, 'https://'); ?>
-                        <div class="input-group">
-                            <select class="form-select" name="url_protocol" style="max-width: 110px;">
-                                <option value="https" <?= $sslEnabled ? 'selected' : '' ?>>https://</option>
-                                <option value="http" <?= !$sslEnabled ? 'selected' : '' ?>>http://</option>
-                            </select>
-                            <input type="text" class="form-control" name="server_host" value="<?= htmlspecialchars($settings['server_host'] ?? '') ?>">
-                        </div>
-                        <div class="form-text">The address agents use to reach this server. Use https:// for public servers, http:// for LAN/internal installs.
-                            <?php if (!$sslEnabled): ?>
-                                <br>To enable SSL, first obtain a certificate: <code>sudo certbot --apache -d <?= htmlspecialchars($settings['server_host'] ?? 'your-hostname') ?></code>
-                            <?php endif; ?>
-                        </div>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label fw-semibold">SSH Port</label>
-                        <input type="number" class="form-control" name="ssh_port" value="<?= (int) ($settings['ssh_port'] ?? 22) ?>" min="1" max="65535" style="max-width: 120px;">
-                        <div class="form-text">The SSH port agents use to connect for backups. Default is 22. Docker setups typically map to a different port (e.g. 2222).</div>
-                    </div>
-                </div>
+    <h5 class="settings-group">Server</h5>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">
+                Maintenance Mode
+                <?php if ($mmOn): ?>
+                    <span class="badge bg-warning text-dark ms-1"><i class="bi bi-exclamation-triangle-fill me-1"></i>Active</span>
+                <?php endif; ?>
             </div>
-
-            <div class="card border-0 shadow-sm mt-4">
-                <div class="card-header fw-semibold">
-                    <i class="bi bi-incognito me-1"></i> Agent
-                </div>
-                <div class="card-body">
-                    <div class="mb-3">
-                        <label class="form-label fw-semibold">Agent Poll Interval (seconds)</label>
-                        <input type="number" class="form-control" name="agent_poll_interval" value="<?= htmlspecialchars($settings['agent_poll_interval'] ?? '30') ?>" min="5" max="300">
-                        <div class="form-text">How often agents check for new tasks.</div>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label fw-semibold">Stall Detection Timeout (minutes)</label>
-                        <input type="number" class="form-control" name="stall_timeout_minutes" value="<?= htmlspecialchars($settings['stall_timeout_minutes'] ?? '120') ?>" min="10" max="1440">
-                        <div class="form-text">Kill backup jobs with no progress after this many minutes. Set higher for large files. Default: 120 (2 hours).</div>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label fw-semibold">Weekly Compact Schedule</label>
-                        <?php
-                            $compactDay  = (int) ($settings['auto_compact_day'] ?? 6);
-                            $compactHour = (int) ($settings['auto_compact_hour'] ?? 2);
-                            $dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
-                        ?>
-                        <div class="d-flex gap-2">
-                            <select class="form-select" name="auto_compact_day">
-                                <?php foreach ($dayNames as $i => $dn): ?>
-                                <option value="<?= $i ?>"<?= $i === $compactDay ? ' selected' : '' ?>><?= $dn ?></option>
-                                <?php endforeach; ?>
-                            </select>
-                            <select class="form-select" name="auto_compact_hour">
-                                <?php for ($h = 0; $h < 24; $h++): ?>
-                                <option value="<?= $h ?>"<?= $h === $compactHour ? ' selected' : '' ?>><?= sprintf('%02d:00', $h) ?></option>
-                                <?php endfor; ?>
-                            </select>
-                        </div>
-                        <div class="form-text">When repositories are auto-compacted (reclaims freed space) each week. Runs at or after this time on the chosen day, so storage that isn't powered on 24/7 still gets compacted. Default: Saturday 02:00.</div>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label fw-semibold">Notify When Agent Offline (minutes)</label>
-                        <input type="number" class="form-control" name="agent_offline_notify_minutes" value="<?= htmlspecialchars($settings['agent_offline_notify_minutes'] ?? '5') ?>" min="1" max="60">
-                        <div class="form-text">Wait this long before firing an "agent offline" notification or push. Brief network blips and short laptop suspends never become alerts. The agent still <em>shows</em> as offline immediately on dashboards — only the outbound notification is delayed. Default: 5.</div>
-                    </div>
-                    <div class="mb-3">
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox" name="auto_retry_failed_backups" value="1"
-                                   id="autoRetryFailed" <?= (($settings['auto_retry_failed_backups'] ?? '1') === '1') ? 'checked' : '' ?>>
-                            <label class="form-check-label fw-semibold" for="autoRetryFailed">
-                                Auto-retry backups when agent goes offline
-                            </label>
-                        </div>
-                        <div class="form-text">
-                            If a backup fails because the agent disconnects mid-run (laptop closed, network drop), automatically re-queue it so it picks up when the agent reconnects. Real errors (borg path missing, repo locked, etc.) are not retried.
-                        </div>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label fw-semibold">Max Retry Attempts</label>
-                        <input type="number" class="form-control" name="auto_retry_max_attempts" value="<?= htmlspecialchars($settings['auto_retry_max_attempts'] ?? '3') ?>" min="1" max="10">
-                        <div class="form-text">Cap on offline-induced retries per plan. Once exhausted, a final email is sent (bypassing dedup) so persistent failures aren't hidden. Default: 3.</div>
-                    </div>
-                    <div class="mb-3">
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox" name="auto_update_agents" value="1"
-                                   id="autoUpdateAgents" <?= (($settings['auto_update_agents'] ?? '1') === '1') ? 'checked' : '' ?>>
-                            <label class="form-check-label fw-semibold" for="autoUpdateAgents">
-                                Auto-update agents when BBS updates
-                            </label>
-                        </div>
-                        <div class="form-text">
-                            After BBS updates to a new version, automatically queue an agent update for every outdated, online client so agents stay in sync. Updates the agent script through the normal mechanism. Default: on.
-                        </div>
-                    </div>
-                </div>
+            <p class="settings-row-help">Pauses the job queue. Nothing new starts, including server-side jobs such as prune and offsite sync. Jobs already running finish normally.</p>
+        </div>
+        <div class="settings-row-control">
+            <div class="form-check form-switch mb-0">
+                <input class="form-check-input" type="checkbox" role="switch" name="maintenance_mode" value="1"
+                       id="maintenance_mode" <?= $mmOn ? 'checked' : '' ?>>
+                <label class="form-check-label" for="maintenance_mode"
+                       data-on="On" data-off="Off"><?= $mmOn ? 'On' : 'Off' ?></label>
             </div>
         </div>
-
-        <div class="col-lg-6">
-            <div class="card border-0 shadow-sm">
-                <div class="card-header fw-semibold">
-                    <i class="bi bi-shield-lock me-1"></i> Security
-                </div>
-                <div class="card-body">
-                    <div class="mb-3">
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox" name="force_2fa" value="1"
-                                   id="force2fa" <?= ($settings['force_2fa'] ?? '0') === '1' ? 'checked' : '' ?>>
-                            <label class="form-check-label fw-semibold" for="force2fa">
-                                Require Two-Factor Authentication for All Users
-                            </label>
-                        </div>
-                        <div class="form-text">
-                            When enabled, users without 2FA will be redirected to set it up on their next page load.
-                        </div>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label fw-semibold">Session Timeout (hours)</label>
-                        <input type="number" class="form-control" name="session_timeout_hours" value="<?= htmlspecialchars($settings['session_timeout_hours'] ?? '8') ?>" min="1" max="720">
-                        <div class="form-text">Log out after this many hours of inactivity.</div>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label fw-semibold">Default Theme</label>
-                        <select class="form-select" name="default_theme">
-                            <option value="dark" <?= ($settings['default_theme'] ?? 'dark') === 'dark' ? 'selected' : '' ?>>Dark</option>
-                            <option value="light" <?= ($settings['default_theme'] ?? 'dark') === 'light' ? 'selected' : '' ?>>Light</option>
-                        </select>
-                        <div class="form-text">Default theme for the login page and new users. Users can override this in their profile.</div>
-                    </div>
-                    <?php if (isset($_GET['debug']) && $_GET['debug'] === '1'): ?>
-                    <div class="mb-0">
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox" name="debug_mode" value="1"
-                                   id="debugMode" <?= ($settings['debug_mode'] ?? '0') === '1' ? 'checked' : '' ?>>
-                            <label class="form-check-label fw-semibold" for="debugMode">
-                                Enable Debug Mode
-                            </label>
-                        </div>
-                        <div class="form-text">
-                            Shows detailed error pages with stack traces. Disable in production for security.
-                        </div>
-                    </div>
-                    <?php endif; ?>
-                </div>
-            </div>
-
-            <div class="card border-0 shadow-sm mt-4">
-                <div class="card-header fw-semibold">
-                    <i class="bi bi-shield-check me-1"></i> Server Backups
-                </div>
-                <div class="card-body">
-                    <div class="mb-3">
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox" name="self_backup_enabled" value="1"
-                                   id="selfBackupEnabled" <?= ($settings['self_backup_enabled'] ?? '1') === '1' ? 'checked' : '' ?>>
-                            <label class="form-check-label fw-semibold" for="selfBackupEnabled">
-                                Enable Daily Server Backups
-                            </label>
-                        </div>
-                        <div class="form-text">
-                            Automatically backs up the database, configuration, and SSH keys to <code>/var/bbs/backups</code> once per day.
-                        </div>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label fw-semibold">Keep Last</label>
-                        <div class="input-group" style="max-width: 200px;">
-                            <input type="number" class="form-control" name="self_backup_retention"
-                                   value="<?= htmlspecialchars($settings['self_backup_retention'] ?? '7') ?>"
-                                   min="1" max="90">
-                            <span class="input-group-text">backups</span>
-                        </div>
-                        <div class="form-text">Older backups are automatically deleted.</div>
-                    </div>
-                    <div class="mb-3">
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox" name="self_backup_catalogs" value="1"
-                                   id="selfBackupCatalogs" <?= ($settings['self_backup_catalogs'] ?? '0') === '1' ? 'checked' : '' ?>>
-                            <label class="form-check-label fw-semibold" for="selfBackupCatalogs">
-                                Include File Catalog Data
-                            </label>
-                        </div>
-                        <div class="form-text">
-                            Catalogs can be large but save time on restore. If excluded, they will be rebuilt automatically from your repositories.
-                        </div>
-                    </div>
-                    <div class="alert alert-info mb-0 small">
-                        <i class="bi bi-info-circle me-1"></i>
-                        <?php if (\BBS\Core\Config::isHosted()): ?>
-                        To back up your server settings off-site, make sure you've added S3 Storage in your Hosted Account.
-                        <?php else: ?>
-                        Server backups include the database, configuration, and SSH host keys &mdash; <strong>not repository data</strong>.
-                        To protect your backup repositories, configure <a href="/settings?tab=offsite" class="alert-link">S3 Offsite Sync</a>.
-                        <?php endif; ?>
-                    </div>
-                </div>
-            </div>
-        </div>
+        <div class="settings-row-default">Default: Off</div>
     </div>
 
-    <div class="card border-0 shadow-sm mt-4">
-        <div class="card-header fw-semibold">
-            <i class="bi bi-bar-chart me-1"></i> Usage Statistics
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Server Host / IP</div>
+            <p class="settings-row-help">The address clients use to reach this server. Use https:// for public servers, http:// for a LAN or internal install. Changing it rewrites the repository paths of every client without an override.</p>
         </div>
-        <div class="card-body">
-            <div class="form-check">
-                <input class="form-check-input" type="checkbox" name="telemetry_opt_out" value="1"
+        <div class="settings-row-control">
+            <select class="form-select" name="url_protocol" style="max-width:110px;">
+                <option value="https" <?= $sslEnabled ? 'selected' : '' ?>>https://</option>
+                <option value="http" <?= !$sslEnabled ? 'selected' : '' ?>>http://</option>
+            </select>
+            <input type="text" class="form-control" name="server_host" style="max-width:260px;"
+                   value="<?= htmlspecialchars($settings['server_host'] ?? '') ?>" placeholder="backup.example.com">
+        </div>
+        <div class="settings-row-default">&nbsp;</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">SSH Port</div>
+            <p class="settings-row-help">The port clients connect to for backups. Docker installs usually map this to something else.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="number" class="form-control form-control-narrow" name="ssh_port"
+                   value="<?= (int) ($settings['ssh_port'] ?? 22) ?>" min="1" max="65535">
+        </div>
+        <div class="settings-row-default">Default: 22</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Max Concurrent Jobs</div>
+            <p class="settings-row-help">How many backups may run at once across all clients. A disk or host on the Storage page can set a lower limit of its own.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="number" class="form-control form-control-narrow" name="max_queue"
+                   value="<?= htmlspecialchars($settings['max_queue'] ?? '4') ?>" min="1" max="20">
+            <span class="settings-row-unit">jobs</span>
+        </div>
+        <div class="settings-row-default">Default: 4 jobs</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Max Concurrent Offsite Syncs</div>
+            <p class="settings-row-help">How many offsite syncs and restores may run at once across all repositories. The others wait their turn; backups are never held up behind them. 0 for unlimited.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="number" class="form-control form-control-narrow" name="s3_max_concurrent"
+                   value="<?= (int) ($settings['s3_max_concurrent'] ?? 4) ?>" min="0" max="50">
+            <span class="settings-row-unit">syncs</span>
+        </div>
+        <div class="settings-row-default">Default: 4 syncs</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Low-Storage Alert At</div>
+            <p class="settings-row-help">How full a storage location may get before it raises a low-space alert. The same figure decides when <code>/api/v1/health</code> reports a storage warning.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="number" class="form-control form-control-narrow" name="storage_alert_threshold"
+                   value="<?= htmlspecialchars($settings['storage_alert_threshold'] ?? '90') ?>" min="50" max="99">
+            <span class="settings-row-unit">% full</span>
+        </div>
+        <div class="settings-row-default">Default: 90% full</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Default Theme</div>
+            <p class="settings-row-help">Used for the login page and new users. Anyone can override it in their profile.</p>
+        </div>
+        <div class="settings-row-control">
+            <select class="form-select" name="default_theme" style="max-width:150px;">
+                <option value="dark" <?= ($settings['default_theme'] ?? 'dark') === 'dark' ? 'selected' : '' ?>>Dark</option>
+                <option value="light" <?= ($settings['default_theme'] ?? 'dark') === 'light' ? 'selected' : '' ?>>Light</option>
+            </select>
+        </div>
+        <div class="settings-row-default">Default: Dark</div>
+    </div>
+
+    <h5 class="settings-group">Security</h5>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Require Two-Factor Authentication</div>
+            <p class="settings-row-help">Users without 2FA are sent to set it up on their next page load.</p>
+        </div>
+        <div class="settings-row-control">
+            <div class="form-check form-switch mb-0">
+                <input class="form-check-input" type="checkbox" role="switch" name="force_2fa" value="1"
+                       id="force2fa" <?= ($settings['force_2fa'] ?? '0') === '1' ? 'checked' : '' ?>>
+                <label class="form-check-label" for="force2fa"
+                       data-on="On" data-off="Off"><?= ($settings['force_2fa'] ?? '0') === '1' ? 'On' : 'Off' ?></label>
+            </div>
+        </div>
+        <div class="settings-row-default">Default: Off</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Session Timeout</div>
+            <p class="settings-row-help">Log out after this long without activity.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="number" class="form-control form-control-narrow" name="session_timeout_hours"
+                   value="<?= htmlspecialchars($settings['session_timeout_hours'] ?? '8') ?>" min="1" max="720">
+            <span class="settings-row-unit">hours</span>
+        </div>
+        <div class="settings-row-default">Default: 8 hours</div>
+    </div>
+
+    <?php if ($showDebugRow): ?>
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Debug Mode</div>
+            <p class="settings-row-help">Shows detailed error pages with stack traces. Leave off in production.</p>
+        </div>
+        <div class="settings-row-control">
+            <div class="form-check form-switch mb-0">
+                <input class="form-check-input" type="checkbox" role="switch" name="debug_mode" value="1"
+                       id="debugMode" <?= ($settings['debug_mode'] ?? '0') === '1' ? 'checked' : '' ?>>
+                <label class="form-check-label" for="debugMode"
+                       data-on="On" data-off="Off"><?= ($settings['debug_mode'] ?? '0') === '1' ? 'On' : 'Off' ?></label>
+            </div>
+        </div>
+        <div class="settings-row-default">Default: Off</div>
+    </div>
+    <?php endif; ?>
+
+    <h5 class="settings-group">Server Backups</h5>
+    <p class="settings-group-note">
+        <?php if (\BBS\Core\Config::isHosted()): ?>
+        These cover the database, configuration and SSH host keys &mdash; <strong>not repository data</strong>. To keep them off-site, add S3 storage to your hosted account.
+        <?php else: ?>
+        These cover the database, configuration and SSH host keys &mdash; <strong>not repository data</strong>. To protect the repositories themselves, configure <a href="/storage-locations?section=s3">S3 offsite sync</a>.
+        <?php endif; ?>
+    </p>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Daily Server Backup</div>
+            <p class="settings-row-help">Backs up the database, configuration and SSH keys to <code>/var/bbs/backups</code> once a day.</p>
+        </div>
+        <div class="settings-row-control">
+            <div class="form-check form-switch mb-0">
+                <input class="form-check-input" type="checkbox" role="switch" name="self_backup_enabled" value="1"
+                       id="selfBackupEnabled" <?= ($settings['self_backup_enabled'] ?? '1') === '1' ? 'checked' : '' ?>>
+                <label class="form-check-label" for="selfBackupEnabled"
+                       data-on="On" data-off="Off"><?= ($settings['self_backup_enabled'] ?? '1') === '1' ? 'On' : 'Off' ?></label>
+            </div>
+        </div>
+        <div class="settings-row-default">Default: On</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Keep Last</div>
+            <p class="settings-row-help">Older server backups are deleted automatically.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="number" class="form-control form-control-narrow" name="self_backup_retention"
+                   value="<?= htmlspecialchars($settings['self_backup_retention'] ?? '7') ?>" min="1" max="90">
+            <span class="settings-row-unit">backups</span>
+        </div>
+        <div class="settings-row-default">Default: 7 backups</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Include File Catalog Data</div>
+            <p class="settings-row-help">Catalogs can be large but save time on a restore. Left out, they are rebuilt from the repositories.</p>
+        </div>
+        <div class="settings-row-control">
+            <div class="form-check form-switch mb-0">
+                <input class="form-check-input" type="checkbox" role="switch" name="self_backup_catalogs" value="1"
+                       id="selfBackupCatalogs" <?= ($settings['self_backup_catalogs'] ?? '0') === '1' ? 'checked' : '' ?>>
+                <label class="form-check-label" for="selfBackupCatalogs"
+                       data-on="On" data-off="Off"><?= ($settings['self_backup_catalogs'] ?? '0') === '1' ? 'On' : 'Off' ?></label>
+            </div>
+        </div>
+        <div class="settings-row-default">Default: Off</div>
+    </div>
+
+    <h5 class="settings-group">Usage Statistics</h5>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Disable Anonymous Usage Statistics</div>
+            <p class="settings-row-help">BBS reports its version and OS once per version, so the developer knows which versions and platforms are in use. Nothing identifying is collected.</p>
+        </div>
+        <div class="settings-row-control">
+            <div class="form-check form-switch mb-0">
+                <input class="form-check-input" type="checkbox" role="switch" name="telemetry_opt_out" value="1"
                        id="telemetryOptOut" <?= ($settings['telemetry_opt_out'] ?? '0') === '1' ? 'checked' : '' ?>>
-                <label class="form-check-label fw-semibold" for="telemetryOptOut">
-                    Disable Anonymous Usage Statistics
-                </label>
-            </div>
-            <div class="form-text">
-                BBS sends anonymous version and OS information once per version to help the developer understand what versions and platforms are in use. No identifying data is collected.
+                <label class="form-check-label" for="telemetryOptOut"
+                       data-on="On" data-off="Off"><?= ($settings['telemetry_opt_out'] ?? '0') === '1' ? 'On' : 'Off' ?></label>
             </div>
         </div>
+        <div class="settings-row-default">Default: Off</div>
     </div>
 
-    <div class="mt-4">
-        <button type="submit" class="btn btn-warning">
-            <i class="bi bi-check-lg me-1"></i> Save General Settings
-        </button>
+    <div class="settings-actions">
+        <a href="/settings?tab=general" class="btn btn-sm btn-outline-secondary">Cancel</a>
+        <button type="submit" class="btn btn-sm btn-primary"><i class="bi bi-save me-1"></i> Save Changes</button>
     </div>
 </form>
 <?php endif; ?>
 
 <!-- Email Settings Tab -->
 <?php if ($activeTab === 'notifications'): ?>
+<div class="settings-page-head">
+    <h1 class="settings-page-title">Email Settings</h1>
+    <p class="settings-page-lede mb-0">Outgoing mail for password resets, upgrade notices and other system messages.</p>
+</div>
+
+<?php
+$smtpPortForDefault = (int) ($settings['smtp_port'] ?? 587);
+$smtpSecure = $settings['smtp_secure'] ?? match ($smtpPortForDefault) {
+    465 => 'ssl',
+    25 => 'none',
+    default => 'starttls',
+};
+?>
 <?php if (!empty($smtpWarning)): ?>
 <div class="alert alert-warning d-flex align-items-start mb-4" role="alert">
     <i class="bi bi-exclamation-triangle-fill me-2 mt-1"></i>
     <div>
         <strong>Email notifications won't actually send.</strong>
-        One or more <em>Email on …</em> toggles below are enabled, but SMTP isn't configured yet — failure events fire the in-app notification only and the email is silently skipped. Fill in the SMTP card below and click <em>Test SMTP</em> to verify.
-    </div>
-</div>
-<?php endif; ?>
-<div class="row g-4">
-    <div class="col-lg-7">
-        <div class="card border-0 shadow-sm">
-            <div class="card-header fw-semibold">
-                <i class="bi bi-envelope me-1"></i> SMTP Configuration
-            </div>
-            <div class="card-body">
-                <form method="POST" action="/settings">
-                    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-                    <input type="hidden" name="_tab" value="notifications">
-
-                    <div class="row g-3 mb-3">
-                        <div class="col-md-8">
-                            <label class="form-label fw-semibold">SMTP Host</label>
-                            <input type="text" class="form-control" name="smtp_host" value="<?= htmlspecialchars($settings['smtp_host'] ?? '') ?>" placeholder="smtp.example.com">
-                        </div>
-                        <div class="col-md-4">
-                            <label class="form-label fw-semibold">Port</label>
-                            <input type="number" class="form-control" name="smtp_port" value="<?= htmlspecialchars($settings['smtp_port'] ?? '587') ?>">
-                        </div>
-                    </div>
-                    <div class="row g-3 mb-3">
-                        <div class="col-md-6">
-                            <label class="form-label fw-semibold">SMTP User</label>
-                            <input type="text" class="form-control" name="smtp_user" value="<?= htmlspecialchars($settings['smtp_user'] ?? '') ?>">
-                        </div>
-                        <div class="col-md-6">
-                            <label class="form-label fw-semibold">SMTP Password</label>
-                            <input type="password" class="form-control" name="smtp_pass"
-                                   autocomplete="new-password"
-                                   placeholder="<?= !empty($settings['smtp_pass']) ? '(unchanged if empty)' : '' ?>">
-                        </div>
-                    </div>
-                    <?php
-                    // Default encryption choice based on port when smtp_secure is unset.
-                    $smtpPortForDefault = (int) ($settings['smtp_port'] ?? 587);
-                    $smtpSecureDefault = match ($smtpPortForDefault) {
-                        465 => 'ssl',
-                        25 => 'none',
-                        default => 'starttls',
-                    };
-                    $smtpSecure = $settings['smtp_secure'] ?? $smtpSecureDefault;
-                    ?>
-                    <div class="row g-3 mb-3">
-                        <div class="col-md-6">
-                            <label class="form-label fw-semibold">Encryption</label>
-                            <select class="form-select" name="smtp_secure">
-                                <option value="starttls" <?= $smtpSecure === 'starttls' ? 'selected' : '' ?>>STARTTLS (typically port 587)</option>
-                                <option value="ssl" <?= $smtpSecure === 'ssl' ? 'selected' : '' ?>>SSL/TLS (typically port 465)</option>
-                                <option value="none" <?= $smtpSecure === 'none' ? 'selected' : '' ?>>None (plaintext)</option>
-                            </select>
-                        </div>
-                        <div class="col-md-6">
-                            <label class="form-label fw-semibold">From Address</label>
-                            <input type="email" class="form-control" name="smtp_from" value="<?= htmlspecialchars($settings['smtp_from'] ?? '') ?>" placeholder="backups@example.com">
-                        </div>
-                    </div>
-
-                    <div class="d-flex align-items-center gap-3">
-                        <button type="submit" class="btn btn-warning">
-                            <i class="bi bi-check-lg me-1"></i> Save Email Settings
-                        </button>
-                        <button type="button" class="btn btn-outline-secondary" id="btnTestSmtp">
-                            <i class="bi bi-envelope-check me-1"></i> Test SMTP
-                        </button>
-                        <span id="smtpTestResult" class="small"></span>
-                    </div>
-                </form>
-            </div>
-        </div>
-    </div>
-
-    <div class="col-lg-5">
-        <div class="card border-0 shadow-sm mb-3">
-            <div class="card-header fw-semibold">
-                <i class="bi bi-bell me-1"></i> In-App Notifications
-            </div>
-            <div class="card-body">
-                <form method="POST" action="/settings">
-                    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-                    <input type="hidden" name="_tab" value="notifications">
-                    <div class="form-check form-switch mb-2">
-                        <input class="form-check-input" type="checkbox" role="switch"
-                               id="inapp_notify_success_events" name="inapp_notify_success_events" value="1"
-                               <?= ($settings['inapp_notify_success_events'] ?? '0') === '1' ? 'checked' : '' ?>>
-                        <label class="form-check-label" for="inapp_notify_success_events">
-                            Show successful backups / restores in the notification bell
-                        </label>
-                    </div>
-                    <p class="small text-muted mb-3">
-                        Off by default. When off, only failures, agent-offline, storage-low, and other
-                        alert-worthy events show up in the bell menu — so routine success messages
-                        don't pile up and bury real issues. Email and push notifications stay
-                        independent of this setting.
-                    </p>
-                    <button type="submit" class="btn btn-sm btn-warning">
-                        <i class="bi bi-check-lg me-1"></i> Save
-                    </button>
-                </form>
-            </div>
-        </div>
-        <div class="card border-0 bg-body-secondary">
-            <div class="card-body">
-                <h6 class="card-title"><i class="bi bi-lightbulb me-1 text-warning"></i> Tip</h6>
-                <p class="card-text small text-muted mb-2">
-                    Email settings are used for password resets, upgrade notices, and other system messages.
-                </p>
-                <p class="card-text small text-muted mb-0">
-                    For backup alerts (failures, offline clients, storage warnings), configure
-                    <a href="/settings?tab=push">Push Notifications</a> using Discord, Slack, Telegram, or 100+ other services.
-                </p>
-            </div>
-        </div>
+        Something is set to notify by email, but SMTP isn't configured — those events fire the in-app notification only and the email is skipped. Fill in the fields below and use <em>Send Test Email</em> to check.
     </div>
 </div>
 <?php endif; ?>
 
+<div class="alert alert-info small d-flex align-items-center mt-4" role="note">
+    <i class="bi bi-info-circle me-2 flex-shrink-0"></i>
+    <div>For backup alerts &mdash; failures, offline clients, storage warnings &mdash; see <a href="/settings?tab=push" class="alert-link">Apprise</a>, which covers Discord, Slack, Telegram and many others.</div>
+</div>
+
+<form method="POST" action="/settings">
+    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+    <input type="hidden" name="_tab" value="notifications">
+    <input type="hidden" name="_checkboxes" value="inapp_notify_success_events">
+
+    <h5 class="settings-group">Outgoing Mail</h5>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">SMTP Server</div>
+            <p class="settings-row-help">Host and port of the mail server to send through.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="text" class="form-control" name="smtp_host" style="max-width:250px;"
+                   value="<?= htmlspecialchars($settings['smtp_host'] ?? '') ?>" placeholder="smtp.example.com">
+            <input type="number" class="form-control form-control-narrow" name="smtp_port"
+                   value="<?= htmlspecialchars($settings['smtp_port'] ?? '587') ?>" placeholder="587">
+        </div>
+        <div class="settings-row-default">Default port: 587</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Encryption</div>
+            <p class="settings-row-help">Match this to the port — the wrong pairing is the usual reason mail silently fails.</p>
+        </div>
+        <div class="settings-row-control">
+            <select class="form-select" name="smtp_secure" style="max-width:280px;">
+                <option value="starttls" <?= $smtpSecure === 'starttls' ? 'selected' : '' ?>>STARTTLS (typically port 587)</option>
+                <option value="ssl" <?= $smtpSecure === 'ssl' ? 'selected' : '' ?>>SSL/TLS (typically port 465)</option>
+                <option value="none" <?= $smtpSecure === 'none' ? 'selected' : '' ?>>None (plaintext)</option>
+            </select>
+        </div>
+        <div class="settings-row-default">Default: STARTTLS</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Credentials</div>
+            <p class="settings-row-help">Leave the password blank to keep the stored one. Leave both blank if the server accepts unauthenticated mail from this host.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="text" class="form-control" name="smtp_user" style="max-width:220px;"
+                   value="<?= htmlspecialchars($settings['smtp_user'] ?? '') ?>" placeholder="username">
+            <input type="password" class="form-control" name="smtp_pass" style="max-width:220px;"
+                   autocomplete="new-password"
+                   placeholder="<?= !empty($settings['smtp_pass']) ? '(unchanged if empty)' : 'password' ?>">
+        </div>
+        <div class="settings-row-default">&nbsp;</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">From Address</div>
+            <p class="settings-row-help">Who the mail appears to come from. Some providers require this to match the account.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="email" class="form-control" name="smtp_from" style="max-width:280px;"
+                   value="<?= htmlspecialchars($settings['smtp_from'] ?? '') ?>" placeholder="backups@example.com">
+        </div>
+        <div class="settings-row-default">&nbsp;</div>
+    </div>
+
+    <h5 class="settings-group">In-App Notifications</h5>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Show successful backups in the bell</div>
+            <p class="settings-row-help">Off by default, so the bell holds failures, offline clients, low storage and other things worth acting on rather than burying them under routine successes. Email and push are unaffected.</p>
+        </div>
+        <div class="settings-row-control">
+            <div class="form-check form-switch mb-0">
+                <input class="form-check-input" type="checkbox" role="switch" name="inapp_notify_success_events" value="1"
+                       id="inapp_notify_success_events" <?= ($settings['inapp_notify_success_events'] ?? '0') === '1' ? 'checked' : '' ?>>
+                <label class="form-check-label" for="inapp_notify_success_events"
+                       data-on="On" data-off="Off"><?= ($settings['inapp_notify_success_events'] ?? '0') === '1' ? 'On' : 'Off' ?></label>
+            </div>
+        </div>
+        <div class="settings-row-default">Default: Off</div>
+    </div>
+
+    <div class="settings-actions">
+        <span id="smtpTestResult" class="small me-auto"></span>
+        <button type="button" class="btn btn-sm btn-outline-secondary" id="btnTestSmtp">
+            <i class="bi bi-envelope-check me-1"></i> Send Test Email
+        </button>
+        <a href="/settings?tab=notifications" class="btn btn-sm btn-outline-secondary">Cancel</a>
+        <button type="submit" class="btn btn-sm btn-primary"><i class="bi bi-save me-1"></i> Save Changes</button>
+    </div>
+</form>
+<?php endif; ?>
 
 <!-- Push Notifications Tab -->
 <?php if ($activeTab === 'push'): ?>
@@ -472,8 +618,9 @@ $eventGroups = [
     ],
     'Storage' => [
         'storage_low' => 'Storage Low',
-        's3_sync_failed' => 'S3 Sync Failed',
-        's3_sync_done' => 'S3 Sync Done',
+        'certificate_expiring' => 'SSL Certificate Expiring',
+        's3_sync_failed' => 'Offsite Sync Failed',
+        's3_sync_done' => 'Offsite Sync Done',
     ],
     'Schedules' => [
         'missed_schedule' => 'Missed Schedule',
@@ -501,6 +648,7 @@ $eventColors = [
     'backup_warning' => 'warning',
     'agent_offline' => 'warning',
     'storage_low' => 'warning',
+    'certificate_expiring' => 'warning',
     'missed_schedule' => 'warning',
 ];
 $notifServices = $this->db->fetchAll("SELECT * FROM notification_services ORDER BY name ASC");
@@ -510,49 +658,16 @@ foreach ($notifServices as &$ns) {
 unset($ns);
 ?>
 
-<div class="d-flex justify-content-between align-items-center mb-3">
+<div class="settings-page-head d-flex justify-content-between align-items-start">
     <div>
-        <p class="text-muted mb-0 small">Send alerts to Discord, Telegram, Slack, Pushover, and <a href="https://github.com/caronc/apprise/wiki#notification-services" target="_blank">100+ other services</a> using Apprise.</p>
+        <h1 class="settings-page-title">Apprise Notifications</h1>
+        <p class="settings-page-lede mb-0">Send alerts to Discord, Telegram, Slack, Pushover and <a href="https://github.com/caronc/apprise/wiki#notification-services" target="_blank">100+ other services</a> using Apprise. Each service chooses which events it wants.</p>
     </div>
-    <button class="btn btn-success" data-bs-toggle="collapse" data-bs-target="#addServiceForm">
+    <button class="btn btn-sm btn-success flex-shrink-0 ms-3" data-bs-toggle="collapse" data-bs-target="#addServiceForm">
         <i class="bi bi-plus-circle me-1"></i> Add Service
     </button>
 </div>
 
-<!-- Info banner with URL examples -->
-<div class="alert alert-light border mb-4">
-    <div class="d-flex align-items-start">
-        <i class="bi bi-info-circle text-primary me-2 mt-1"></i>
-        <div class="w-100">
-            <a class="small text-decoration-none" data-bs-toggle="collapse" href="#urlExamples" role="button">
-                <i class="bi bi-chevron-down me-1"></i>Show Service URL Examples
-            </a>
-            <div class="collapse mt-2" id="urlExamples">
-                <div class="bg-body-secondary rounded p-3 font-monospace small">
-                    <div class="row">
-                        <div class="col-md-6">
-                            <strong>Discord:</strong> discord://webhook_id/webhook_token<br>
-                            <strong>Telegram:</strong> tgram://bot_token/chat_id[:thread]<br>
-                            <strong>Slack:</strong> slack://tokenA/tokenB/tokenC<br>
-                            <strong>Pushover:</strong> pover://user@token
-                        </div>
-                        <div class="col-md-6">
-                            <strong>ntfy:</strong> ntfy://topic<br>
-                            <strong>Gotify:</strong> gotify://hostname/token<br>
-                            <strong>Email:</strong> mailto://user:pass@smtp.example.com<br>
-                            <strong>Webhook:</strong> json://your-webhook-url
-                        </div>
-                    </div>
-                    <div class="mt-2">
-                        <a href="https://github.com/caronc/apprise/wiki#notification-services" target="_blank" class="text-decoration-none">
-                            View all supported services <i class="bi bi-box-arrow-up-right"></i>
-                        </a>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-</div>
 
 <!-- Add Service Form (Collapse) -->
 <div class="collapse mb-4" id="addServiceForm">
@@ -617,7 +732,7 @@ unset($ns);
                             <div class="form-check">
                                 <input class="form-check-input" type="checkbox" name="events[<?= $event ?>]"
                                        value="1" id="addEvent_<?= $event ?>"
-                                       <?= str_contains($event, 'failed') || $event === 'agent_offline' || $event === 'storage_low' || $event === 'missed_schedule' ? 'checked' : '' ?>>
+                                       <?= str_contains($event, 'failed') || $event === 'agent_offline' || $event === 'storage_low' || $event === 'certificate_expiring' || $event === 'missed_schedule' ? 'checked' : '' ?>>
                                 <label class="form-check-label" for="addEvent_<?= $event ?>">
                                     <?= htmlspecialchars($label) ?>
                                 </label>
@@ -630,7 +745,7 @@ unset($ns);
                 </div>
 
                 <div>
-                    <button type="submit" class="btn btn-success">
+                    <button type="submit" class="btn btn-sm btn-success">
                         <i class="bi bi-plus-circle me-1"></i> Create Service
                     </button>
                     <button type="button" class="btn btn-outline-secondary ms-2" data-bs-toggle="collapse" data-bs-target="#addServiceForm">
@@ -644,10 +759,12 @@ unset($ns);
 
 <!-- Services Table -->
 <?php if (!empty($notifServices)): ?>
-<div class="card border-0 shadow-sm">
+<h5 class="settings-group">Connected Services</h5>
+<p class="settings-group-note">Manage your Apprise services and the events they subscribe to.</p>
+<div>
     <div class="table-responsive d-none d-md-block">
-        <table class="table table-hover align-middle mb-0">
-            <thead class="table-light">
+        <table class="table table-hover align-middle mb-0 settings-table">
+            <thead>
                 <tr>
                     <th>Service</th>
                     <th class="text-center" style="width: 100px;">Status</th>
@@ -784,15 +901,15 @@ unset($ns);
                                     </button>
                                 </div>
                                 <div>
-                                    <form method="POST" action="/notification-services/<?= $service['id'] ?>/toggle" class="d-inline">
-                                        <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-                                        <button type="submit" class="btn btn-sm btn-outline-<?= $service['enabled'] ? 'warning' : 'success' ?>">
-                                            <i class="bi bi-<?= $service['enabled'] ? 'pause-circle' : 'play-circle' ?> me-1"></i>
-                                            <?= $service['enabled'] ? 'Disable' : 'Enable' ?>
-                                        </button>
-                                    </form>
+                                    <button type="submit" class="btn btn-sm btn-outline-<?= $service['enabled'] ? 'warning' : 'success' ?>" form="svcToggle_<?= $service['id'] ?>">
+                                        <i class="bi bi-<?= $service['enabled'] ? 'pause-circle' : 'play-circle' ?> me-1"></i>
+                                        <?= $service['enabled'] ? 'Disable' : 'Enable' ?>
+                                    </button>
                                 </div>
                             </div>
+                        </form>
+                        <form id="svcToggle_<?= $service['id'] ?>" method="POST" action="/notification-services/<?= $service['id'] ?>/toggle" class="d-none">
+                            <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                         </form>
                     </td>
                 </tr>
@@ -891,13 +1008,13 @@ unset($ns);
                             <button type="button" class="btn btn-sm btn-outline-secondary ms-2"
                                     data-bs-toggle="collapse" data-bs-target="#editMobile_<?= $service['id'] ?>">Cancel</button>
                         </div>
-                        <form method="POST" action="/notification-services/<?= $service['id'] ?>/toggle" class="d-inline">
-                            <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-                            <button type="submit" class="btn btn-sm btn-outline-<?= $service['enabled'] ? 'warning' : 'success' ?>">
-                                <?= $service['enabled'] ? 'Disable' : 'Enable' ?>
-                            </button>
-                        </form>
+                        <button type="submit" class="btn btn-sm btn-outline-<?= $service['enabled'] ? 'warning' : 'success' ?>" form="svcToggleMobile_<?= $service['id'] ?>">
+                            <?= $service['enabled'] ? 'Disable' : 'Enable' ?>
+                        </button>
                     </div>
+                </form>
+                <form id="svcToggleMobile_<?= $service['id'] ?>" method="POST" action="/notification-services/<?= $service['id'] ?>/toggle" class="d-none">
+                    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                 </form>
             </div>
         </div>
@@ -910,7 +1027,7 @@ unset($ns);
         <i class="bi bi-megaphone text-muted" style="font-size: 3rem;"></i>
         <h5 class="mt-3">No Notification Services</h5>
         <p class="text-muted mb-3">Add a notification service to receive alerts about backup failures, client status changes, and more.</p>
-        <button class="btn btn-success" data-bs-toggle="collapse" data-bs-target="#addServiceForm">
+        <button class="btn btn-sm btn-success" data-bs-toggle="collapse" data-bs-target="#addServiceForm">
             <i class="bi bi-plus-circle me-1"></i> Add Your First Service
         </button>
     </div>
@@ -1004,12 +1121,19 @@ const serviceSchemas = {
             const port = f.smtp_port || '587';
             const to = encodeURIComponent(f.smtp_to || '');
             const from = encodeURIComponent(f.smtp_from || f.smtp_user || f.smtp_to || '');
-            let mode = '';
-            if (f.smtp_secure === 'ssl') mode = 'mailtos';
-            else if (f.smtp_secure === 'none') mode = 'mailto';
-            else mode = 'mailto'; // starttls is default
+            // Keep this in sync with the standalone notification-services
+            // view. Apprise chooses the mail security mode from the scheme,
+            // not the port, unless mode= is explicit.
+            let scheme = 'mailtos';
+            let urlMode = 'starttls';
+            if (f.smtp_secure === 'ssl') {
+                urlMode = 'ssl';
+            } else if (f.smtp_secure === 'none') {
+                scheme = 'mailto';
+                urlMode = 'insecure';
+            }
             const auth = (f.smtp_user || f.smtp_pass) ? `${user}:${pass}@` : '';
-            return `${mode}://${auth}${host}:${port}?to=${to}&from=${from}`;
+            return `${scheme}://${auth}${host}:${port}?to=${to}&from=${from}&mode=${urlMode}`;
         }
     },
     discord: {
@@ -1068,14 +1192,31 @@ const serviceSchemas = {
         label: 'ntfy',
         fields: [
             { name: 'topic', label: 'Topic', type: 'text', required: true, placeholder: 'my-backup-alerts', width: 'col-md-6' },
-            { name: 'server', label: 'Server (optional)', type: 'text', placeholder: 'ntfy.sh', width: 'col-md-6' }
+            { name: 'server', label: 'Server (optional)', type: 'text', placeholder: 'ntfy.sh', width: 'col-md-6' },
+            { name: 'secure', label: 'Connection', type: 'select', width: 'col-md-6', options: [
+                { value: 'https', label: 'HTTPS' },
+                { value: 'http', label: 'HTTP' }
+            ]},
+            { name: 'token', label: 'Access token (optional)', type: 'password', placeholder: 'tk_...', width: 'col-md-6' }
         ],
-        help: 'Subscribe to the topic in your ntfy app. Default server is ntfy.sh',
+        help: 'Subscribe to the topic in your ntfy app. Leave Server empty for ntfy.sh. The access token is for servers or topics that need a login.',
         build: function(f) {
-            if (f.server && f.server !== 'ntfy.sh') {
-                return `ntfy://${f.server}/${f.topic || ''}`;
+            // Accept a pasted URL in Server: its scheme picks the connection (#550).
+            let server = (f.server || '').trim();
+            let secure = f.secure !== 'http';
+            const m = server.match(/^(https?|ntfys?):\/\//i);
+            if (m) {
+                secure = /^(https|ntfys)$/i.test(m[1]);
+                server = server.slice(m[0].length);
             }
-            return `ntfy://${f.topic || ''}`;
+            server = server.replace(/\/+$/, '');
+            const topic = f.topic || '';
+            const token = (f.token || '').trim();
+            const query = token ? `?token=${encodeURIComponent(token)}` : '';
+            if (server && server.toLowerCase() !== 'ntfy.sh') {
+                return `${secure ? 'ntfys' : 'ntfy'}://${server}/${topic}${query}`;
+            }
+            return `ntfy://${topic}${query}`;
         }
     },
     gotify: {
@@ -1264,22 +1405,459 @@ function updateBuiltUrl(containerId, schema, prefix) {
     }
 })();
 </script>
+<h5 class="settings-group">Service URL Examples</h5>
+<p class="settings-group-note">Apprise addresses each service with a URL. These are the common ones.</p>
+<?php
+$appriseExamples = [
+    ['Discord',  'discord://webhook_id/webhook_token'],
+    ['Telegram', 'tgram://bot_token/chat_id[:thread]'],
+    ['Slack',    'slack://tokenA/tokenB/tokenC'],
+    ['Pushover', 'pover://user@token'],
+    ['ntfy',     'ntfy://topic or ntfys://host/topic?token=tk_...'],
+    ['Gotify',   'gotify://hostname/token'],
+    ['Email',    'mailto://user:pass@smtp.example.com'],
+    ['Webhook',  'json://your-webhook-url'],
+];
+$half = (int) ceil(count($appriseExamples) / 2);
+?>
+<div class="url-example-panel">
+    <div class="row g-0">
+        <?php foreach ([array_slice($appriseExamples, 0, $half), array_slice($appriseExamples, $half)] as $column): ?>
+        <div class="col-md-6">
+            <?php foreach ($column as [$label, $url]): ?>
+            <div class="url-example">
+                <span class="url-example-label"><?= htmlspecialchars($label) ?>:</span>
+                <code class="url-example-value"><?= htmlspecialchars($url) ?></code>
+            </div>
+            <?php endforeach; ?>
+        </div>
+        <?php endforeach; ?>
+    </div>
+</div>
+<p class="mt-3 mb-4" style="font-size:13px;">
+    <a href="https://github.com/caronc/apprise/wiki#notification-services" target="_blank" class="text-decoration-none">
+        View all supported services <i class="bi bi-box-arrow-up-right ms-1" style="font-size:.85em;"></i>
+    </a>
+</p>
+
+<?php endif; ?>
+
+
+<!-- Push Service Tab -->
+<?php if ($activeTab === 'push_service'): ?>
+<?php
+// Push notification service. Its own tab rather than sharing one with the
+// Apprise services: those deliver to chat and webhook targets and contact
+// those providers directly, which is a different thing entirely, and putting
+// unfinished groundwork next to them invited confusion.
+$pushSvc = new \BBS\Services\PushService();
+$pushOn = $pushSvc->isEnabled();
+$pushRegistered = (bool) $pushSvc->serverId();
+?>
+<div class="settings-page-head">
+    <h1 class="settings-page-title">Push Service</h1>
+    <p class="settings-page-lede mb-0">Delivers alerts to your phone through the <strong>BBS Manager</strong> mobile app. Install the app from <a href="https://borgbackupserver.com/bbs-manager" target="_blank" rel="noopener">borgbackupserver.com/bbs-manager</a>, then register this server here so the app can receive its alerts. Separate from <a href="/settings?tab=push">Apprise</a>, which contacts chat and webhook providers directly.</p>
+</div>
+
+<form method="POST" action="/settings/push">
+    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+
+    <h5 class="settings-group">Registration</h5>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Register with the Push Notification Service</div>
+            <p class="settings-row-help">Registers this server with the push service so devices running BBS Manager can receive alerts. Nothing is sent to it until this is on.</p>
+        </div>
+        <div class="settings-row-control">
+            <div class="form-check form-switch mb-0">
+                <input class="form-check-input" type="checkbox" role="switch"
+                       id="push_enabled" name="push_enabled" value="1" <?= $pushOn ? 'checked' : '' ?>>
+                <label class="form-check-label" for="push_enabled"
+                       data-on="On" data-off="Off"><?= $pushOn ? 'On' : 'Off' ?></label>
+            </div>
+        </div>
+        <div class="settings-row-default">Default: Off</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Service URL</div>
+            <p class="settings-row-help">Where this server registers. Leave it as it is unless you have been told otherwise.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="text" class="form-control" name="push_relay_url" style="max-width:340px;"
+                   value="<?= htmlspecialchars($settings['push_relay_url'] ?? 'https://push.borgbackupserver.com') ?>">
+        </div>
+        <div class="settings-row-default">&nbsp;</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Status</div>
+            <p class="settings-row-help">Whether this server currently holds credentials for the service.</p>
+        </div>
+        <div class="settings-row-control">
+            <?php if ($pushOn && $pushRegistered): ?>
+                <span class="badge bg-success">Registered</span>
+            <?php elseif ($pushOn): ?>
+                <span class="badge bg-warning text-dark">Enabled, not registered</span>
+                <span class="settings-row-unit">Save to retry registration.</span>
+            <?php else: ?>
+                <span class="badge bg-secondary">Disabled</span>
+            <?php endif; ?>
+        </div>
+        <div class="settings-row-default">&nbsp;</div>
+    </div>
+
+    <div class="settings-actions">
+        <a href="/settings?tab=push_service" class="btn btn-sm btn-outline-secondary">Cancel</a>
+        <button type="submit" class="btn btn-sm btn-primary"><i class="bi bi-save me-1"></i> Save Changes</button>
+    </div>
+</form>
 <?php endif; ?>
 
 
 <!-- Templates Tab -->
-<?php if ($activeTab === 'templates'): ?>
-<div class="card border-0 shadow-sm">
-    <div class="card-header fw-semibold">
-        <i class="bi bi-clipboard-check me-1"></i> Backup Templates
+<?php if ($activeTab === 'profiles'): ?>
+<?php
+$freqLabels = ['hourly' => 'Hourly', 'daily' => 'Daily', 'weekly' => 'Weekly', 'monthly' => 'Monthly'];
+$dowLabels = [0 => 'Sunday', 1 => 'Monday', 2 => 'Tuesday', 3 => 'Wednesday', 4 => 'Thursday', 5 => 'Friday', 6 => 'Saturday'];
+// The form is identical for create and edit, so it is written once and the
+// modal is retargeted rather than duplicated — the two drifting apart is how a
+// field ends up saving on one screen and not the other.
+$renderProfileForm = function (?array $p) use ($templates, $freqLabels, $dowLabels) {
+    $v = fn($k, $d = '') => htmlspecialchars((string) ($p[$k] ?? $d));
+    ?>
+    <div class="row g-3">
+        <div class="col-md-6">
+            <label class="form-label fw-semibold">Profile Name</label>
+            <input type="text" name="name" class="form-control" required value="<?= $v('name') ?>" placeholder="e.g. Laptops, DB Servers, Registers">
+        </div>
+        <div class="col-md-6">
+            <label class="form-label fw-semibold">Description</label>
+            <input type="text" name="description" class="form-control" value="<?= $v('description') ?>" placeholder="What kind of machine this is for">
+        </div>
     </div>
-    <div class="card-body">
-        <p class="text-muted small mb-3">Templates pre-fill directories, excludes, and borg options when creating backup plans. Select a template to auto-populate the form.</p>
 
+    <hr class="my-3">
+    <div class="row g-3">
+        <div class="col-md-6">
+            <label class="form-label fw-semibold">Backup Template</label>
+            <select name="template_id" class="form-select">
+                <option value="">None — author directories per client</option>
+                <?php foreach ($templates as $t): ?>
+                <option value="<?= (int) $t['id'] ?>" <?= (int) ($p['template_id'] ?? 0) === (int) $t['id'] ? 'selected' : '' ?>><?= htmlspecialchars($t['name']) ?></option>
+                <?php endforeach; ?>
+            </select>
+            <div class="form-text">Supplies the directories, exclude patterns and options a new plan starts with.</div>
+        </div>
+        <div class="col-md-3">
+            <label class="form-label fw-semibold">Frequency</label>
+            <select name="frequency" class="form-select profile-frequency">
+                <?php foreach ($freqLabels as $fk => $fl): ?>
+                <option value="<?= $fk ?>" <?= ($p['frequency'] ?? 'daily') === $fk ? 'selected' : '' ?>><?= $fl ?></option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="col-md-3">
+            <label class="form-label fw-semibold">Run Hours</label>
+            <input type="text" name="times" class="form-control" value="<?= $v('times', '02:00') ?>" placeholder="02:00">
+            <div class="form-text">24-hour, comma-separated for several runs a day.</div>
+        </div>
+        <div class="col-md-6">
+            <label class="form-label fw-semibold">Timezone</label>
+            <select name="timezone" class="form-select">
+                <option value="">Server timezone (<?= htmlspecialchars((new \BBS\Services\ClientProfileService())->timezoneFor([])) ?>)</option>
+                <?php foreach (\DateTimeZone::listIdentifiers() as $tzId): ?>
+                <option value="<?= htmlspecialchars($tzId) ?>" <?= ($p['timezone'] ?? '') === $tzId ? 'selected' : '' ?>><?= htmlspecialchars($tzId) ?></option>
+                <?php endforeach; ?>
+            </select>
+            <div class="form-text">The zone those run hours are in. Applying the profile sets it on every client's schedule, so they all run at the same moment.</div>
+        </div>
+        <div class="col-md-3 profile-dow" style="display:none;">
+            <label class="form-label fw-semibold">Day of Week</label>
+            <select name="day_of_week" class="form-select">
+                <?php foreach ($dowLabels as $dk => $dl): ?>
+                <option value="<?= $dk ?>" <?= (string) ($p['day_of_week'] ?? '0') === (string) $dk ? 'selected' : '' ?>><?= $dl ?></option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="col-md-3 profile-dom" style="display:none;">
+            <label class="form-label fw-semibold">Day of Month</label>
+            <input type="text" name="day_of_month" class="form-control" value="<?= $v('day_of_month', '1') ?>" placeholder="1">
+        </div>
+    </div>
+
+    <hr class="my-3">
+    <label class="form-label fw-semibold mb-1">Retention</label>
+    <div class="form-text mb-2">How many backups to keep at each interval. 0 keeps none; -1 keeps every one.</div>
+    <div class="row g-2">
+        <?php foreach (['minutes' => 'Minutely', 'hours' => 'Hourly', 'days' => 'Daily', 'weeks' => 'Weekly', 'months' => 'Monthly', 'years' => 'Yearly'] as $unit => $label): ?>
+        <div class="col-4 col-md-2">
+            <label class="form-label small mb-1"><?= $label ?></label>
+            <input type="number" name="prune_<?= $unit ?>" class="form-control form-control-sm" min="-1"
+                   value="<?= $v('prune_' . $unit, in_array($unit, ['days','weeks','months']) ? ['days'=>7,'weeks'=>4,'months'=>6][$unit] : 0) ?>">
+        </div>
+        <?php endforeach; ?>
+    </div>
+
+    <hr class="my-3">
+    <label class="form-label fw-semibold mb-1">Failure Handling</label>
+    <div class="form-text mb-2">
+        Leave any of these blank to follow the server-wide setting. A fleet of laptops that sleep mid-backup
+        wants more patience than a database server on a wired LAN, which is the reason these live here at all.
+    </div>
+    <div class="row g-3">
+        <div class="col-md-4">
+            <label class="form-label small fw-semibold mb-1">Max Retry Attempts</label>
+            <input type="number" name="auto_retry_max_attempts" class="form-control form-control-sm" min="0" max="10"
+                   value="<?= $v('auto_retry_max_attempts') ?>" placeholder="Server default">
+        </div>
+        <div class="col-md-4">
+            <label class="form-label small fw-semibold mb-1">Give Up On Running Jobs After</label>
+            <div class="input-group input-group-sm">
+                <input type="number" name="job_offline_grace_minutes" class="form-control" min="1" max="120"
+                       value="<?= $v('job_offline_grace_minutes') ?>" placeholder="Server default">
+                <span class="input-group-text">min</span>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <label class="form-label small fw-semibold mb-1">Retry Backoff</label>
+            <div class="input-group input-group-sm">
+                <input type="number" name="auto_retry_backoff_minutes" class="form-control" min="1" max="60"
+                       value="<?= $v('auto_retry_backoff_minutes') ?>" placeholder="Server default">
+                <span class="input-group-text">min</span>
+            </div>
+        </div>
+    </div>
+
+    <hr class="my-3">
+    <label class="form-label fw-semibold mb-1">Backup Freshness</label>
+    <div class="form-text mb-2">
+        How long a machine of this kind may go without a successful backup before health monitoring
+        calls it overdue. A laptop that spends the weekend switched off is not a fault; a database
+        server silent for a day is. Blank follows the server-wide setting.
+    </div>
+    <div class="row g-3">
+        <div class="col-md-4">
+            <label class="form-label small fw-semibold mb-1">Overdue After</label>
+            <div class="input-group input-group-sm">
+                <input type="number" name="backup_overdue_hours" class="form-control" min="1" max="8760"
+                       value="<?= $v('backup_overdue_hours') ?>" placeholder="Server default">
+                <span class="input-group-text">hours</span>
+            </div>
+            <div class="form-text">24 = a day, 168 = a week, 336 = two weeks.</div>
+        </div>
+    </div>
+    <?php
+};
+?>
+
+<div class="settings-page-head d-flex justify-content-between align-items-start">
+    <div>
+        <h1 class="settings-page-title">Client Profiles</h1>
+        <p class="settings-page-lede mb-0">A profile describes a kind of machine — laptops, database servers, point-of-sale registers — and the settings a new client of that kind starts with.</p>
+    </div>
+    <button type="button" class="btn btn-sm btn-success flex-shrink-0 ms-3" onclick="openProfileModal(null)">
+        <i class="bi bi-plus-circle me-1"></i> New Profile
+    </button>
+</div>
+
+<div>
+    <div>
+        <h5 class="settings-group">Profiles</h5>
+        <p class="settings-group-note">
+            Assign one when you add a client and its first backup plan is filled in for you.
+            <strong>Editing a profile does not touch clients that already exist</strong> — that is what
+            <em>Apply to Clients</em> does, and it overwrites their settings.
+        </p>
+
+        <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0 settings-table">
+                <thead>
+                    <tr>
+                        <th>Profile</th>
+                        <th>Template</th>
+                        <th>Schedule</th>
+                        <th>Retention</th>
+                        <th class="text-center">Clients</th>
+                        <th class="text-end">&nbsp;</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($clientProfiles as $p):
+                        $retention = [];
+                        foreach (['minutes' => 'm', 'hours' => 'H', 'days' => 'd', 'weeks' => 'w', 'months' => 'M', 'years' => 'y'] as $unit => $abbr) {
+                            $n = (int) $p['prune_' . $unit];
+                            if ($n !== 0) $retention[] = ($n < 0 ? 'all' : $n) . $abbr;
+                        }
+                    ?>
+                    <tr>
+                        <td>
+                            <span class="fw-semibold"><?= htmlspecialchars($p['name']) ?></span>
+                            <?php if (!empty($p['is_default'])): ?>
+                                <span class="badge bg-body-secondary text-muted border ms-1">default</span>
+                            <?php endif; ?>
+                            <?php if (!empty($p['description'])): ?>
+                                <div class="small text-muted"><?= htmlspecialchars($p['description']) ?></div>
+                            <?php endif; ?>
+                        </td>
+                        <td class="small"><?= $p['template_name'] ? htmlspecialchars($p['template_name']) : '<span class="text-muted">None</span>' ?></td>
+                        <td class="small">
+                            <?= htmlspecialchars($freqLabels[$p['frequency']] ?? $p['frequency']) ?>
+                            <span class="text-muted">at <?= htmlspecialchars($p['times'] ?: '--') ?></span>
+                        </td>
+                        <td class="small text-muted"><?= $retention ? htmlspecialchars(implode(' ', $retention)) : 'Keep nothing' ?></td>
+                        <td class="text-center"><span class="badge bg-body-secondary text-body border"><?= (int) $p['client_count'] ?></span></td>
+                        <td class="text-end text-nowrap">
+                            <button type="button" class="btn btn-sm btn-outline-secondary"
+                                    onclick='openProfileModal(<?= json_encode($p, JSON_HEX_APOS | JSON_HEX_QUOT) ?>)'>
+                                <i class="bi bi-pencil"></i>
+                            </button>
+                            <button type="button" class="btn btn-sm btn-outline-warning"
+                                    onclick="confirmApplyProfile(<?= (int) $p['id'] ?>, <?= htmlspecialchars(json_encode($p['name']), ENT_QUOTES) ?>)"
+                                    <?= (int) $p['client_count'] === 0 ? 'disabled title="No clients are in this profile"' : 'title="Overwrite the settings of every client in this profile"' ?>>
+                                <i class="bi bi-arrow-down-square me-1"></i>Apply to Clients
+                            </button>
+                            <?php if (empty($p['is_default'])): ?>
+                            <form method="POST" action="/settings/profiles/<?= (int) $p['id'] ?>/delete" class="d-inline"
+                                  data-confirm="Delete the profile &quot;<?= htmlspecialchars($p['name']) ?>&quot;? Its clients move to the default profile and keep the settings they have.">
+                                <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                                <button type="submit" class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
+                            </form>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Create / edit -->
+<div class="modal fade" id="profileModal" tabindex="-1">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <form method="POST" id="profileForm" class="modal-content">
+            <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+            <div class="modal-header">
+                <h5 class="modal-title" id="profileModalTitle">New Client Profile</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <?php $renderProfileForm(null); ?>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="submit" class="btn btn-primary" id="profileSubmit">Create Profile</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Apply confirmation. Deliberately not a data-confirm one-liner: this
+     overwrites work someone may have tuned by hand, and the dialog says what
+     it will touch and what it will leave alone. -->
+<div class="modal fade" id="applyProfileModal" tabindex="-1">
+    <div class="modal-dialog">
+        <form method="POST" id="applyProfileForm" class="modal-content">
+            <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+            <div class="modal-header bg-warning-subtle">
+                <h5 class="modal-title"><i class="bi bi-exclamation-triangle me-2"></i>Overwrite existing client settings?</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p>Applying <strong id="applyProfileName"></strong> replaces settings on every client already assigned to it:</p>
+                <ul class="small mb-3" id="applyImpact"><li class="text-muted">Checking…</li></ul>
+                <p class="small mb-2"><strong>Replaced:</strong> backup directories, exclude patterns, options, retention, and the schedule's frequency and run times.</p>
+                <p class="small mb-3"><strong>Left alone:</strong> which repository each plan writes to, which plugins it runs, and any archives already taken.</p>
+                <div class="alert alert-warning small mb-0">
+                    Anything tuned by hand on those clients is lost. There is no undo.
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="submit" class="btn btn-warning">Yes, overwrite these clients</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script>
+function syncProfileFreqFields(form) {
+    var freq = form.querySelector('.profile-frequency').value;
+    form.querySelector('.profile-dow').style.display = (freq === 'weekly') ? '' : 'none';
+    form.querySelector('.profile-dom').style.display = (freq === 'monthly') ? '' : 'none';
+}
+
+function openProfileModal(profile) {
+    var form = document.getElementById('profileForm');
+    form.action = profile ? '/settings/profiles/' + profile.id + '/edit' : '/settings/profiles/add';
+    document.getElementById('profileModalTitle').textContent = profile ? 'Edit Profile — ' + profile.name : 'New Client Profile';
+    document.getElementById('profileSubmit').textContent = profile ? 'Save Profile' : 'Create Profile';
+
+    // Blank for a new profile, the stored values for an existing one. Nulls
+    // stay empty so the "follow the server setting" placeholder shows through.
+    var fields = ['name','description','template_id','frequency','times','day_of_week','day_of_month',
+                  'timezone','prune_minutes','prune_hours','prune_days','prune_weeks','prune_months','prune_years',
+                  'auto_retry_max_attempts','job_offline_grace_minutes','auto_retry_backoff_minutes','backup_overdue_hours'];
+    var blanks = {frequency:'daily', times:'02:00', prune_days:'7', prune_weeks:'4', prune_months:'6',
+                  prune_minutes:'0', prune_hours:'0', prune_years:'0'};
+    fields.forEach(function (f) {
+        var el = form.querySelector('[name="' + f + '"]');
+        if (!el) return;
+        var val = profile ? profile[f] : blanks[f];
+        el.value = (val === null || val === undefined) ? '' : val;
+    });
+
+    syncProfileFreqFields(form);
+    new bootstrap.Modal(document.getElementById('profileModal')).show();
+}
+
+function confirmApplyProfile(id, name) {
+    var form = document.getElementById('applyProfileForm');
+    form.action = '/settings/profiles/' + id + '/apply';
+    document.getElementById('applyProfileName').textContent = name;
+    var list = document.getElementById('applyImpact');
+    list.innerHTML = '<li class="text-muted">Checking…</li>';
+    new bootstrap.Modal(document.getElementById('applyProfileModal')).show();
+
+    // Count what is about to be overwritten, so the warning is specific
+    // rather than a generic "are you sure".
+    fetch('/api/client-profiles/' + id, {credentials: 'same-origin'})
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+            var i = d.impact || {};
+            list.innerHTML =
+                '<li><strong>' + (i.clients || 0) + '</strong> client(s)</li>' +
+                '<li><strong>' + (i.plans || 0) + '</strong> backup plan(s)</li>' +
+                '<li><strong>' + (i.schedules || 0) + '</strong> schedule(s)</li>';
+        })
+        .catch(function () { list.innerHTML = '<li class="text-muted">Could not count what would change.</li>'; });
+}
+
+document.addEventListener('change', function (e) {
+    if (e.target.classList && e.target.classList.contains('profile-frequency')) {
+        syncProfileFreqFields(e.target.closest('form'));
+    }
+});
+</script>
+<?php endif; ?>
+
+<?php if ($activeTab === 'templates'): ?>
+<div class="settings-page-head">
+    <h1 class="settings-page-title">Backup Templates</h1>
+    <p class="settings-page-lede mb-0">A template pre-fills the directories, excludes and borg options of a new backup plan, so a kind of machine is described once rather than typed out per client.</p>
+</div>
+<div>
+    <div>
         <?php if (!empty($templates)): ?>
+        <h5 class="settings-group">Templates</h5>
+        <p class="settings-group-note">Pick one while creating a plan and the form fills itself in. Client profiles can name one as their default.</p>
         <div class="table-responsive mb-4">
-            <table class="table table-hover">
-                <thead class="table-light">
+            <table class="table table-hover settings-table">
+                <thead>
                     <tr>
                         <th>Name</th>
                         <th>Description</th>
@@ -1301,6 +1879,10 @@ function updateBuiltUrl(containerId, schema, prefix) {
                             <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#edit-tpl-<?= $tpl['id'] ?>">
                                 <i class="bi bi-pencil"></i>
                             </button>
+                            <form method="POST" action="/settings/templates/<?= $tpl['id'] ?>/duplicate" class="d-inline">
+                                <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                                <button class="btn btn-sm btn-outline-secondary" title="Duplicate"><i class="bi bi-copy"></i></button>
+                            </form>
                             <form method="POST" action="/settings/templates/<?= $tpl['id'] ?>/delete" class="d-inline" data-confirm="Delete this template?" data-confirm-danger>
                                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                                 <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
@@ -1312,7 +1894,7 @@ function updateBuiltUrl(containerId, schema, prefix) {
                         $editHasComp = (bool)preg_match('/--compression\s+(\S+)/', $editAdv, $editCompMatch);
                         $editCompSpec = $editHasComp ? $editCompMatch[1] : 'lz4';
                     ?>
-                    <tr class="collapse" id="edit-tpl-<?= $tpl['id'] ?>">
+                    <tr class="collapse<?= (int) ($_GET['edit'] ?? 0) === (int) $tpl['id'] ? ' show' : '' ?>" id="edit-tpl-<?= $tpl['id'] ?>">
                         <td colspan="6">
                             <form method="POST" action="/settings/templates/<?= $tpl['id'] ?>/edit" class="p-2 tpl-form">
                                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
@@ -1389,7 +1971,7 @@ function updateBuiltUrl(containerId, schema, prefix) {
         </div>
         <?php endif; ?>
 
-        <h6>Add Template</h6>
+        <h5 class="settings-group">Add Template</h5>
         <form method="POST" action="/settings/templates/add" class="tpl-form" id="addTplForm">
             <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
             <div class="row g-3 mb-2">
@@ -1453,7 +2035,7 @@ function updateBuiltUrl(containerId, schema, prefix) {
                     <input type="text" class="form-control form-control-sm font-monospace tpl-adv-field" name="advanced_options" placeholder="e.g. --pattern ...">
                 </div>
                 <div class="col-md-2 d-flex align-items-end">
-                    <button type="submit" class="btn btn-success w-100">Add Template</button>
+                    <button type="submit" class="btn btn-sm btn-success w-100">Add Template</button>
                 </div>
             </div>
         </form>
@@ -1495,120 +2077,170 @@ function updateBuiltUrl(containerId, schema, prefix) {
 
 <!-- Authentication Tab -->
 <?php if ($activeTab === 'auth'): ?>
-<div class="card border-0 shadow-sm">
-    <div class="card-header fw-semibold">
-        <i class="bi bi-shield-lock me-1"></i> Single Sign-On (OIDC)
-    </div>
-    <div class="card-body">
-        <p class="text-muted small mb-3">Configure OpenID Connect (OIDC) to allow users to sign in with an external identity provider (Keycloak, Authentik, Azure AD, Google, Okta, etc.).</p>
-
-        <form method="POST" action="/settings/oidc">
-            <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-
-            <div class="form-check form-switch mb-4">
-                <input class="form-check-input" type="checkbox" name="oidc_enabled" id="oidcEnabled" value="1" <?= ($settings['oidc_enabled'] ?? '0') === '1' ? 'checked' : '' ?>>
-                <label class="form-check-label fw-semibold" for="oidcEnabled">Enable OIDC Single Sign-On</label>
-            </div>
-
-            <div class="row g-3 mb-3">
-                <div class="col-md-12">
-                    <label class="form-label fw-semibold">Provider URL</label>
-                    <input type="url" class="form-control" name="oidc_provider_url" value="<?= htmlspecialchars($settings['oidc_provider_url'] ?? '') ?>" placeholder="https://idp.example.com/realms/myrealm">
-                    <div class="form-text">The base URL for OpenID Connect discovery. BBS appends <code>/.well-known/openid-configuration</code> automatically.</div>
-                </div>
-            </div>
-
-            <div class="row g-3 mb-3">
-                <div class="col-md-6">
-                    <label class="form-label fw-semibold">Client ID</label>
-                    <input type="text" class="form-control" name="oidc_client_id" value="<?= htmlspecialchars($settings['oidc_client_id'] ?? '') ?>" placeholder="bbs">
-                </div>
-                <div class="col-md-6">
-                    <label class="form-label fw-semibold">Client Secret</label>
-                    <input type="password" class="form-control" name="oidc_client_secret" placeholder="<?= !empty($settings['oidc_client_secret']) ? '(unchanged if empty)' : '' ?>">
-                    <?php if (!empty($settings['oidc_client_secret'])): ?>
-                    <div class="form-text">A value is saved. Leave empty to keep unchanged.</div>
-                    <?php endif; ?>
-                </div>
-            </div>
-
-            <div class="row g-3 mb-3">
-                <div class="col-md-6">
-                    <label class="form-label fw-semibold">Button Label</label>
-                    <input type="text" class="form-control" name="oidc_button_label" value="<?= htmlspecialchars($settings['oidc_button_label'] ?? 'Login with SSO') ?>">
-                    <div class="form-text">Text shown on the SSO button on the login page.</div>
-                </div>
-                <div class="col-md-6">
-                    <label class="form-label fw-semibold">Scopes</label>
-                    <input type="text" class="form-control" name="oidc_scopes" value="<?= htmlspecialchars($settings['oidc_scopes'] ?? 'openid email profile') ?>">
-                    <div class="form-text">Space-separated OIDC scopes. Must include <code>openid</code> and <code>email</code>.</div>
-                </div>
-            </div>
-
-            <div class="row g-3 mb-3">
-                <div class="col-12">
-                    <label class="form-label fw-semibold">Redirect URL Override <span class="text-muted fw-normal small">(optional)</span></label>
-                    <input type="url" class="form-control" name="oidc_redirect_url" value="<?= htmlspecialchars($settings['oidc_redirect_url'] ?? '') ?>" placeholder="https://bbs.example.com/login/oidc/callback">
-                    <div class="form-text">Leave blank to auto-detect from the request. Set this if BBS sits behind a reverse proxy but your OIDC provider needs a different URL than what the request headers show (e.g. your agents use an internal URL but SSO must use the public hostname).</div>
-                </div>
-            </div>
-
-            <hr>
-
-            <h6 class="mb-3">New User Handling</h6>
-            <p class="text-muted small">When an unknown user authenticates via SSO for the first time:</p>
-
-            <div class="mb-3">
-                <select class="form-select" name="oidc_new_user_policy" id="oidcNewUserPolicy">
-                    <?php $policy = $settings['oidc_new_user_policy'] ?? 'deny'; ?>
-                    <option value="deny" <?= $policy === 'deny' ? 'selected' : '' ?>>Deny access (user must already exist with matching email)</option>
-                    <option value="pending" <?= $policy === 'pending' ? 'selected' : '' ?>>Create user, pending admin approval</option>
-                    <option value="copy" <?= $policy === 'copy' ? 'selected' : '' ?>>Create user with permissions copied from a template user</option>
-                </select>
-            </div>
-
-            <div class="mb-3" id="oidcTemplateUserWrap" style="<?= $policy === 'copy' ? '' : 'display:none;' ?>">
-                <label class="form-label fw-semibold">Template User</label>
-                <select class="form-select" name="oidc_template_user_id">
-                    <option value="">-- Select a user --</option>
-                    <?php foreach ($oidcUsers ?? [] as $u): ?>
-                    <option value="<?= $u['id'] ?>" <?= ($settings['oidc_template_user_id'] ?? '') == $u['id'] ? 'selected' : '' ?>>
-                        <?= htmlspecialchars($u['username']) ?> (<?= htmlspecialchars($u['email']) ?>) — <?= $u['role'] ?>
-                    </option>
-                    <?php endforeach; ?>
-                </select>
-                <div class="form-text">New SSO users will receive the same client access and permissions as this user.</div>
-            </div>
-
-            <hr>
-
-            <div class="form-check form-switch mb-3">
-                <input class="form-check-input" type="checkbox" name="oidc_logout_enabled" id="oidcLogout" value="1" <?= ($settings['oidc_logout_enabled'] ?? '0') === '1' ? 'checked' : '' ?>>
-                <label class="form-check-label" for="oidcLogout">Enable OIDC Logout</label>
-                <div class="form-text">When enabled, logging out of BBS also logs the user out of the identity provider.</div>
-            </div>
-
-            <button type="submit" class="btn btn-primary">
-                <i class="bi bi-check-lg me-1"></i> Save Authentication Settings
-            </button>
-        </form>
-    </div>
+<?php $policy = $settings['oidc_new_user_policy'] ?? 'deny'; ?>
+<div class="settings-page-head">
+    <h1 class="settings-page-title">Authentication</h1>
+    <p class="settings-page-lede mb-0">Let people sign in with an external identity provider — Keycloak, Authentik, Entra ID, Google, Okta and anything else that speaks OpenID Connect.</p>
 </div>
+
+<form method="POST" action="/settings/oidc">
+    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+
+    <h5 class="settings-group">Single Sign-On</h5>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Enable OIDC Single Sign-On</div>
+            <p class="settings-row-help">Adds a sign-in button to the login page. Local passwords keep working.</p>
+        </div>
+        <div class="settings-row-control">
+            <div class="form-check form-switch mb-0">
+                <input class="form-check-input" type="checkbox" role="switch" name="oidc_enabled" value="1"
+                       id="oidcEnabled" <?= ($settings['oidc_enabled'] ?? '0') === '1' ? 'checked' : '' ?>>
+                <label class="form-check-label" for="oidcEnabled"
+                       data-on="On" data-off="Off"><?= ($settings['oidc_enabled'] ?? '0') === '1' ? 'On' : 'Off' ?></label>
+            </div>
+        </div>
+        <div class="settings-row-default">Default: Off</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Provider URL</div>
+            <p class="settings-row-help">The base URL for discovery. BBS appends <code>/.well-known/openid-configuration</code> itself.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="url" class="form-control" name="oidc_provider_url" style="max-width:380px;"
+                   value="<?= htmlspecialchars($settings['oidc_provider_url'] ?? '') ?>"
+                   placeholder="https://idp.example.com/realms/myrealm">
+        </div>
+        <div class="settings-row-default">&nbsp;</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Client Credentials</div>
+            <p class="settings-row-help">From the application you registered with the provider. Leave the secret blank to keep the stored one.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="text" class="form-control" name="oidc_client_id" style="max-width:180px;"
+                   value="<?= htmlspecialchars($settings['oidc_client_id'] ?? '') ?>" placeholder="client id">
+            <input type="password" class="form-control" name="oidc_client_secret" style="max-width:200px;"
+                   placeholder="<?= !empty($settings['oidc_client_secret']) ? '(unchanged if empty)' : 'client secret' ?>">
+        </div>
+        <div class="settings-row-default"><?= !empty($settings['oidc_client_secret']) ? 'A secret is saved' : '&nbsp;' ?></div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Button Label</div>
+            <p class="settings-row-help">What the sign-in button says on the login page.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="text" class="form-control" name="oidc_button_label" style="max-width:260px;"
+                   value="<?= htmlspecialchars($settings['oidc_button_label'] ?? 'Login with SSO') ?>">
+        </div>
+        <div class="settings-row-default">Default: Login with SSO</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Scopes</div>
+            <p class="settings-row-help">Space-separated. Must include <code>openid</code> and <code>email</code>.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="text" class="form-control" name="oidc_scopes" style="max-width:280px;"
+                   value="<?= htmlspecialchars($settings['oidc_scopes'] ?? 'openid email profile') ?>">
+        </div>
+        <div class="settings-row-default">Default: openid email profile</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Redirect URL Override</div>
+            <p class="settings-row-help">Blank uses Server Host (General tab), then APP_URL. Set it when the provider must use a different address than Server Host, for example clients on an internal address and SSO on the public hostname.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="url" class="form-control" name="oidc_redirect_url" style="max-width:380px;"
+                   value="<?= htmlspecialchars($settings['oidc_redirect_url'] ?? '') ?>"
+                   placeholder="https://bbs.example.com/login/oidc/callback">
+        </div>
+        <div class="settings-row-default">Optional</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Log out of the provider too</div>
+            <p class="settings-row-help">Signing out of BBS also ends the session at the identity provider.</p>
+        </div>
+        <div class="settings-row-control">
+            <div class="form-check form-switch mb-0">
+                <input class="form-check-input" type="checkbox" role="switch" name="oidc_logout_enabled" value="1"
+                       id="oidcLogout" <?= ($settings['oidc_logout_enabled'] ?? '0') === '1' ? 'checked' : '' ?>>
+                <label class="form-check-label" for="oidcLogout"
+                       data-on="On" data-off="Off"><?= ($settings['oidc_logout_enabled'] ?? '0') === '1' ? 'On' : 'Off' ?></label>
+            </div>
+        </div>
+        <div class="settings-row-default">Default: Off</div>
+    </div>
+
+    <h5 class="settings-group">New Users</h5>
+    <p class="settings-group-note">What happens the first time someone unknown authenticates through SSO.</p>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">First Sign-In Policy</div>
+            <p class="settings-row-help">Denying is the safe default — it means SSO can authenticate people you have already created, and cannot create anyone.</p>
+        </div>
+        <div class="settings-row-control">
+            <select class="form-select" name="oidc_new_user_policy" id="oidcNewUserPolicy" style="max-width:380px;">
+                <option value="deny" <?= $policy === 'deny' ? 'selected' : '' ?>>Deny — the user must already exist</option>
+                <option value="pending" <?= $policy === 'pending' ? 'selected' : '' ?>>Create, pending admin approval</option>
+                <option value="copy" <?= $policy === 'copy' ? 'selected' : '' ?>>Create, copying a template user's access</option>
+            </select>
+        </div>
+        <div class="settings-row-default">Default: Deny</div>
+    </div>
+
+    <div class="settings-row" id="oidcTemplateUserWrap" style="<?= $policy === 'copy' ? '' : 'display:none;' ?>">
+        <div>
+            <div class="settings-row-label">Template User</div>
+            <p class="settings-row-help">New SSO users get the same client access and permissions as this one.</p>
+        </div>
+        <div class="settings-row-control">
+            <select class="form-select" name="oidc_template_user_id" style="max-width:380px;">
+                <option value="">-- Select a user --</option>
+                <?php foreach ($oidcUsers ?? [] as $u): ?>
+                <option value="<?= $u['id'] ?>" <?= ($settings['oidc_template_user_id'] ?? '') == $u['id'] ? 'selected' : '' ?>>
+                    <?= htmlspecialchars($u['username']) ?> (<?= htmlspecialchars($u['email']) ?>) — <?= $u['role'] ?>
+                </option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="settings-row-default">&nbsp;</div>
+    </div>
+
+    <div class="settings-actions">
+        <a href="/settings?tab=auth" class="btn btn-sm btn-outline-secondary">Cancel</a>
+        <button type="submit" class="btn btn-sm btn-primary"><i class="bi bi-save me-1"></i> Save Changes</button>
+    </div>
+</form>
 <script>
-document.getElementById('oidcNewUserPolicy').addEventListener('change', function() {
-    document.getElementById('oidcTemplateUserWrap').style.display = this.value === 'copy' ? '' : 'none';
+document.getElementById('oidcNewUserPolicy').addEventListener('change', function () {
+    // grid, not block — restoring display:block would collapse the three columns
+    document.getElementById('oidcTemplateUserWrap').style.display = this.value === 'copy' ? 'grid' : 'none';
 });
 </script>
 <?php endif; ?>
 
 <!-- Branding Tab -->
 <?php if ($activeTab === 'branding'): ?>
-<div class="card border-0 shadow-sm">
-    <div class="card-header fw-semibold">
-        <i class="bi bi-palette me-1"></i> Branding
-    </div>
-    <div class="card-body">
-        <p class="text-muted small mb-4">Customize the BBS interface with your own logos. Images are stored in the database and persist across updates.</p>
+<div class="settings-page-head">
+    <h1 class="settings-page-title">Branding</h1>
+    <p class="settings-page-lede mb-0">Replace the logos with your own. Images are stored in the database, so they survive updates.</p>
+</div>
+<div>
+    <div>
 
         <form method="POST" action="/settings/branding" enctype="multipart/form-data" id="brandingForm">
             <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
@@ -1621,11 +2253,13 @@ document.getElementById('oidcNewUserPolicy').addEventListener('change', function
                 <div class="col-md-7">
                     <h6><i class="bi bi-image me-1"></i> Navbar Icon</h6>
                     <p class="text-muted small">
-                        Transparent PNG shown in the top-left corner of every page (sits in a ~115×100px slot
-                        and overflows slightly into the page header). Also reused as the small header logo on
-                        the <strong>mobile login screen</strong>, since the wider Login Page Logo would crowd a
-                        phone-width pane. Wide landscape artwork works best. Will be resized to fit within
-                        360×200 pixels max.
+                        Transparent PNG shown in the top-left corner of every page, in a
+                        <strong>192&times;64 pixel</strong> slot above the menu. Wide landscape artwork suits it
+                        best &mdash; around <strong>3:1</strong> fills the slot edge to edge, and anything taller
+                        than that is scaled to the 64px height with space left either side. Also reused as the
+                        small header logo on the <strong>mobile login screen</strong>, since the wider Login Page
+                        Logo would crowd a phone-width pane. Uploads are resized to fit within 360&times;200
+                        pixels.
                     </p>
                     <input type="file" class="form-control form-control-sm" id="iconFileInput" accept="image/png">
                     <div class="small text-muted mt-1" id="iconDimensions"></div>
@@ -1733,7 +2367,7 @@ document.getElementById('oidcNewUserPolicy').addEventListener('change', function
                 </select>
             </div>
 
-            <button type="submit" class="btn btn-primary">
+            <button type="submit" class="btn btn-sm btn-primary">
                 <i class="bi bi-check-lg me-1"></i> Save Branding
             </button>
         </form>
@@ -1811,13 +2445,223 @@ document.getElementById('appIconFileInput').addEventListener('change', function(
 <?php endif; ?>
 
 <!-- API Tab -->
-<?php if ($activeTab === 'api'): ?>
-<div class="card border-0 shadow-sm">
-    <div class="card-header fw-semibold">
-        <i class="bi bi-key me-1"></i> API Tokens
+<?php if ($activeTab === 'ssl'): ?>
+<?php $c = $certificate ?? null; ?>
+<div class="settings-page-head">
+    <h1 class="settings-page-title">SSL Certificate</h1>
+    <p class="settings-page-lede mb-0">The certificate this server presents to browsers and agents. Renewal is automatic; this page is for checking it worked and stepping in when it didn't.</p>
+</div>
+<div>
+    <h5 class="settings-group">Status</h5>
+
+    <?php if ($c && !empty($c['installed']) && (($settings['certificate_external'] ?? '0') === '1')): ?>
+    <div class="alert alert-secondary d-flex align-items-start">
+        <i class="bi bi-info-circle me-2 fs-5"></i>
+        <div>
+            <strong>Expiry warnings are off for this certificate.</strong>
+            <div class="small mt-1">TLS is terminated elsewhere, so the certificate clients see is not this one. Its details are below for reference; nothing here will warn when it expires.</div>
+        </div>
     </div>
-    <div class="card-body">
-        <p class="text-muted small mb-3">API tokens allow automated access to the BBS provisioning API. Tokens have full admin access. Keep them secret.</p>
+    <?php endif; ?>
+
+    <?php if (!$c || empty($c['installed'])): ?>
+    <div class="alert alert-secondary d-flex align-items-start">
+        <i class="bi bi-info-circle me-2 fs-5"></i>
+        <div>
+            <strong>No certificate found on this server.</strong>
+            <div class="small mt-1">
+                That is expected if TLS is terminated somewhere else — a reverse proxy, a load balancer, or a Docker setup that handles certificates outside the container. If this server is meant to hold its own certificate, run
+                <code>certbot --apache -d <?= htmlspecialchars($settings['server_host'] ?? 'your.hostname') ?></code> and reload this page.
+            </div>
+        </div>
+    </div>
+    <?php else: ?>
+
+    <?php
+        $days = $c['days_remaining'];
+        if (!empty($c['expired']))          { $band = 'danger';  $note = 'This certificate has expired.'; }
+        elseif (!empty($c['expiring_soon'])) { $band = 'warning'; $note = 'Renewal has not happened yet — check the schedule below.'; }
+        else                                 { $band = 'success'; $note = 'Renewal runs automatically before this date.'; }
+    ?>
+    <div class="alert alert-<?= $band ?> d-flex align-items-start">
+        <i class="bi bi-<?= $band === 'success' ? 'shield-check' : 'exclamation-triangle' ?> me-2 fs-5"></i>
+        <div>
+            <strong>
+                <?php if ($days === null): ?>Certificate installed
+                <?php elseif ($days < 0): ?>Expired <?= abs($days) ?> day<?= abs($days) === 1 ? '' : 's' ?> ago
+                <?php else: ?><?= $days ?> day<?= $days === 1 ? '' : 's' ?> remaining
+                <?php endif; ?>
+            </strong>
+            <div class="small mt-1"><?= htmlspecialchars($note) ?></div>
+        </div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Covers</div>
+            <p class="settings-row-help">The names this certificate is valid for. A browser reaching the server by any other name will warn.</p>
+        </div>
+        <div class="settings-row-control">
+            <span class="small"><?= $c['domains'] ? htmlspecialchars(implode(', ', $c['domains'])) : '—' ?></span>
+        </div>
+        <div class="settings-row-default"></div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Issued by</div>
+            <p class="settings-row-help"><?= !empty($c['self_signed']) ? 'Self-signed. Browsers will warn, and this cannot be renewed automatically.' : 'The certificate authority that signed it.' ?></p>
+        </div>
+        <div class="settings-row-control">
+            <span class="small"><?= htmlspecialchars($c['issuer'] ?? '—') ?></span>
+        </div>
+        <div class="settings-row-default"></div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Expires</div>
+            <p class="settings-row-help">Let's Encrypt certificates last 90 days and are renewed at 30 days remaining.</p>
+        </div>
+        <div class="settings-row-control">
+            <span class="small"><?= $c['expires_at'] ? \BBS\Core\TimeHelper::format($c['expires_at'], 'M j, Y g:ia') : '—' ?></span>
+        </div>
+        <div class="settings-row-default"></div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Automatic renewal</div>
+            <p class="settings-row-help">Certbot's own timer. If this says Not scheduled, nothing will renew the certificate and it will expire.</p>
+        </div>
+        <div class="settings-row-control">
+            <?php $timer = $c['auto_renewal'] ?? 'unknown'; ?>
+            <?php if ($timer === 'active' || $timer === 'cron'): ?>
+                <span class="badge bg-success-subtle text-success-emphasis">Scheduled<?= $timer === 'cron' ? ' (cron)' : '' ?></span>
+            <?php elseif ($timer === 'none'): ?>
+                <span class="badge bg-danger-subtle text-danger-emphasis">Not scheduled</span>
+            <?php else: ?>
+                <span class="badge bg-secondary-subtle text-secondary-emphasis">Unknown</span>
+            <?php endif; ?>
+        </div>
+        <div class="settings-row-default"></div>
+    </div>
+    <?php endif; ?>
+
+    <h5 class="settings-group mt-4">Expiry warnings</h5>
+    <form method="POST" action="/settings/ssl/external">
+        <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+        <div class="settings-row">
+            <div>
+                <div class="settings-row-label">This certificate is not the one clients see</div>
+                <p class="settings-row-help">Turn on when a reverse proxy or load balancer in front of this server holds the public certificate and the one here only covers the hop from the proxy, or is unused. BBS then stops warning about this server's certificate expiring. Keep it off when browsers and agents connect to this server directly.</p>
+            </div>
+            <div class="settings-row-control">
+                <div class="form-check form-switch mb-0">
+                    <input class="form-check-input" type="checkbox" role="switch" name="certificate_external" value="1"
+                           id="certificateExternal" onchange="this.form.submit()" <?= (($settings['certificate_external'] ?? '0') === '1') ? 'checked' : '' ?>>
+                    <label class="form-check-label" for="certificateExternal"><?= (($settings['certificate_external'] ?? '0') === '1') ? 'On' : 'Off' ?></label>
+                </div>
+            </div>
+            <div class="settings-row-default">Default: Off</div>
+        </div>
+    </form>
+    <form method="POST" action="/settings/ssl/email">
+        <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+        <div class="settings-row">
+            <div>
+                <div class="settings-row-label">Contact address</div>
+                <p class="settings-row-help">The contact address on the Let's Encrypt account, used for account and technical notices. Let's Encrypt stopped sending certificate expiry warnings in June 2025, so this address will not warn you about an expiring certificate — BBS does that itself. Leave blank to set none.</p>
+            </div>
+            <div class="settings-row-control">
+                <input type="email" class="form-control" name="ssl_email" style="max-width:260px;"
+                       placeholder="you@example.com"
+                       value="<?= htmlspecialchars($settings['ssl_contact_email'] ?? '') ?>">
+            </div>
+            <div class="settings-row-default">
+                <button type="submit" class="btn btn-sm btn-primary">Save</button>
+            </div>
+        </div>
+    </form>
+
+    <?php if ($c && !empty($c['installed']) && empty($c['self_signed'])): ?>
+    <h5 class="settings-group mt-4">Renew now</h5>
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Renew the certificate</div>
+            <p class="settings-row-help">Certbot declines while more than 30 days remain and will say so. Use Force only after fixing something that broke renewal — Let's Encrypt limits how many certificates a domain may be issued per week.</p>
+        </div>
+        <div class="settings-row-control d-flex gap-2">
+            <button type="button" class="btn btn-sm btn-primary" id="sslRenewBtn">Renew</button>
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="sslForceBtn">Force renew</button>
+        </div>
+        <div class="settings-row-default"></div>
+    </div>
+    <pre id="sslRenewOut" class="small bg-body-tertiary border rounded p-2 mt-2 d-none" style="max-height:320px;overflow:auto;white-space:pre-wrap;"></pre>
+    <?php endif; ?>
+</div>
+
+<script>
+(function () {
+    const out = document.getElementById('sslRenewOut');
+    if (!out) return;
+    const csrf = '<?= $this->csrfToken() ?>';
+
+    async function renew(force, btn) {
+        const label = btn.textContent;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Working…';
+        out.classList.remove('d-none', 'text-danger');
+        out.textContent = 'Asking certbot…';
+        try {
+            const body = new URLSearchParams({ csrf_token: csrf });
+            if (force) body.set('force', '1');
+            const r = await fetch('/settings/ssl/renew', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-CSRF-Token': csrf },
+                credentials: 'same-origin',
+                body,
+            });
+            const d = await r.json();
+            out.textContent = d.output || '(no output)';
+            if (d.status !== 'ok') out.classList.add('text-danger');
+        } catch (e) {
+            out.textContent = 'Request failed: ' + e.message;
+            out.classList.add('text-danger');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = label;
+        }
+    }
+
+    document.getElementById('sslRenewBtn').addEventListener('click', function () { renew(false, this); });
+    document.getElementById('sslForceBtn').addEventListener('click', function () {
+        if (!confirm('Force a new certificate even though the current one is still valid?\n\nLet\'s Encrypt limits certificates per domain per week.')) return;
+        renew(true, this);
+    });
+})();
+</script>
+<?php endif; ?>
+
+<?php if ($activeTab === 'api'): ?>
+<?php
+$metricsEnabled = ($settings['metrics_enabled'] ?? '0') === '1';
+$metricsAcl = \BBS\Services\MetricsAccess::parseAcl($settings['metrics_acl'] ?? '[]');
+$metricsProxies = \BBS\Services\MetricsAccess::parseCidrList($settings['metrics_trusted_proxies'] ?? '[]');
+if ($metricsAcl === []) {
+    $metricsAcl = [['cidr' => '127.0.0.1/32', 'token' => true, 'note' => 'localhost']];
+}
+if ($metricsProxies === []) {
+    $metricsProxies = [''];
+}
+?>
+<div class="settings-page-head">
+    <h1 class="settings-page-title">API</h1>
+    <p class="settings-page-lede mb-0">Tokens for automated access to the provisioning API. A token carries full admin access, so treat one like a password &mdash; except a monitoring token, which only reads.</p>
+</div>
+<div>
+    <div>
+        <h5 class="settings-group">Tokens</h5>
 
         <?php if (!empty($_SESSION['new_api_token'])): ?>
         <div class="alert alert-success d-flex align-items-center mb-3">
@@ -1838,7 +2682,7 @@ document.getElementById('appIconFileInput').addEventListener('change', function(
         <?php if (!empty($apiTokens)): ?>
         <div class="table-responsive mb-4">
             <table class="table table-hover">
-                <thead class="table-light">
+                <thead>
                     <tr>
                         <th>Name</th>
                         <th>User</th>
@@ -1851,7 +2695,15 @@ document.getElementById('appIconFileInput').addEventListener('change', function(
                     <?php foreach ($apiTokens as $token): ?>
                     <tr>
                         <td class="fw-semibold">
+                            <?php if (($token['kind'] ?? 'user') === 'mobile'): ?>
+                            <i class="bi bi-phone me-1 text-muted"></i><?= htmlspecialchars($token['device_name'] ?: $token['name']) ?>
+                            <span class="badge bg-info-subtle text-info-emphasis ms-2" title="Signed in from a mobile session<?= !empty($token['last_seen_ip']) ? ' — last seen from ' . htmlspecialchars($token['last_seen_ip']) : '' ?>">mobile</span>
+                            <?php else: ?>
                             <i class="bi bi-key me-1 text-muted"></i><?= htmlspecialchars($token['name']) ?>
+                            <?php endif; ?>
+                            <?php if (($token['kind'] ?? 'user') === 'metrics'): ?>
+                            <span class="badge bg-secondary-subtle text-secondary-emphasis ms-2" title="Reads /api/v1/metrics and /api/v1/health only — no write access, no secrets"><i class="bi bi-graph-up me-1"></i>monitoring</span>
+                            <?php endif; ?>
                             <?php if (!empty($token['can_read_secrets'])): ?>
                             <span class="badge bg-warning text-dark ms-2" title="This token can read repository passphrases and S3 credentials"><i class="bi bi-eye me-1"></i>secrets</span>
                             <?php endif; ?>
@@ -1873,6 +2725,18 @@ document.getElementById('appIconFileInput').addEventListener('change', function(
         <?php endif; ?>
 
         <h6>Create Token</h6>
+        <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            const kind = document.getElementById('tokenKind');
+            const wrap = document.getElementById('tokenSecretsWrap');
+            if (!kind || !wrap) return;
+            // Showing a toggle that the chosen type ignores reads as a promise
+            // the server will not keep.
+            const sync = () => { wrap.hidden = kind.value === 'metrics'; };
+            kind.addEventListener('change', sync);
+            sync();
+        });
+        </script>
         <form method="POST" action="/settings/api/tokens/create">
             <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
             <div class="row g-3 align-items-end">
@@ -1880,7 +2744,15 @@ document.getElementById('appIconFileInput').addEventListener('change', function(
                     <label class="form-label fw-semibold">Token Name</label>
                     <input type="text" class="form-control" name="name" required placeholder="e.g. ansible-provisioner">
                 </div>
-                <div class="col-md-6">
+                <div class="col-md-3">
+                    <label class="form-label fw-semibold">Type</label>
+                    <select class="form-select" name="kind" id="tokenKind">
+                        <option value="user">Full access (admin)</option>
+                        <option value="metrics">Monitoring (read-only)</option>
+                    </select>
+                    <div class="form-text small">A monitoring token reads <code>/api/v1/metrics</code> and <code>/api/v1/health</code> and nothing else &mdash; it cannot change anything, whatever the account it was created under. Use it for Prometheus.</div>
+                </div>
+                <div class="col-md-3" id="tokenSecretsWrap">
                     <div class="form-check mb-2">
                         <input class="form-check-input" type="checkbox" name="can_read_secrets" value="1" id="canReadSecrets">
                         <label class="form-check-label fw-semibold" for="canReadSecrets">Display Secrets</label>
@@ -1888,12 +2760,157 @@ document.getElementById('appIconFileInput').addEventListener('change', function(
                     <div class="form-text small">Allows this token to return repository passphrases and S3 credentials in API responses (e.g. <code>?include_secrets=1</code> on <code>GET&nbsp;/api/v1/repositories</code>). Leave unchecked unless you specifically need an escrow / disaster-recovery export.</div>
                 </div>
                 <div class="col-md-2">
-                    <button type="submit" class="btn btn-success w-100"><i class="bi bi-plus-circle me-1"></i>Create Token</button>
+                    <button type="submit" class="btn btn-sm btn-success w-100"><i class="bi bi-plus-circle me-1"></i>Create Token</button>
                 </div>
             </div>
         </form>
     </div>
 </div>
+
+<h5 class="settings-group mt-4">Monitoring</h5>
+<p class="settings-page-lede mb-3">Lets a monitoring system read <code>/api/v1/metrics</code> and <code>/api/v1/health</code> without an admin token. Callers are admitted by address; each range decides whether a token is also required.</p>
+
+<form method="POST" action="/settings/monitoring">
+    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Allow monitoring access</div>
+            <p class="settings-row-help">While this is off, the monitoring endpoints behave exactly as before: admin token only, from anywhere.</p>
+        </div>
+        <div class="settings-row-control">
+            <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" role="switch" name="metrics_enabled" value="1" id="metricsEnabled" <?= $metricsEnabled ? 'checked' : '' ?>>
+            </div>
+        </div>
+        <div class="settings-row-default">Default: off</div>
+    </div>
+
+    <div class="mb-3">
+        <label class="form-label fw-semibold">Allowed ranges</label>
+        <div class="table-responsive">
+            <table class="table table-sm align-middle mb-2">
+                <thead>
+                    <tr>
+                        <th style="min-width:200px">Address or range</th>
+                        <th style="width:130px" class="text-center">Token required</th>
+                        <th>Note</th>
+                        <th style="width:44px"></th>
+                    </tr>
+                </thead>
+                <tbody id="metricsAclRows">
+                    <?php foreach ($metricsAcl as $i => $entry): ?>
+                    <tr>
+                        <td><input type="text" class="form-control form-control-sm font-monospace" name="acl_cidr[<?= $i ?>]" value="<?= htmlspecialchars($entry['cidr']) ?>" placeholder="10.0.0.0/27"></td>
+                        <td class="text-center"><input class="form-check-input" type="checkbox" name="acl_token[]" value="<?= $i ?>" <?= !empty($entry['token']) ? 'checked' : '' ?>></td>
+                        <td><input type="text" class="form-control form-control-sm" name="acl_note[<?= $i ?>]" value="<?= htmlspecialchars($entry['note']) ?>" placeholder="prometheus cluster"></td>
+                        <td class="text-end"><button type="button" class="btn btn-sm btn-outline-secondary js-acl-del" title="Remove this range"><i class="bi bi-x"></i></button></td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+        <button type="button" class="btn btn-sm btn-outline-secondary" id="metricsAclAdd"><i class="bi bi-plus-circle me-1"></i>Add a range</button>
+        <div class="form-text small mt-2">
+            One row per network: <code>10.0.0.0/27</code> and <code>10.0.2.40/27</code> are two rows, each revocable on its own. A bare address means that address alone.
+            The most specific range wins, so a narrow exception beats the wide range around it.
+            Host bits are cleared on save (<code>10.0.0.5/27</code> becomes <code>10.0.0.0/27</code>) and the result is shown back to you.
+            A range reachable from everywhere must keep <strong>token required</strong> ticked.
+        </div>
+    </div>
+
+    <div class="mb-3">
+        <label class="form-label fw-semibold">Trusted proxies <span class="text-muted fw-normal">&mdash; optional</span></label>
+        <div id="metricsProxyRows">
+            <?php foreach ($metricsProxies as $proxy): ?>
+            <div class="input-group input-group-sm mb-2" style="max-width:420px">
+                <input type="text" class="form-control font-monospace" name="proxy_cidr[]" value="<?= htmlspecialchars($proxy) ?>" placeholder="10.0.1.0/24">
+                <button type="button" class="btn btn-outline-secondary js-proxy-del" title="Remove"><i class="bi bi-x"></i></button>
+            </div>
+            <?php endforeach; ?>
+        </div>
+        <button type="button" class="btn btn-sm btn-outline-secondary" id="metricsProxyAdd"><i class="bi bi-plus-circle me-1"></i>Add a proxy</button>
+        <div class="form-text small mt-2">
+            Behind a reverse proxy or an ingress, every request arrives from the proxy, so the ranges above would match <em>it</em> rather than the scraper.
+            List the proxy here and its <code>X-Forwarded-For</code> is believed &mdash; its last hop only. Leave empty and only the real socket address counts, which is what you want when BBS is reached directly.
+        </div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Scrape rate limit</div>
+            <p class="settings-row-help">Requests per minute, per calling address. A scrape every minute is the usual cadence; this only stops a runaway loop.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="number" class="form-control form-control-narrow" name="metrics_rate_per_minute" min="1" max="600" value="<?= (int) ($settings['metrics_rate_per_minute'] ?? 12) ?>">
+            <span class="settings-row-unit">per minute</span>
+        </div>
+        <div class="settings-row-default">Default: 12</div>
+    </div>
+
+    <div class="settings-row">
+        <div>
+            <div class="settings-row-label">Metrics cache</div>
+            <p class="settings-row-help">How long a rendered snapshot is reused. The queries behind it read the whole job history, so on a large fleet this is what keeps frequent scraping cheap. 0 disables the cache.</p>
+        </div>
+        <div class="settings-row-control">
+            <input type="number" class="form-control form-control-narrow" name="metrics_cache_seconds" min="0" max="3600" value="<?= (int) ($settings['metrics_cache_seconds'] ?? 30) ?>">
+            <span class="settings-row-unit">seconds</span>
+        </div>
+        <div class="settings-row-default">Default: 30 seconds</div>
+    </div>
+
+    <div class="settings-actions">
+        <button type="submit" class="btn btn-sm btn-success"><i class="bi bi-check-lg me-1"></i>Save monitoring access</button>
+    </div>
+</form>
+
+<script>
+(function () {
+    const rows = document.getElementById('metricsAclRows');
+    const addRow = document.getElementById('metricsAclAdd');
+    if (!rows || !addRow) return;
+
+    // Row indexes have to stay unique for the whole life of the page: the
+    // checkbox carries the index of the row it belongs to, so reusing one
+    // after a delete would tie two rows to the same "token required" box.
+    let next = rows.querySelectorAll('tr').length;
+
+    addRow.addEventListener('click', function () {
+        const i = next++;
+        const tr = document.createElement('tr');
+        tr.innerHTML = '<td><input type="text" class="form-control form-control-sm font-monospace" name="acl_cidr[' + i + ']" placeholder="10.0.0.0/27"></td>'
+            + '<td class="text-center"><input class="form-check-input" type="checkbox" name="acl_token[]" value="' + i + '" checked></td>'
+            + '<td><input type="text" class="form-control form-control-sm" name="acl_note[' + i + ']" placeholder="prometheus cluster"></td>'
+            + '<td class="text-end"><button type="button" class="btn btn-sm btn-outline-secondary js-acl-del" title="Remove this range"><i class="bi bi-x"></i></button></td>';
+        rows.appendChild(tr);
+        tr.querySelector('input').focus();
+    });
+
+    rows.addEventListener('click', function (e) {
+        const btn = e.target.closest('.js-acl-del');
+        if (btn) btn.closest('tr').remove();
+    });
+
+    const proxies = document.getElementById('metricsProxyRows');
+    const addProxy = document.getElementById('metricsProxyAdd');
+    if (proxies && addProxy) {
+        addProxy.addEventListener('click', function () {
+            const div = document.createElement('div');
+            div.className = 'input-group input-group-sm mb-2';
+            div.style.maxWidth = '420px';
+            div.innerHTML = '<input type="text" class="form-control font-monospace" name="proxy_cidr[]" placeholder="10.0.1.0/24">'
+                + '<button type="button" class="btn btn-outline-secondary js-proxy-del" title="Remove"><i class="bi bi-x"></i></button>';
+            proxies.appendChild(div);
+            div.querySelector('input').focus();
+        });
+        proxies.addEventListener('click', function (e) {
+            const btn = e.target.closest('.js-proxy-del');
+            if (btn) btn.closest('.input-group').remove();
+        });
+    }
+})();
+</script>
 
 <div class="card border-0 shadow-sm mt-4">
     <div class="card-header fw-semibold">
@@ -1903,25 +2920,27 @@ document.getElementById('appIconFileInput').addEventListener('change', function(
         <p class="text-muted small mb-3">Use your API token with the <code>Authorization: Bearer &lt;token&gt;</code> header. All endpoints accept and return JSON.</p>
 
         <table class="table table-sm small mb-0">
-            <thead class="table-light">
+            <thead>
                 <tr><th>Method</th><th>Endpoint</th><th>Description</th></tr>
             </thead>
             <tbody>
                 <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/summary</code></td><td>Summary of each client's backup plans and latest backup result</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/metrics</code></td><td>Monitoring snapshot: client/queue counts, per-plan last run &amp; last success, job totals, repo sizes. Readable by a monitoring token.</td></tr>
+                <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/health</code></td><td>Database, scheduler, storage, catalog, clients, backups and maintenance checks. Readable by a monitoring token; 503 when critical.</td></tr>
                 <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/clients</code></td><td>List all clients</td></tr>
-                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients</code></td><td>Create a client (returns api_key for agent install)</td></tr>
+                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients</code></td><td>Create a client (returns api_key for agent install): <code>{"name": "web-01", "location": "Frankfurt DC"}</code>, <code>location</code> optional</td></tr>
                 <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/clients/{id}</code></td><td>Get client details with repos &amp; plans</td></tr>
-                <tr><td><span class="badge bg-warning text-dark">PUT</span></td><td><code>/api/v1/clients/{id}</code></td><td>Rename a client: <code>{"name": "new-name"}</code></td></tr>
+                <tr><td><span class="badge bg-warning text-dark">PUT</span></td><td><code>/api/v1/clients/{id}</code></td><td>Update a client. Any of <code>name</code>, <code>location</code> (≤ 100 chars), <code>offline_alerts</code> (bool), <code>client_profile_id</code>, <code>user_id</code>, <code>server_host_override</code>, <code>ssh_port_override</code>, <code>wol_*</code>, <code>notes</code>. Non-admin tokens may change only <code>name</code> and <code>location</code>.</td></tr>
                 <tr><td><span class="badge bg-danger">DELETE</span></td><td><code>/api/v1/clients/{id}</code></td><td>Delete a client</td></tr>
                 <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/clients/{id}/repositories</code></td><td>List repositories</td></tr>
                 <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients/{id}/repositories</code></td><td>Create a repository</td></tr>
                 <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/clients/{id}/plans</code></td><td>List backup plans</td></tr>
-                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients/{id}/plans</code></td><td>Create a backup plan (with optional plugin configs)</td></tr>
+                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients/{id}/plans</code></td><td>Create a backup plan (with optional plugin configs). <code>template_id</code> fills directories, excludes and advanced options from a backup template; fields you send override it.</td></tr>
                 <tr><td><span class="badge bg-warning text-dark">PUT</span></td><td><code>/api/v1/clients/{id}/repositories/{repo_id}</code></td><td>Rename a repository</td></tr>
-                <tr><td><span class="badge bg-danger">DELETE</span></td><td><code>/api/v1/clients/{id}/repositories/{repo_id}</code></td><td>Delete a repository</td></tr>
+                <tr><td><span class="badge bg-danger">DELETE</span></td><td><code>/api/v1/clients/{id}/repositories/{repo_id}</code></td><td>Delete a repository (<code>?keep_data=1</code> unlinks only, keeping borg data on disk)</td></tr>
                 <tr><td colspan="3" class="text-muted small fw-semibold pt-2">Backup Plans</td></tr>
                 <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/clients/{id}/plans</code></td><td>List backup plans</td></tr>
-                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients/{id}/plans</code></td><td>Create a backup plan</td></tr>
+                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients/{id}/plans</code></td><td>Create a backup plan. <code>template_id</code> fills directories, excludes and advanced options from a backup template; fields you send override it.</td></tr>
                 <tr><td><span class="badge bg-warning text-dark">PUT</span></td><td><code>/api/v1/clients/{id}/plans/{plan_id}</code></td><td>Edit plan, schedule, plugins</td></tr>
                 <tr><td><span class="badge bg-danger">DELETE</span></td><td><code>/api/v1/clients/{id}/plans/{plan_id}</code></td><td>Delete a plan</td></tr>
                 <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/clients/{id}/plans/{plan_id}/pause</code></td><td>Pause schedule</td></tr>
@@ -1959,7 +2978,7 @@ document.getElementById('appIconFileInput').addEventListener('change', function(
                 <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/schedules</code></td><td>Flat list of every plan with its schedule, next_run, last_run, last_status, and last_completed_at across all clients</td></tr>
                 <tr><td colspan="3" class="text-muted small fw-semibold pt-2">Maintenance</td></tr>
                 <tr><td><span class="badge bg-success">GET</span></td><td><code>/api/v1/maintenance</code></td><td>Read the maintenance-mode flag</td></tr>
-                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/maintenance</code></td><td>Toggle maintenance mode: <code>{"enabled": true|false}</code> (pauses agent dispatch)</td></tr>
+                <tr><td><span class="badge bg-primary">POST</span></td><td><code>/api/v1/maintenance</code></td><td>Toggle maintenance mode: <code>{"enabled": true|false}</code> (pauses the job queue; running jobs finish)</td></tr>
             </tbody>
         </table>
 
@@ -1989,6 +3008,11 @@ sudo /var/www/bbs/bin/bbs-token revoke "ansible"</code></pre>
 
 <!-- Updates Tab -->
 <?php if ($activeTab === 'updates'): ?>
+<div class="settings-page-head">
+    <h1 class="settings-page-title">Updates</h1>
+    <p class="settings-page-lede mb-0">The version of BBS on this server, and the borg build its clients run.</p>
+</div>
+
 
 <!-- Updates Sub-Navigation -->
 <ul class="nav storage-subnav mb-4">
@@ -2158,7 +3182,7 @@ sudo /var/www/bbs/bin/bbs-token revoke "ansible"</code></pre>
                 <?php else: ?>
                     <div class="table-responsive">
                     <table class="table table-sm small mb-0" id="borg-clients-table">
-                        <thead class="table-light">
+                        <thead>
                             <tr>
                                 <th>Client</th>
                                 <th>OS</th>
@@ -2345,27 +3369,17 @@ sudo /var/www/bbs/bin/bbs-token revoke "ansible"</code></pre>
 ?>
 <?php
 // Agent version check
-$bundledAgentVersion = null;
-$agentPyFile = dirname(__DIR__, 3) . '/agent/bbs-agent.py';
-if (file_exists($agentPyFile)) {
-    $fh = fopen($agentPyFile, 'r');
-    if ($fh) {
-        for ($i = 0; $i < 50 && ($ln = fgets($fh)) !== false; $i++) {
-            if (preg_match('/^AGENT_VERSION\s*=\s*["\']([^"\']+)["\']/m', $ln, $mv)) {
-                $bundledAgentVersion = $mv[1];
-                break;
-            }
-        }
-        fclose($fh);
-    }
-}
+$bundledAgentVersion = $updateSvc->getBundledAgentVersion();
 $allAgents = $bundledAgentVersion ? $this->db->fetchAll("SELECT id, name, agent_version FROM agents WHERE agent_version IS NOT NULL") : [];
-$outdatedAgents = $bundledAgentVersion ? array_filter($allAgents, fn($a) => $a['agent_version'] !== $bundledAgentVersion) : [];
+// Everyone on an older agent is listed (#566); only those that accept
+// server-driven updates count toward "Update All".
+$agentsBehind = $bundledAgentVersion ? $updateSvc->getAgentsBehind() : [];
 $totalAgents = count($allAgents);
-$outdatedCount = count($outdatedAgents);
+$behindCount = count($agentsBehind);
+$updatableCount = count(array_filter($agentsBehind, fn($a) => !empty($a['auto_update_enabled'])));
 ?>
-<div class="row g-4">
-    <div class="col-lg-6">
+<div class="row g-4" id="updates-row">
+    <div class="col-lg-6" id="updates-left-col">
         <div class="card border-0 shadow-sm">
             <div class="card-header fw-semibold">
                 Borg Backup Server Version
@@ -2442,14 +3456,14 @@ docker compose up -d</pre>
         <?php if ($bundledAgentVersion): ?>
         <div class="card border-0 shadow-sm mt-4">
             <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
-                <span><i class="bi bi-pc-display me-1"></i> BBS Client</span>
+                <span><i class="bi bi-pc-display me-1"></i> Borg Backup Server Agents</span>
                 <span class="badge bg-success" id="agent-bundled-ver">v<?= htmlspecialchars($bundledAgentVersion) ?></span>
             </div>
             <div class="card-body" id="agent-updates-body">
-                <p class="text-muted small mb-3">The BBS Client receives commands from the server to initiate backups, perform restores, and update Borg software.</p>
+                <p class="text-muted small mb-3">The BBS Agents receive commands from this server to start backups, run restores, and update their own software and Borg.</p>
                 <?php if ($totalAgents === 0): ?>
                     <p class="text-muted small mb-0">No clients connected yet.</p>
-                <?php elseif ($outdatedCount === 0): ?>
+                <?php elseif ($behindCount === 0): ?>
                     <div class="d-flex align-items-center small">
                         <span class="badge rounded-pill me-2" style="background-color: #e8f5e9; color: #2e7d32;"><i class="bi bi-check-circle me-1"></i>Up to date</span>
                         All <?= $totalAgents ?> client(s) running v<?= htmlspecialchars($bundledAgentVersion) ?>
@@ -2457,20 +3471,22 @@ docker compose up -d</pre>
                 <?php else: ?>
                     <div class="d-flex align-items-center justify-content-between mb-3">
                         <div class="small">
-                            <span class="badge rounded-pill text-dark me-1" style="background-color: #fff3cd;"><?= $outdatedCount ?> outdated</span>
+                            <span class="badge rounded-pill text-dark me-1" style="background-color: #fff3cd;"><?= $behindCount ?> outdated</span>
                             of <?= $totalAgents ?> client(s)
                         </div>
-                        <form method="POST" action="/settings/upgrade-agents" data-confirm="Queue agent updates for <?= $outdatedCount ?> client(s)?">
+                        <?php if ($updatableCount > 0): ?>
+                        <form method="POST" action="/settings/upgrade-agents" data-confirm="Queue agent updates for <?= $updatableCount ?> client(s)?">
                             <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                             <button type="submit" class="btn btn-sm btn-primary">
                                 <i class="bi bi-arrow-up-circle me-1"></i> Update All
                             </button>
                         </form>
+                        <?php endif; ?>
                     </div>
-                    <?php foreach ($outdatedAgents as $oa): ?>
+                    <?php foreach ($agentsBehind as $oa): ?>
                     <div class="d-flex justify-content-between align-items-center small py-1">
                         <span><i class="bi bi-pc-display me-1 text-muted"></i><?= htmlspecialchars($oa['name']) ?></span>
-                        <span class="text-muted">v<?= htmlspecialchars($oa['agent_version']) ?></span>
+                        <span class="text-muted">v<?= htmlspecialchars($oa['agent_version']) ?><?php if (empty($oa['auto_update_enabled'])): ?> <span class="badge bg-secondary ms-1" title="This client manages its own updates, so the server won't update it. Container agents update by pulling a newer image.">updates itself</span><?php endif; ?></span>
                     </div>
                     <?php endforeach; ?>
                 <?php endif; ?>
@@ -2478,33 +3494,8 @@ docker compose up -d</pre>
         </div>
         <?php endif; ?>
         </div>
-    </div>
-
-    <?php if (!empty($latest['notes'])): ?>
-    <div class="col-lg-6">
-        <div class="card border-0 shadow-sm">
-            <div class="card-header fw-semibold">
-                <i class="bi bi-journal-text me-1"></i> Release Notes
-                <?php if (!empty($latest['url'])): ?>
-                    <a href="<?= htmlspecialchars($latest['url']) ?>" target="_blank" class="float-end small text-decoration-none">
-                        View on GitHub <i class="bi bi-box-arrow-up-right"></i>
-                    </a>
-                <?php endif; ?>
-            </div>
-            <div class="card-body small release-notes-md">
-                <?php $converter = new \League\CommonMark\GithubFlavoredMarkdownConverter(['html_input' => 'strip']); echo $converter->convert($latest['notes']); ?>
-            </div>
-        </div>
-    </div>
-    <?php endif; ?>
-</div>
-
 <?php if (!$isDocker): ?>
-<hr>
-
-<div class="row g-4">
-    <div class="col-lg-6">
-        <div class="card border-0 shadow-sm">
+        <div class="card border-0 shadow-sm mt-4">
             <div class="card-header fw-semibold">
                 <i class="bi bi-git me-1"></i> Developer Sync
             </div>
@@ -2521,9 +3512,76 @@ docker compose up -d</pre>
                 </form>
             </div>
         </div>
-    </div>
-</div>
 <?php endif; ?>
+    </div>
+
+    <?php if (!empty($latest['notes'])): ?>
+    <div class="col-lg-6" id="updates-notes-col">
+        <div class="card border-0 shadow-sm h-100 d-flex flex-column">
+            <div class="card-header fw-semibold flex-shrink-0">
+                <i class="bi bi-journal-text me-1"></i> Release Notes
+                <?php if (!empty($latest['url'])): ?>
+                    <a href="<?= htmlspecialchars($latest['url']) ?>" target="_blank" class="float-end small text-decoration-none">
+                        View on GitHub <i class="bi bi-box-arrow-up-right"></i>
+                    </a>
+                <?php endif; ?>
+            </div>
+            <div class="card-body small release-notes-md" id="release-notes-body">
+                <?php echo (new \BBS\Services\ReleaseNotes())->render((string) $latest['notes']); ?>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
+</div>
+
+<script>
+(function () {
+    const left  = document.getElementById('updates-left-col');
+    const notes = document.getElementById('release-notes-body');
+    if (!left || !notes) return;
+
+    // Release notes grow with however much was written; the column beside them
+    // does not. Left alone the notes set the height of the row and the page
+    // runs on past everything else, so cap them at the height of that column
+    // and scroll the rest.
+    function fit() {
+        // Single column on small screens — a cap there would be a scrollbar
+        // inside a scrollbar for no gain.
+        if (window.innerWidth < 992) {
+            notes.style.maxHeight = '';
+            notes.style.overflowY = '';
+            return;
+        }
+        const card = notes.closest('.card');
+        const header = card ? card.querySelector('.card-header') : null;
+        const headerH = header ? header.offsetHeight : 0;
+
+        // Two limits, and the smaller wins. Matching the column beside it was
+        // the request, but that column is often taller than the window, so on
+        // its own it left the page scrolling past everything.
+        const besideCol = left.offsetHeight - headerH;
+
+        // Measured from the notes element rather than its card. The card's
+        // position was read before the layout settled, so this came out too
+        // generous and the column limit won — the panel then hung below the
+        // fold, which is the thing it exists to prevent.
+        notes.style.maxHeight = '';
+        const inWindow = window.innerHeight - notes.getBoundingClientRect().top - 24;
+
+        notes.style.maxHeight = Math.max(Math.min(besideCol, inWindow), 240) + 'px';
+        notes.style.overflowY = 'auto';
+    }
+
+    fit();
+    // Again once fonts and images have settled — the first run measures a
+    // layout that is still moving.
+    window.addEventListener('load', fit);
+    window.addEventListener('resize', fit);
+    // The left column carries badges and counts that arrive after the update
+    // check returns, and its height changes when they do.
+    if (window.ResizeObserver) new ResizeObserver(fit).observe(left);
+})();
+</script>
 
 <?php if ($upgradeResult): ?>
 <div class="card border-0 shadow-sm mt-4">
@@ -2538,7 +3596,6 @@ docker compose up -d</pre>
 <?php endif; ?>
 
 <?php endif; ?>
-</div><!-- /client-tab-content -->
 
 <script>
 // Remote SSH host management
@@ -2644,25 +3701,30 @@ document.getElementById('btnTestSmtp')?.addEventListener('click', function() {
                 var verEl = document.getElementById('agent-bundled-ver');
                 if (verEl) verEl.textContent = 'v' + data.bundled_version;
                 var html = '';
-                var descHtml = '<p class="text-muted small mb-3">The BBS Client receives commands from the server to initiate backups, perform restores, and update Borg software.</p>';
+                var descHtml = '<p class="text-muted small mb-3">The BBS Agents receive commands from this server to start backups, run restores, and update their own software and Borg.</p>';
                 if (data.total === 0) {
                     html = descHtml + '<p class="text-muted small mb-0">No clients connected yet.</p>';
-                } else if (data.outdated.length === 0) {
+                } else if (data.behind.length === 0) {
                     html = descHtml + '<div class="d-flex align-items-center small">'
                          + '<span class="badge rounded-pill me-2" style="background-color: #e8f5e9; color: #2e7d32;"><i class="bi bi-check-circle me-1"></i>Up to date</span>'
                          + 'All ' + data.total + ' client(s) running v' + data.bundled_version
                          + '</div>';
                 } else {
                     html = descHtml + '<div class="d-flex align-items-center justify-content-between mb-3">'
-                         + '<div class="small"><span class="badge rounded-pill text-dark me-1" style="background-color: #fff3cd;">' + data.outdated.length + ' outdated</span> of ' + data.total + ' client(s)</div>'
-                         + '<form method="POST" action="/settings/upgrade-agents" data-confirm="Queue agent updates for ' + data.outdated.length + ' client(s)?">'
-                         + '<input type="hidden" name="csrf_token" value="' + csrfToken + '">'
-                         + '<button type="submit" class="btn btn-sm btn-primary"><i class="bi bi-arrow-up-circle me-1"></i> Update All</button>'
-                         + '</form></div>';
-                    data.outdated.forEach(function(a) {
+                         + '<div class="small"><span class="badge rounded-pill text-dark me-1" style="background-color: #fff3cd;">' + data.behind.length + ' outdated</span> of ' + data.total + ' client(s)</div>';
+                    if (data.outdated.length > 0) {
+                        html += '<form method="POST" action="/settings/upgrade-agents" data-confirm="Queue agent updates for ' + data.outdated.length + ' client(s)?">'
+                              + '<input type="hidden" name="csrf_token" value="' + csrfToken + '">'
+                              + '<button type="submit" class="btn btn-sm btn-primary"><i class="bi bi-arrow-up-circle me-1"></i> Update All</button>'
+                              + '</form>';
+                    }
+                    html += '</div>';
+                    data.behind.forEach(function(a) {
                         html += '<div class="d-flex justify-content-between align-items-center small py-1">'
                               + '<span><i class="bi bi-pc-display me-1 text-muted"></i>' + a.name.replace(/</g, '&lt;') + '</span>'
-                              + '<span class="text-muted">v' + a.agent_version.replace(/</g, '&lt;') + '</span></div>';
+                              + '<span class="text-muted">v' + a.agent_version.replace(/</g, '&lt;')
+                              + (a.auto_update_enabled == 1 ? '' : ' <span class="badge bg-secondary ms-1" title="This client manages its own updates, so the server won\'t update it. Container agents update by pulling a newer image.">updates itself</span>')
+                              + '</span></div>';
                     });
                 }
                 container.innerHTML = html;
@@ -2670,4 +3732,17 @@ document.getElementById('btnTestSmtp')?.addEventListener('click', function() {
             .catch(function() {});
     }, 10000);
 })();
+</script>
+
+<script>
+// Every settings switch says what it is, not just which way it points. Lives
+// outside the per-tab blocks because three pages use it now.
+document.querySelectorAll('.settings-row .form-switch input[type=checkbox]').forEach(function (box) {
+    box.addEventListener('change', function () {
+        var label = document.querySelector('label[for="' + box.id + '"]');
+        if (label && label.dataset.on) {
+            label.textContent = box.checked ? label.dataset.on : label.dataset.off;
+        }
+    });
+});
 </script>

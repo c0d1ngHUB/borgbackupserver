@@ -33,6 +33,10 @@ class RemoteSshConfigController extends Controller
             $this->flash('danger', 'Name, host, user, and SSH private key are required.');
             $this->redirect('/storage-locations');
         }
+        if ($fieldErr = \BBS\Services\RemoteSshService::fieldError($remoteHost, $remoteUser, $borgRemotePath)) {
+            $this->flash('danger', $fieldErr);
+            $this->redirect('/storage-locations');
+        }
 
         if ($remotePort < 1 || $remotePort > 65535) {
             $remotePort = 22;
@@ -56,6 +60,7 @@ class RemoteSshConfigController extends Controller
             'ssh_private_key_encrypted' => Encryption::encrypt($sshPrivateKey),
             'borg_remote_path' => $borgRemotePath,
             'append_repo_name' => $appendRepoName,
+            'max_concurrent' => $this->maxConcurrentFromPost(),
         ];
         $data = array_merge($data, $borgBaseFields);
 
@@ -117,6 +122,10 @@ class RemoteSshConfigController extends Controller
             $this->flash('danger', 'Name, host, and user are required.');
             $this->redirect('/storage-locations');
         }
+        if ($fieldErr = \BBS\Services\RemoteSshService::fieldError($remoteHost, $remoteUser, $borgRemotePath)) {
+            $this->flash('danger', $fieldErr);
+            $this->redirect('/storage-locations');
+        }
 
         if ($remotePort < 1 || $remotePort > 65535) {
             $remotePort = 22;
@@ -134,6 +143,7 @@ class RemoteSshConfigController extends Controller
             'remote_base_path' => $remoteBasePath,
             'borg_remote_path' => $borgRemotePath,
             'append_repo_name' => $appendRepoName,
+            'max_concurrent' => $this->maxConcurrentFromPost(),
         ];
         if ($isBorgBase) {
             $data['provider'] = 'borgbase';
@@ -147,6 +157,23 @@ class RemoteSshConfigController extends Controller
         // Only update SSH key if a new one was provided
         if (!empty($sshPrivateKey)) {
             $data['ssh_private_key_encrypted'] = Encryption::encrypt($sshPrivateKey);
+        }
+
+        // Cached usage describes the machine that was there before. Point the
+        // config somewhere else and those figures — and any recorded failure —
+        // are about a host this config no longer refers to, so they go rather
+        // than sit there until the next poll still naming the old hostname.
+        $pointsElsewhere = $remoteHost !== ($existing['remote_host'] ?? '')
+            || $remotePort !== (int) ($existing['remote_port'] ?? 22)
+            || $remoteUser !== ($existing['remote_user'] ?? '')
+            || $remoteBasePath !== ($existing['remote_base_path'] ?? './')
+            || !empty($sshPrivateKey);
+        if ($pointsElsewhere) {
+            $data['disk_total_bytes'] = null;
+            $data['disk_used_bytes'] = null;
+            $data['disk_free_bytes'] = null;
+            $data['disk_checked_at'] = null;
+            $data['disk_check_error'] = null;
         }
 
         $borgBaseApiChanged = trim($_POST['borgbase_api_key'] ?? '') !== ''
@@ -174,6 +201,26 @@ class RemoteSshConfigController extends Controller
             (new RemoteSshService())->refreshBorgBaseDiskUsage(array_merge($existing, $data, ['id' => $id]));
         }
 
+        // Repo paths embed this config's host/port/user/base path at creation
+        // time. Rebuild them so existing repos follow the change instead of
+        // still pointing at the old host (#358).
+        $repos = $this->db->fetchAll(
+            "SELECT id, name FROM repositories WHERE remote_ssh_config_id = ? AND storage_type = 'remote_ssh'",
+            [$id]
+        );
+        if ($repos) {
+            $newConfig = array_merge($existing, $data, ['id' => $id]);
+            $remoteSshService = new RemoteSshService();
+            foreach ($repos as $repo) {
+                $this->db->update(
+                    'repositories',
+                    ['path' => $remoteSshService->buildRepoPath($newConfig, $repo['name'])],
+                    'id = ?',
+                    [$repo['id']]
+                );
+            }
+        }
+
         $this->db->insert('server_log', [
             'level' => 'info',
             'message' => "Remote SSH config \"{$name}\" updated",
@@ -186,6 +233,20 @@ class RemoteSshConfigController extends Controller
     /**
      * Delete a remote SSH config (blocked if repos reference it).
      */
+    /**
+     * Per-storage job limit from the form (#154): blank or 0 means none of
+     * its own. Above the global Max Concurrent Jobs is refused, not clamped.
+     */
+    private function maxConcurrentFromPost(): ?int
+    {
+        $cap = \BBS\Services\QueueManager::parseStorageCap($_POST['max_concurrent'] ?? null, $error);
+        if ($error !== null) {
+            $this->flash('danger', $error);
+            $this->redirect('/storage-locations');
+        }
+        return $cap;
+    }
+
     public function delete(int $id): void
     {
         $this->denyIfHosted();
@@ -237,7 +298,24 @@ class RemoteSshConfigController extends Controller
         $result = $remoteSshService->testConnection($config);
 
         if ($result['success']) {
-            $this->json(['status' => 'ok', 'version' => $result['version'] ?? '']);
+            // The host has just proved it is reachable, which is exactly when
+            // the quota should be re-read — waiting up to fifteen minutes for
+            // the next poll leaves a fixed config still looking broken.
+            $quota = null;
+            $full = $remoteSshService->getDecrypted($id);
+            if ($full) {
+                if (($full['provider'] ?? '') === 'borgbase' || str_contains((string) ($full['remote_host'] ?? ''), '.repo.borgbase.com')) {
+                    $quota = $remoteSshService->refreshBorgBaseDiskUsage($full);
+                } else {
+                    $quota = $remoteSshService->getDiskUsage($full);
+                    $remoteSshService->updateDiskUsage($id, $quota, 'df', $remoteSshService->lastDiskError());
+                }
+            }
+            $this->json([
+                'status' => 'ok',
+                'version' => $result['version'] ?? '',
+                'quota_changed' => $quota !== null,
+            ]);
         } else {
             $this->json(['status' => 'error', 'error' => $result['error'] ?? 'Connection failed']);
         }
@@ -261,6 +339,10 @@ class RemoteSshConfigController extends Controller
 
         if (empty($remoteHost) || empty($remoteUser) || empty($sshPrivateKey)) {
             $this->json(['status' => 'error', 'error' => 'Host, user, and SSH key are required']);
+            return;
+        }
+        if ($fieldErr = \BBS\Services\RemoteSshService::fieldError($remoteHost, $remoteUser, $borgRemotePath)) {
+            $this->json(['status' => 'error', 'error' => $fieldErr]);
             return;
         }
 

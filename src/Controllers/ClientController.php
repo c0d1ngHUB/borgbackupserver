@@ -19,12 +19,33 @@ class ClientController extends Controller
         $agents = $this->db->fetchAll("
             SELECT a.*,
                    u.username as owner_name,
+                   cp.name as profile_name,
                    (SELECT COUNT(*) FROM repositories r WHERE r.agent_id = a.id) as repo_count,
                    (SELECT COUNT(*) FROM schedules s JOIN backup_plans bp ON bp.id = s.backup_plan_id WHERE bp.agent_id = a.id) as schedule_count,
                    (SELECT COALESCE(SUM(r2.size_bytes), 0) FROM repositories r2 WHERE r2.agent_id = a.id) as total_size,
-                   (SELECT COUNT(*) FROM archives ar JOIN repositories r3 ON r3.id = ar.repository_id WHERE r3.agent_id = a.id) as restore_points
+                   (SELECT COUNT(*) FROM archives ar JOIN repositories r3 ON r3.id = ar.repository_id WHERE r3.agent_id = a.id) as restore_points,
+                   (SELECT MAX(sj.completed_at) FROM backup_jobs sj
+                     WHERE sj.agent_id = a.id AND sj.task_type = 'backup' AND sj.status = 'completed') as last_success_at,
+                   -- Failed backups since that success. Counted from the epoch
+                   -- when there has never been one, so a client that has never
+                   -- backed up successfully shows every attempt rather than 0.
+                   (SELECT COUNT(*) FROM backup_jobs fj
+                     WHERE fj.agent_id = a.id AND fj.task_type = 'backup' AND fj.status = 'failed'
+                       AND fj.completed_at > COALESCE(
+                           (SELECT MAX(sj2.completed_at) FROM backup_jobs sj2
+                             WHERE sj2.agent_id = a.id AND sj2.task_type = 'backup' AND sj2.status = 'completed'),
+                           '1970-01-01 00:00:00')
+                   ) as missed_since_success,
+                   -- Where this client's repositories live (#474): local
+                   -- storage locations and remote SSH hosts, by name.
+                   (SELECT GROUP_CONCAT(DISTINCT COALESCE(sl.label, rsc.name, 'Local') SEPARATOR ', ')
+                      FROM repositories r
+                      LEFT JOIN storage_locations sl ON sl.id = r.storage_location_id
+                      LEFT JOIN remote_ssh_configs rsc ON rsc.id = r.remote_ssh_config_id
+                     WHERE r.agent_id = a.id) as storage_names
             FROM agents a
             LEFT JOIN users u ON u.id = a.user_id
+            LEFT JOIN client_profiles cp ON cp.id = a.client_profile_id
             WHERE {$where}
             ORDER BY a.name ASC, a.id DESC
         ", $params);
@@ -68,32 +89,29 @@ class ClientController extends Controller
         ", $params)['cnt'];
 
         // Out of date agents — compare against server's bundled agent version
-        $latestVersion = null;
-        $agentFile = dirname(__DIR__, 2) . '/agent/bbs-agent.py';
-        if (file_exists($agentFile)) {
-            $handle = fopen($agentFile, 'r');
-            if ($handle) {
-                for ($i = 0; $i < 50 && ($line = fgets($handle)) !== false; $i++) {
-                    if (preg_match('/^AGENT_VERSION\s*=\s*["\']([^"\']+)["\']/m', $line, $m)) {
-                        $latestVersion = $m[1];
-                        break;
-                    }
-                }
-                fclose($handle);
-            }
-        }
+        $latestVersion = (new \BBS\Services\UpdateService())->getBundledAgentVersion();
         if (!$latestVersion) {
             // Fallback to max version from agents
             $latestVersion = $this->db->fetchOne("
                 SELECT MAX(agent_version) as v FROM agents a WHERE agent_version IS NOT NULL AND {$where}
             ", $params)['v'];
         }
+        // Strictly-older only. A string comparison counted an agent that is
+        // AHEAD of the bundled version as needing an update (#387), which is
+        // routine when a container image ships a newer agent than the server.
         $outdatedCount = 0;
         if ($latestVersion) {
-            $outdatedCount = $this->db->fetchOne("
-                SELECT COUNT(*) as cnt FROM agents a
-                WHERE (agent_version IS NULL OR agent_version != ?) AND status != 'setup' AND {$where}
-            ", array_merge([$latestVersion], $params))['cnt'];
+            $rows = $this->db->fetchAll("
+                SELECT a.agent_version FROM agents a
+                WHERE a.agent_version IS NOT NULL AND a.status != 'setup'
+                  AND a.auto_update_enabled = 1 AND {$where}
+            ", $params);
+            $updSvc = new \BBS\Services\UpdateService();
+            foreach ($rows as $r) {
+                if ($updSvc->isAgentOutdated($r['agent_version'], $latestVersion)) {
+                    $outdatedCount++;
+                }
+            }
         }
 
         // 7-day backup activity chart — group by user's local date, segmented by category
@@ -115,7 +133,7 @@ class ClientController extends Controller
         // disaster happened (#141).
         $categoryMap = [
             'backup' => 'backups',
-            'restore' => 'restores', 'restore_mysql' => 'restores', 'restore_pg' => 'restores', 'restore_mongo' => 'restores',
+            'restore' => 'restores', 'restore_mysql' => 'restores', 'restore_pg' => 'restores', 'restore_mongo' => 'restores', 'restore_mssql' => 'restores',
             's3_sync' => 's3_sync',
         ];
 
@@ -195,21 +213,32 @@ class ClientController extends Controller
         ]);
     }
 
+    private function requireCreateClients(): void
+    {
+        $this->requireAuth();
+        if (!(new PermissionService())->canCreateClients((int) $_SESSION['user_id'])) {
+            http_response_code(403);
+            echo 'Access denied';
+            exit;
+        }
+    }
+
     public function add(): void
     {
-        $this->requireAdmin();
+        $this->requireCreateClients();
 
-        $users = $this->db->fetchAll("SELECT id, username FROM users ORDER BY username");
+        $users = $this->isAdmin() ? $this->db->fetchAll("SELECT id, username FROM users ORDER BY username") : [];
 
         $this->view('clients/add', [
             'pageTitle' => 'Clients',
             'users' => $users,
+            'clientProfiles' => (new \BBS\Services\ClientProfileService())->all(),
         ]);
     }
 
     public function store(): void
     {
-        $this->requireAdmin();
+        $this->requireCreateClients();
         $this->verifyCsrf();
 
         $name = trim($_POST['name'] ?? '');
@@ -219,14 +248,31 @@ class ClientController extends Controller
         }
 
         $apiKey = bin2hex(random_bytes(32));
-        $userId = !empty($_POST['user_id']) ? (int) $_POST['user_id'] : null;
+        // A non-admin always owns the clients they add (#481)
+        $userId = $this->isAdmin()
+            ? (!empty($_POST['user_id']) ? (int) $_POST['user_id'] : null)
+            : (int) $_SESSION['user_id'];
+
+        // Falls back to the default profile rather than null, so failure
+        // settings and plan defaults always resolve to something.
+        $profileService = new \BBS\Services\ClientProfileService();
+        $profileId = !empty($_POST['client_profile_id'])
+            ? (int) $_POST['client_profile_id']
+            : $profileService->defaultProfileId();
+        if ($profileId && !$profileService->find($profileId)) {
+            $profileId = $profileService->defaultProfileId();
+        }
+
+        $location = mb_substr(trim($_POST['location'] ?? ''), 0, 100);
 
         $id = $this->db->insert('agents', [
             'name' => $name,
+            'location' => $location !== '' ? $location : null,
             'api_key_hash' => hash('sha256', $apiKey),
             'api_key_encrypted' => \BBS\Services\Encryption::encrypt($apiKey),
             'status' => 'setup',
             'user_id' => $userId,
+            'client_profile_id' => $profileId,
         ]);
 
         // Determine SSH home path: use storage_path unless a separate storage location
@@ -266,7 +312,10 @@ class ClientController extends Controller
             // Clean up: remove storage dir and agent record
             @rmdir($clientDir);
             $this->db->delete('agents', 'id = ?', [$id]);
-            $this->flash('danger', 'Cannot create client — SSH provisioning failed. Ensure bbs-ssh-helper is installed at /usr/local/bin/bbs-ssh-helper with sudo access. See the Installation Guide: https://github.com/marcpope/borgbackupserver/blob/main/docs/INSTALL.md');
+            $detail = SshKeyManager::getLastHelperError();
+            $this->flash('danger', 'Cannot create client — SSH provisioning failed'
+                . ($detail ? ': ' . htmlspecialchars($detail) : '')
+                . '. Ensure bbs-ssh-helper is installed at /usr/local/bin/bbs-ssh-helper with sudo access. See the Installation Guide: https://github.com/marcpope/borgbackupserver/wiki/Installation');
             $this->redirect('/clients/add');
         }
 
@@ -316,7 +365,7 @@ class ClientController extends Controller
         ", [$id]);
 
         $plans = $this->db->fetchAll("
-            SELECT bp.*, r.name as repo_name, r.storage_type as repo_storage_type, s.frequency, s.times, s.day_of_week, s.day_of_month, s.enabled as schedule_enabled, s.id as schedule_id
+            SELECT bp.*, r.name as repo_name, r.storage_type as repo_storage_type, s.frequency, s.times, s.day_of_week, s.day_of_month, s.timezone as schedule_timezone, s.enabled as schedule_enabled, s.id as schedule_id, s.next_run
             FROM backup_plans bp
             LEFT JOIN repositories r ON r.id = bp.repository_id
             LEFT JOIN schedules s ON s.backup_plan_id = bp.id
@@ -360,13 +409,16 @@ class ClientController extends Controller
         $totalSize = array_sum(array_column($repositories, 'size_bytes'));
         $totalArchives = array_sum(array_column($repositories, 'archive_count'));
         $lastJob = $this->db->fetchOne("
-            SELECT status, completed_at FROM backup_jobs
+            SELECT status, had_warnings, completed_at FROM backup_jobs
             WHERE agent_id = ? AND status IN ('completed','failed')
             ORDER BY completed_at DESC LIMIT 1
         ", [$id]);
 
         // Users list for owner assignment
         $users = $this->isAdmin() ? $this->db->fetchAll("SELECT id, username FROM users ORDER BY username") : [];
+
+        // id → username map for notes attribution ("last updated by …", #334)
+        $usersById = array_column($this->db->fetchAll("SELECT id, username FROM users"), 'username', 'id');
 
         // Status tab data
         $nextBackup = $this->db->fetchOne("
@@ -397,7 +449,7 @@ class ClientController extends Controller
 
         $durationChart = $this->db->fetchAll("
             SELECT DATE_FORMAT(completed_at, '%b %d %H:%i') as label,
-                   duration_seconds, status, task_type
+                   duration_seconds, status, had_warnings, task_type
             FROM backup_jobs
             WHERE agent_id = ? AND task_type = 'backup' AND status IN ('completed','failed') AND completed_at IS NOT NULL
             ORDER BY completed_at DESC LIMIT 30
@@ -408,6 +460,32 @@ class ClientController extends Controller
         $agentPlugins = $pluginManager->getAgentPlugins($id);
         $allPlugins = $pluginManager->getAllPlugins();
         $pluginConfigs = $pluginManager->getPluginConfigs($id);
+
+        // Per-plan plugin slugs for the Status tab schedule summary: plugins
+        // attached to the plan AND enabled for the agent, plus an S3 marker
+        // for plans whose repository has offsite sync enabled.
+        $planPlugins = [];
+        foreach ($this->db->fetchAll(
+            "SELECT bpp.backup_plan_id AS pid, pl.slug
+             FROM backup_plan_plugins bpp
+             JOIN plugins pl ON pl.id = bpp.plugin_id
+             JOIN backup_plans bp ON bp.id = bpp.backup_plan_id
+             JOIN agent_plugins ap ON ap.plugin_id = pl.id AND ap.agent_id = bp.agent_id AND ap.enabled = 1
+             WHERE bp.agent_id = ? AND bpp.enabled = 1", [$id]
+        ) as $r) {
+            $planPlugins[(int) $r['pid']][] = $r['slug'];
+        }
+        foreach ($this->db->fetchAll(
+            "SELECT DISTINCT bp.id AS pid
+             FROM backup_plans bp
+             JOIN repository_s3_configs rsc ON rsc.repository_id = bp.repository_id AND rsc.enabled = 1
+             WHERE bp.agent_id = ?", [$id]
+        ) as $r) {
+            $planPlugins[(int) $r['pid']][] = 's3_sync';
+        }
+        foreach ($planPlugins as $pid => $slugs) {
+            $planPlugins[$pid] = array_values(array_unique($slugs));
+        }
 
         // Check if global S3 settings have a bucket configured
         $globalS3Bucket = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 's3_bucket'");
@@ -455,8 +533,8 @@ class ClientController extends Controller
 
             foreach ($agentS3Configs as $s3PluginConfig) {
                 $config = json_decode($s3PluginConfig['config'] ?? '{}', true) ?: [];
-                $creds = $s3Service->resolveCredentials($config);
-                if (empty($creds['bucket'])) {
+                $creds = $s3Service->resolveDestination($config);
+                if ($creds['error']) {
                     continue;
                 }
                 $remoteResult = $s3Service->listRemoteRepos($agent['name'], $creds);
@@ -472,12 +550,17 @@ class ClientController extends Controller
         }
 
         $this->view('clients/detail', [
+            'profileDefaults' => (new \BBS\Services\ClientProfileService())->planDefaults((int) $id),
+            // Zone a plan created on this page is stored in; shown on the form (#559)
+            'planTimezone' => (new \BBS\Services\ClientProfileService())->planTimezoneFor((int) $id, $_SESSION['timezone'] ?? null),
+            'clientProfiles' => (new \BBS\Services\ClientProfileService())->all(),
             'pageTitle' => 'Clients',
             'agent' => $agent,
             'totalSize' => $totalSize,
             'totalArchives' => $totalArchives,
             'lastJob' => $lastJob,
             'users' => $users,
+            'usersById' => $usersById,
             'repositories' => $repositories,
             'plans' => $plans,
             'recentJobs' => $recentJobs,
@@ -492,6 +575,7 @@ class ClientController extends Controller
             'allPlugins' => $allPlugins,
             'pluginManager' => $pluginManager,
             'pluginConfigs' => $pluginConfigs,
+            'planPlugins' => $planPlugins,
             's3SyncByRepo' => $s3SyncByRepo,
             's3Orphans' => $s3Orphans,
             'globalS3Configured' => $globalS3Configured,
@@ -536,7 +620,7 @@ class ClientController extends Controller
         ", [$id]);
 
         $lastJob = $this->db->fetchOne("
-            SELECT status, completed_at FROM backup_jobs
+            SELECT status, had_warnings, completed_at FROM backup_jobs
             WHERE agent_id = ? AND status IN ('completed','failed')
             ORDER BY completed_at DESC LIMIT 1
         ", [$id]);
@@ -593,6 +677,9 @@ class ClientController extends Controller
         // Format last backup
         $lastBackupLabel = $lastJob ? \BBS\Core\TimeHelper::format($lastJob['completed_at'], 'M j g:ia') : '--';
         $lastBackupStatus = $lastJob ? $lastJob['status'] : null;
+        if ($lastBackupStatus === 'completed' && !empty($lastJob['had_warnings'])) {
+            $lastBackupStatus = 'warning';
+        }
 
         $successRate = ($jobStats['total'] ?? 0) > 0
             ? round(($jobStats['completed'] / $jobStats['total']) * 100) : 0;
@@ -603,6 +690,11 @@ class ClientController extends Controller
             'last_heartbeat' => $agent['last_heartbeat'],
             'seen_ago' => $seenAgo,
             'agent_version' => $agent['agent_version'],
+            // Decided here rather than by comparing strings in the browser, so
+            // an agent ahead of the server's bundle isn't offered a downgrade
+            // dressed up as an upgrade (#387).
+            'agent_needs_update' => !empty($agent['auto_update_enabled'])
+                && (new \BBS\Services\UpdateService())->isAgentOutdated($agent['agent_version'] ?? null),
             'repos_count' => count($repositories),
             'total_archives' => $totalArchives,
             'size_display' => $sizeDisplay,
@@ -675,7 +767,7 @@ class ClientController extends Controller
         // fetchAllOrdered: dodge the CH 26.5 ORDER BY..LIMIT lazy-materialization bug (#301)
         $files = $ch->fetchAllOrdered(
             "SELECT path as file_path, file_name, file_size, status,
-                    formatDateTime(mtime, '%Y-%m-%d %H:%i:%S') as mtime
+                    toString(mtime) as mtime
              FROM file_catalog
              WHERE {$where}
              ORDER BY path
@@ -735,7 +827,7 @@ class ClientController extends Controller
         // Get files directly at this level (exact parent_dir match)
         $files = $ch->fetchAll("
             SELECT path as file_path, file_name, file_size, status,
-                   formatDateTime(mtime, '%Y-%m-%d %H:%i:%S') as mtime
+                   toString(mtime) as mtime
             FROM file_catalog
             WHERE agent_id = ? AND archive_id = ? AND parent_dir = ? AND status != 'D'
             ORDER BY file_name
@@ -799,14 +891,15 @@ class ClientController extends Controller
 
         // Get all versions for these paths from ClickHouse
         $paths = array_column($pathRows, 'path');
-        $pathList = implode(', ', array_map(fn($p) => "'" . str_replace(["\\", "'"], ["\\\\", "\\'"], $p) . "'", $paths));
+        $placeholders = implode(', ', array_fill(0, count($paths), '?'));
 
         $versions = $ch->fetchAll(
             "SELECT path, archive_id, file_size, status,
-                    formatDateTime(mtime, '%Y-%m-%d %H:%i:%S') as mtime
+                    toString(mtime) as mtime
              FROM file_catalog
-             WHERE agent_id = {$id} AND path IN ({$pathList})
-             ORDER BY path, archive_id DESC"
+             WHERE agent_id = ? AND path IN ({$placeholders})
+             ORDER BY path, archive_id DESC",
+            array_merge([(int) $id], $paths)
         );
 
         // Get archive metadata from MySQL
@@ -901,6 +994,56 @@ class ClientController extends Controller
         }
 
 
+        // Resolve the expected file count up front so the queue's existing
+        // files-based progress bar works for restores — the agent counts
+        // each extracted file from `borg extract --list` but can't know the
+        // total itself. Full archive: the stored count. Selected paths:
+        // count matching catalog rows. Left NULL when the catalog can't
+        // answer (progress falls back to byte totals).
+        $filesTotal = null;
+        if (empty($selectedFiles)) {
+            $filesTotal = (int) ($archive['file_count'] ?? 0) ?: null;
+        } else {
+            try {
+                $ch = \BBS\Core\ClickHouse::getInstance();
+                if ($ch->isAvailable()) {
+                    // Catalog paths always carry a leading slash (the indexer
+                    // prepends one); selections from the UI may or may not —
+                    // normalize so the prefix match works either way. Then
+                    // drop selections nested inside another selection so
+                    // overlapping prefixes aren't counted twice.
+                    $paths = array_values(array_filter(array_map(
+                        fn($p) => '/' . trim((string) $p, '/'),
+                        $selectedFiles
+                    ), fn($p) => $p !== '/'));
+                    $roots = array_filter($paths, function ($p) use ($paths) {
+                        foreach ($paths as $other) {
+                            if ($other !== $p && str_starts_with($p, $other . '/')) return false;
+                        }
+                        return true;
+                    });
+
+                    $conds = [];
+                    $params = [$id, $archive_id];
+                    foreach ($roots as $p) {
+                        $conds[] = '(path = ? OR startsWith(path, ?))';
+                        $params[] = $p;
+                        $params[] = $p . '/';
+                    }
+                    if ($conds) {
+                        $row = $ch->fetchOne(
+                            "SELECT count() AS cnt FROM file_catalog
+                             WHERE agent_id = ? AND archive_id = ? AND (" . implode(' OR ', $conds) . ")",
+                            $params
+                        );
+                        $filesTotal = (int) ($row['cnt'] ?? 0) ?: null;
+                    }
+                }
+            } catch (\Exception $e) {
+                // Catalog unavailable — byte-based progress still applies
+            }
+        }
+
         // Create restore job
         $jobId = $this->db->insert('backup_jobs', [
             'agent_id' => $id,
@@ -912,6 +1055,7 @@ class ClientController extends Controller
             'restore_archive_id' => $archive_id,
             'restore_paths' => json_encode($selectedFiles),
             'restore_destination' => $destination ?: null,
+            'files_total' => $filesTotal,
         ]);
 
         $this->db->insert('server_log', [
@@ -951,55 +1095,35 @@ class ClientController extends Controller
             $this->json(['error' => 'Archive not found'], 404);
         }
 
-        $data = $archive['databases_backed_up'] ? json_decode($archive['databases_backed_up'], true) : null;
-        $databases = $data['databases'] ?? [];
-        $compress = $data['compress'] ?? true;
+        // Normalising the stored shape and resolving dump timestamps is shared
+        // with the API — see ArchiveDatabaseService.
+        $groups = (new \BBS\Services\ArchiveDatabaseService())
+            ->groups($id, $archive_id, $archive['databases_backed_up']);
 
-        // Look up dump file mtimes from the file catalog
-        $mtimes = [];
-        if (!empty($databases)) {
-            $dumpDir = $data['dump_dir'] ?? null;
-            if (!$dumpDir) {
-                // Try to find dump_dir from plugin configs for this agent
-                $pluginManager = new \BBS\Services\PluginManager();
-                $configs = $pluginManager->getPluginConfigs($id);
-                foreach ($configs as $c) {
-                    if (in_array($c['slug'], ['mysql_dump', 'pg_dump'])) {
-                        $cfgData = json_decode($c['config_data'] ?? '{}', true);
-                        if (!empty($cfgData['dump_dir'])) {
-                            $dumpDir = rtrim($cfgData['dump_dir'], '/');
-                            break;
-                        }
-                    }
-                }
+        // The service returns raw timestamps; this page shows them in the
+        // viewer's timezone.
+        foreach ($groups as &$g) {
+            foreach (($g['mtimes'] ?? []) as $dbName => $mtime) {
+                $g['mtimes'][$dbName] = $mtime ? \BBS\Core\TimeHelper::format($mtime, 'M j, Y g:i A') : null;
             }
-            if ($dumpDir) {
-                $patterns = [];
-                foreach ($databases as $db) {
-                    $ext = $compress ? '.sql.gz' : '.sql';
-                    $patterns[] = $dumpDir . '/' . $db . $ext;
-                }
-                $ch = \BBS\Core\ClickHouse::getInstance();
-                $pathList = implode(', ', array_map(fn($p) => "'" . str_replace(["\\", "'"], ["\\\\", "\\'"], $p) . "'", $patterns));
-                $rows = $ch->fetchAll("
-                    SELECT path, formatDateTime(mtime, '%Y-%m-%d %H:%i:%S') as mtime
-                    FROM file_catalog
-                    WHERE agent_id = {$id} AND archive_id = {$archive_id} AND path IN ({$pathList})
-                ");
-                foreach ($rows as $row) {
-                    $basename = basename($row['path']);
-                    $dbName = preg_replace('/\\.sql(\\.gz)?$/', '', $basename);
-                    $mtimes[$dbName] = $row['mtime'] ? \BBS\Core\TimeHelper::format($row['mtime'], 'M j, Y g:i A') : null;
-                }
-            }
+        }
+        unset($g);
+
+        // Flat union for backward compatibility with older restore.js.
+        $allDb = [];
+        $unionMtimes = [];
+        foreach ($groups as $g) {
+            foreach (($g['databases'] ?? []) as $db) $allDb[$db] = true;
+            $unionMtimes += $g['mtimes'];
         }
 
         $this->json([
-            'databases' => $databases,
-            'per_database' => $data['per_database'] ?? true,
-            'compress' => $compress,
+            'groups' => $groups,
+            'databases' => array_keys($allDb),
+            'per_database' => $groups[0]['per_database'] ?? true,
+            'compress' => $groups[0]['compress'] ?? true,
             'backed_up_at' => $archive['created_at'] ? \BBS\Core\TimeHelper::format($archive['created_at'], 'M j, Y g:i A') : null,
-            'mtimes' => $mtimes,
+            'mtimes' => $unionMtimes,
         ]);
     }
 
@@ -1320,6 +1444,109 @@ class ClientController extends Controller
     }
 
     /**
+     * Submit a SQL Server database restore job.
+     * POST /clients/{id}/restore-mssql
+     */
+    public function restoreMssqlSubmit(int $id): void
+    {
+        $this->requireAuth();
+        $this->verifyCsrf();
+
+        $agent = $this->getAgent($id);
+        if (!$agent) {
+            $this->flash('danger', 'Client not found.');
+            $this->redirect('/clients');
+        }
+
+        // Require restore permission
+        $this->requirePermission(PermissionService::RESTORE, $id);
+
+        $archive_id = (int) ($_POST['archive_id'] ?? 0);
+        $databases = $_POST['databases'] ?? [];
+        $pluginConfigId = (int) ($_POST['plugin_config_id'] ?? 0);
+
+        if (!$archive_id || empty($databases)) {
+            $this->flash('danger', 'Select an archive and at least one database to restore.');
+            $this->redirect("/clients/{$id}?tab=restore");
+        }
+
+        $pluginManager = new \BBS\Services\PluginManager($this->db);
+        if ($pluginConfigId) {
+            $configCheck = $pluginManager->getPluginConfig($pluginConfigId);
+            if (!$configCheck || $configCheck['agent_id'] != $id || $configCheck['slug'] !== 'mssql_dump') {
+                $this->flash('danger', 'Invalid SQL Server connection selected.');
+                $this->redirect("/clients/{$id}?tab=restore");
+            }
+        }
+
+        $archive = $this->db->fetchOne("
+            SELECT ar.*, r.path as repo_path, r.passphrase_encrypted
+            FROM archives ar
+            JOIN repositories r ON r.id = ar.repository_id
+            WHERE ar.id = ? AND r.agent_id = ?
+        ", [$archive_id, $id]);
+
+        if (!$archive || empty($archive['databases_backed_up'])) {
+            $this->flash('danger', 'Archive not found or has no database backup info.');
+            $this->redirect("/clients/{$id}?tab=restore");
+        }
+
+        $enabledPlugins = $pluginManager->getEnabledAgentPlugins($id);
+        $mssqlEnabled = false;
+        foreach ($enabledPlugins as $p) {
+            if ($p['slug'] === 'mssql_dump') {
+                $mssqlEnabled = true;
+                break;
+            }
+        }
+        if (!$mssqlEnabled) {
+            $this->flash('danger', 'SQL Server plugin is not enabled for this client.');
+            $this->redirect("/clients/{$id}?tab=restore");
+        }
+
+        $restoreDatabases = [];
+        foreach ($databases as $entry) {
+            $dbName = $entry['name'] ?? '';
+            $mode = $entry['mode'] ?? 'replace';
+            if ($dbName && in_array($mode, ['replace', 'rename'])) {
+                $item = ['database' => $dbName, 'mode' => $mode];
+                if ($mode === 'rename' && !empty($entry['target_name'])) {
+                    $item['target_name'] = preg_replace('/[^a-zA-Z0-9_]/', '', $entry['target_name']);
+                }
+                $restoreDatabases[] = $item;
+            }
+        }
+
+        if (empty($restoreDatabases)) {
+            $this->flash('danger', 'No valid databases selected.');
+            $this->redirect("/clients/{$id}?tab=restore");
+        }
+
+        $jobId = $this->db->insert('backup_jobs', [
+            'agent_id' => $id,
+            'backup_plan_id' => null,
+            'repository_id' => $archive['repository_id'],
+            'task_type' => 'restore_mssql',
+            'status' => 'queued',
+            'queued_at' => date('Y-m-d H:i:s'),
+            'restore_archive_id' => $archive_id,
+            'restore_databases' => json_encode($restoreDatabases),
+            'plugin_config_id' => $pluginConfigId ?: null,
+        ]);
+
+        $dbNames = array_column($restoreDatabases, 'database');
+        $this->db->insert('server_log', [
+            'agent_id' => $id,
+            'backup_job_id' => $jobId,
+            'level' => 'info',
+            'message' => "SQL Server restore queued: " . implode(', ', $dbNames) . " from archive {$archive['archive_name']}",
+        ]);
+
+        $this->flash('success', 'SQL Server restore job queued. It will run when a slot is available.');
+        $this->redirect("/queue/{$jobId}");
+    }
+
+    /**
      * POST /clients/{id}/download
      * Extracts selected paths from a borg archive on the server and streams as tar.gz.
      */
@@ -1345,7 +1572,70 @@ class ClientController extends Controller
             $this->redirect("/clients/{$id}?tab=restore");
         }
 
-        $archive = $this->db->fetchOne("
+        $archive = $this->loadArchiveForDownload($archive_id, $id);
+        if (!$archive) {
+            $this->flash('danger', 'Archive not found.');
+            $this->redirect("/clients/{$id}?tab=restore");
+        }
+
+        // The extraction and streaming live in ArchiveDownloadService so the
+        // API shares one implementation rather than a second copy of the most
+        // intricate path in the app.
+        try {
+            (new \BBS\Services\ArchiveDownloadService())->stream($agent, $archive, is_array($selectedFiles) ? $selectedFiles : []);
+        } catch (\Exception $e) {
+            $this->flash('danger', 'Download failed: ' . $e->getMessage());
+            $this->redirect("/clients/{$id}?tab=restore");
+        }
+    }
+
+    /** Download only database dumps recorded for this archive and connector. */
+    public function downloadDatabases(int $id): void
+    {
+        $this->requireAuth();
+        $this->verifyCsrf();
+
+        $agent = $this->getAgent($id);
+        if (!$agent) {
+            $this->flash('danger', 'Client not found.');
+            $this->redirect('/clients');
+        }
+        $this->requirePermission(PermissionService::RESTORE, $id);
+
+        $archiveId = (int) ($_POST['archive_id'] ?? 0);
+        $configId = (int) ($_POST['plugin_config_id'] ?? 0);
+        $names = $_POST['databases'] ?? [];
+        if (!$archiveId || !$configId || !is_array($names) || !$names) {
+            $this->flash('danger', 'Select an archive, connector, and at least one database to download.');
+            $this->redirect("/clients/{$id}?tab=restore");
+        }
+
+        $archive = $this->loadArchiveForDownload($archiveId, $id);
+        $config = (new \BBS\Services\PluginManager())->getPluginConfig($configId);
+        if (!$archive || empty($archive['databases_backed_up']) || !$config
+            || (int) $config['agent_id'] !== $id
+            || !in_array($config['slug'], ['mysql_dump', 'pg_dump', 'mongo_dump'], true)) {
+            $this->flash('danger', 'Archive or database connector not found.');
+            $this->redirect("/clients/{$id}?tab=restore");
+        }
+
+        try {
+            $groups = (new \BBS\Services\ArchiveDatabaseService())->groups($id, $archiveId, $archive['databases_backed_up']);
+            $paths = \BBS\Services\ArchiveDatabaseService::downloadPaths($groups, $configId, $config['slug'], $names);
+            (new \BBS\Services\ArchiveDownloadService())->stream($agent, $archive, $paths);
+        } catch (\Exception $e) {
+            $this->flash('danger', 'Download failed: ' . $e->getMessage());
+            $this->redirect("/clients/{$id}?tab=restore");
+        }
+    }
+
+    /**
+     * The archive row a download needs, joined with its repository and any
+     * remote-SSH configuration. Shared by the web and API download paths.
+     */
+    public function loadArchiveForDownload(int $archiveId, int $agentId): ?array
+    {
+        return $this->db->fetchOne("
             SELECT ar.*, r.path as repo_path, r.passphrase_encrypted, r.encryption,
                    r.agent_id as repo_agent_id, r.name as repo_name,
                    r.storage_type, r.storage_location_id, r.remote_ssh_config_id,
@@ -1356,253 +1646,7 @@ class ClientController extends Controller
             JOIN repositories r ON r.id = ar.repository_id
             LEFT JOIN remote_ssh_configs rsc ON rsc.id = r.remote_ssh_config_id
             WHERE ar.id = ? AND r.agent_id = ?
-        ", [$archive_id, $id]);
-
-        if (!$archive) {
-            $this->flash('danger', 'Archive not found.');
-            $this->redirect("/clients/{$id}?tab=restore");
-        }
-
-        // Build environment — server-side execution uses local paths
-        $repo = [
-            'path' => $archive['repo_path'],
-            'passphrase_encrypted' => $archive['passphrase_encrypted'],
-            'encryption' => $archive['encryption'],
-            'agent_id' => $archive['repo_agent_id'] ?? $id,
-            'name' => $archive['repo_name'] ?? '',
-            'storage_type' => $archive['storage_type'] ?? 'local',
-            'storage_location_id' => $archive['storage_location_id'] ?? null,
-        ];
-        $isRemoteSsh = ($repo['storage_type'] === 'remote_ssh');
-        $localPath = $isRemoteSsh ? $archive['repo_path'] : \BBS\Services\BorgCommandBuilder::getLocalRepoPath($repo);
-        $env = \BBS\Services\BorgCommandBuilder::buildEnv($repo, false);
-
-        // Create temp directory for extraction
-        $tmpDir = '/tmp/bbs-download-' . bin2hex(random_bytes(8));
-        mkdir($tmpDir, 0700, true);
-
-        $remoteSshKeyFile = null; // Track temp SSH key for cleanup
-
-        try {
-            // Build borg extract args: repo::archive + selected paths
-            $borgArgs = [$localPath . '::' . $archive['archive_name']];
-            foreach ($selectedFiles as $path) {
-                $path = ltrim($path, '/');
-                if ($path !== '') {
-                    $borgArgs[] = rtrim($path, '/');
-                }
-            }
-
-            if ($isRemoteSsh && !empty($archive['remote_ssh_key_encrypted'])) {
-                // Remote SSH repos: run borg extract over SSH from BBS server
-                try {
-                    $sshKey = \BBS\Services\Encryption::decrypt($archive['remote_ssh_key_encrypted']);
-                } catch (\Exception $e) {
-                    $sshKey = $archive['remote_ssh_key_encrypted'];
-                }
-                $remoteSshKeyFile = tempnam(sys_get_temp_dir(), 'bbs-ssh-');
-                // Normalize line endings (Windows \r\n → Unix \n) and ensure trailing newline
-                $sshKey = str_replace("\r\n", "\n", $sshKey);
-                $sshKey = str_replace("\r", "\n", $sshKey);
-                $sshKey = rtrim($sshKey) . "\n";
-                file_put_contents($remoteSshKeyFile, $sshKey);
-                chmod($remoteSshKeyFile, 0600);
-
-                $port = (int) ($archive['remote_port'] ?? 22);
-                $env['BORG_RSH'] = "ssh -i {$remoteSshKeyFile} -p {$port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR";
-
-                $cmd = ['borg', 'extract'];
-                if (!empty($archive['borg_remote_path'])) {
-                    $cmd[] = '--remote-path=' . $archive['borg_remote_path'];
-                }
-                $cmd = array_merge($cmd, $borgArgs);
-
-                $envStrings = [];
-                foreach ($_SERVER as $k => $v) {
-                    if (is_string($v)) $envStrings[$k] = $v;
-                }
-                foreach ($env as $k => $v) {
-                    $envStrings[$k] = $v;
-                }
-            } else {
-                // Local repos: Use SSH helper to run borg extract as the repo-owning user
-                // (www-data can't read repo files owned by the bbs-* user)
-                $sshUser = $agent['ssh_unix_user'] ?? '';
-                $useHelper = !empty($sshUser);
-                if ($useHelper) {
-                    // Passphrase piped on stdin ("-" marker) so it's not in argv.
-                    $passphrase = $env['BORG_PASSPHRASE'] ?? '';
-                    $cmd = ['sudo', '/usr/local/bin/bbs-ssh-helper', 'borg-extract', $sshUser, $tmpDir, '-'];
-                    $cmd = array_merge($cmd, $borgArgs);
-
-                    $envStrings = null; // helper handles env; null inherits current env (for PATH)
-                } else {
-                    // Fallback: run directly as www-data (non-SSH repos)
-                    $cmd = array_merge(['borg', 'extract'], $borgArgs);
-                    $envStrings = [];
-                    foreach ($_SERVER as $k => $v) {
-                        if (is_string($v)) $envStrings[$k] = $v;
-                    }
-                    foreach ($env as $k => $v) {
-                        $envStrings[$k] = $v;
-                    }
-                }
-            }
-
-            $desc = [
-                0 => ['pipe', 'r'],
-                1 => ['pipe', 'w'],
-                2 => ['pipe', 'w'],
-            ];
-
-            $proc = proc_open($cmd, $desc, $pipes, $tmpDir, $envStrings);
-            if (!is_resource($proc)) {
-                throw new \RuntimeException('Failed to run borg extract');
-            }
-
-            if (!empty($useHelper)) {
-                fwrite($pipes[0], ($passphrase ?? '') . "\n");
-            }
-            fclose($pipes[0]);
-            $stdout = stream_get_contents($pipes[1]);
-            $stderr = stream_get_contents($pipes[2]);
-            fclose($pipes[1]);
-            fclose($pipes[2]);
-            $exitCode = proc_close($proc);
-
-            $borgOutput = trim($stdout . "\n" . $stderr);
-
-            if ($exitCode > 1) {
-                // Log the full borg output so it's visible even after redirect
-                $this->db->insert('server_log', [
-                    'agent_id' => $id,
-                    'level' => 'error',
-                    'message' => "Download failed — borg extract exit {$exitCode}: " . substr($borgOutput, 0, 4000),
-                ]);
-                throw new \RuntimeException('borg extract failed (exit ' . $exitCode . '): ' . substr($borgOutput, 0, 500));
-            }
-
-            // Fix permissions so www-data can read extracted files
-            // (the helper's post-extract chmod may not complete due to pipe closure)
-            exec('sudo /usr/local/bin/bbs-ssh-helper fix-download-perms ' . escapeshellarg($tmpDir) . ' 2>&1');
-
-            // Check if anything was extracted
-            $extractedFiles = [];
-            try {
-                $rii = new \RecursiveIteratorIterator(
-                    new \RecursiveDirectoryIterator($tmpDir, \RecursiveDirectoryIterator::SKIP_DOTS),
-                    \RecursiveIteratorIterator::SELF_FIRST,
-                    \RecursiveIteratorIterator::CATCH_GET_CHILD
-                );
-                foreach ($rii as $file) {
-                    if ($file->isFile()) {
-                        $extractedFiles[] = $file->getPathname();
-                    }
-                }
-            } catch (\Exception $iterErr) {
-                // Iteration itself failed — log and continue to the empty-check
-                $this->db->insert('server_log', [
-                    'agent_id' => $id,
-                    'level' => 'warning',
-                    'message' => "Download: failed to iterate tmp dir {$tmpDir}: " . $iterErr->getMessage(),
-                ]);
-            }
-
-            if (empty($extractedFiles)) {
-                // The helper may have extracted files but PHP (as www-data) can't
-                // see them due to a permission layer we don't control (FUSE/shfs,
-                // NFS ID mapping, etc). Ask the helper for a root-eye view of the
-                // tmp dir and include borg's output so users can see what happened.
-                $lsOutput = '';
-                exec('sudo /usr/local/bin/bbs-ssh-helper fix-download-perms ' . escapeshellarg($tmpDir) . ' 2>&1');
-                exec('sudo find ' . escapeshellarg($tmpDir) . ' -maxdepth 4 2>&1', $lsLines);
-                $lsOutput = implode("\n", array_slice($lsLines, 0, 50));
-
-                // Re-iterate after the second fix-download-perms pass
-                try {
-                    $rii = new \RecursiveIteratorIterator(
-                        new \RecursiveDirectoryIterator($tmpDir, \RecursiveDirectoryIterator::SKIP_DOTS),
-                        \RecursiveIteratorIterator::SELF_FIRST,
-                        \RecursiveIteratorIterator::CATCH_GET_CHILD
-                    );
-                    foreach ($rii as $file) {
-                        if ($file->isFile()) {
-                            $extractedFiles[] = $file->getPathname();
-                        }
-                    }
-                } catch (\Exception $iterErr2) {
-                    /* ignore */
-                }
-            }
-
-            if (empty($extractedFiles)) {
-                // Log the full diagnostic picture before failing so users can
-                // see it in the server log (the flash message is truncated).
-                $diag = "borg exit={$exitCode}\n"
-                    . "borg output:\n" . substr($borgOutput, 0, 2000) . "\n"
-                    . "tmp dir contents (root view):\n" . substr($lsOutput ?? '(not captured)', 0, 1500);
-                $this->db->insert('server_log', [
-                    'agent_id' => $id,
-                    'level' => 'error',
-                    'message' => "Download failed — no files in {$tmpDir}. {$diag}",
-                ]);
-
-                $userMsg = 'No files were extracted. borg exit=' . $exitCode;
-                if ($borgOutput !== '') {
-                    $userMsg .= ' — ' . substr($borgOutput, 0, 300);
-                }
-                $userMsg .= ' (see server log for full output)';
-                throw new \RuntimeException($userMsg);
-            }
-
-            // Generate filename
-            $safeName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $agent['name'] . '-' . $archive['archive_name']);
-
-            // Stream as tar.gz — clear any buffered output (e.g. debug notices)
-            if (ob_get_level()) {
-                ob_end_clean();
-            }
-            header('Content-Type: application/gzip');
-            header('Content-Disposition: attachment; filename="' . $safeName . '.tar.gz"');
-            header('Cache-Control: no-cache');
-
-            $tarCmd = ['tar', 'czf', '-', '-C', $tmpDir, '.'];
-            $tarProc = proc_open($tarCmd, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $tarPipes);
-            if (!is_resource($tarProc)) {
-                throw new \RuntimeException('Failed to create tar archive');
-            }
-
-            fclose($tarPipes[0]);
-            fpassthru($tarPipes[1]);
-            fclose($tarPipes[1]);
-            fclose($tarPipes[2]);
-            proc_close($tarProc);
-
-        } catch (\Exception $e) {
-            $this->flash('danger', 'Download failed: ' . $e->getMessage());
-            $this->redirect("/clients/{$id}?tab=restore");
-        } finally {
-            // Cleanup temp directory and remote SSH key
-            $this->removeDir($tmpDir);
-            if ($remoteSshKeyFile && file_exists($remoteSshKeyFile)) {
-                @unlink($remoteSshKeyFile);
-            }
-        }
-
-        exit;
-    }
-
-    private function removeDir(string $dir): void
-    {
-        if (!is_dir($dir)) return;
-        $items = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator($dir, \RecursiveDirectoryIterator::SKIP_DOTS),
-            \RecursiveIteratorIterator::CHILD_FIRST
-        );
-        foreach ($items as $item) {
-            $item->isDir() ? rmdir($item->getPathname()) : unlink($item->getPathname());
-        }
-        rmdir($dir);
+        ", [$archiveId, $agentId]);
     }
 
     public function update(int $id): void
@@ -1620,20 +1664,75 @@ class ClientController extends Controller
         if (isset($_POST['name']) && trim($_POST['name']) !== '') {
             $data['name'] = trim($_POST['name']);
         }
+        if (array_key_exists('location', $_POST)) {
+            $loc = mb_substr(trim($_POST['location']), 0, 100);
+            $data['location'] = $loc !== '' ? $loc : null;
+        }
+        if ($this->isAdmin() && array_key_exists('offline_alerts', $_POST)) {
+            $data['offline_alerts'] = !empty($_POST['offline_alerts']) ? 1 : 0;
+        }
         if ($this->isAdmin() && array_key_exists('user_id', $_POST)) {
             $data['user_id'] = $_POST['user_id'] !== '' ? (int) $_POST['user_id'] : null;
         }
+        if ($this->isAdmin() && array_key_exists('client_profile_id', $_POST)) {
+            $profileService = new \BBS\Services\ClientProfileService();
+            $pid = $_POST['client_profile_id'] !== '' ? (int) $_POST['client_profile_id'] : null;
+            // Unknown id falls back to the default rather than nulling the
+            // column, so failure settings always resolve to something.
+            $data['client_profile_id'] = ($pid && $profileService->find($pid)) ? $pid : $profileService->defaultProfileId();
+        }
         if ($this->isAdmin() && array_key_exists('server_host_override', $_POST)) {
             $host = trim($_POST['server_host_override']);
+            if ($host !== '' && !\BBS\Core\Config::isValidHost($host, false)) {
+                $this->flash('danger', 'Server host override must be a hostname or IP address, without a port or path.');
+                $this->redirect("/clients/{$id}");
+            }
             $data['server_host_override'] = $host !== '' ? $host : null;
         }
         if ($this->isAdmin() && array_key_exists('ssh_port_override', $_POST)) {
             $port = trim($_POST['ssh_port_override']);
             $data['ssh_port_override'] = ($port !== '' && (int) $port > 0 && (int) $port <= 65535) ? (int) $port : null;
         }
+        if ($this->isAdmin() && array_key_exists('wol_enabled', $_POST)) {
+            $data['wol_enabled'] = !empty($_POST['wol_enabled']) ? 1 : 0;
+
+            $mac = \BBS\Services\WakeOnLanService::normalizeMac(trim($_POST['wol_mac'] ?? ''));
+            $data['wol_mac'] = $mac;
+            if ($data['wol_enabled'] && $mac === null && trim($_POST['wol_mac'] ?? '') !== '') {
+                $this->flash('danger', 'Invalid MAC address — use the form aa:bb:cc:dd:ee:ff.');
+                $this->redirect("/clients/{$id}");
+                return;
+            }
+
+            $broadcast = trim($_POST['wol_broadcast'] ?? '');
+            $data['wol_broadcast'] = ($broadcast !== '' && filter_var($broadcast, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) ? $broadcast : null;
+
+            $timeout = (int) ($_POST['wol_timeout_minutes'] ?? 5);
+            $data['wol_timeout_minutes'] = min(60, max(1, $timeout));
+        }
 
         if (!empty($data)) {
             $this->db->update('agents', $data, 'id = ?', [$id]);
+
+            // Repo paths bake the server host in at creation time — when the
+            // override changes (set, changed, or cleared), rewrite this
+            // client's local repo paths to the new effective host (#367)
+            if (array_key_exists('server_host_override', $data)
+                && $data['server_host_override'] !== ($agent['server_host_override'] ?? null)) {
+                $effectiveHost = $data['server_host_override'];
+                if ($effectiveHost === null) {
+                    $serverHost = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
+                    $effectiveHost = $serverHost['value'] ?? '';
+                }
+                $updated = SshKeyManager::rewriteAgentRepoHosts($this->db, $id, $effectiveHost);
+                if ($updated > 0) {
+                    $this->db->insert('server_log', [
+                        'agent_id' => $id,
+                        'level' => 'info',
+                        'message' => "Server host override changed — updated {$updated} repository path(s)",
+                    ]);
+                }
+            }
 
             // A newly assigned owner gets access and all permissions by
             // default, revocable in the user's profile (#337)
@@ -1665,6 +1764,17 @@ class ClientController extends Controller
             $this->redirect("/clients/{$id}");
         }
 
+        // Deleting a client cascades its repositories — locked archives
+        // (legal hold, #314) must not be removable that way either
+        $lockedCount = $this->db->fetchOne("
+            SELECT COUNT(*) as cnt FROM archives ar
+            JOIN repositories r ON r.id = ar.repository_id
+            WHERE r.agent_id = ? AND ar.locked = 1", [$id]);
+        if ((int) ($lockedCount['cnt'] ?? 0) > 0) {
+            $this->flash('danger', 'Cannot delete this client — it has locked archives. Unlock them first.');
+            $this->redirect("/clients/{$id}?tab=repos");
+        }
+
         // Deprovision SSH user
         if (!empty($agent['ssh_unix_user'])) {
             SshKeyManager::deprovisionClient($agent['ssh_unix_user']);
@@ -1683,9 +1793,34 @@ class ClientController extends Controller
             $ch->exec("ALTER TABLE catalog_dirs DROP PARTITION " . (int) $id);
         } catch (\Exception $e) { /* ignore */ }
 
+        // Clear S3 sync links first: repository_s3_configs RESTRICTs
+        // plugin_config deletion, and the agent cascade reaches
+        // plugin_configs before the repository cascade clears these rows,
+        // so deleting the agent directly 500s with an FK violation (#378)
+        $this->db->query(
+            "DELETE rsc FROM repository_s3_configs rsc
+             JOIN repositories r ON r.id = rsc.repository_id
+             WHERE r.agent_id = ?", [$id]
+        );
+        $this->db->query(
+            "DELETE rsc FROM repository_s3_configs rsc
+             JOIN plugin_configs pc ON pc.id = rsc.plugin_config_id
+             WHERE pc.agent_id = ?", [$id]
+        );
+
         $this->db->delete('agents', 'id = ?', [$id]);
         $this->flash('success', "Client \"{$agent['name']}\" deleted.");
         $this->redirect('/clients');
+    }
+
+    /**
+     * Admins, or the client's owner: who may change how a client runs
+     * (delete it, rotate its key, update its agent or borg). Users who can
+     * merely see a client can't (GHSA-f9mm-7r3c-wmw2).
+     */
+    private function isOwnerOrAdmin(array $agent): bool
+    {
+        return $this->isAdmin() || (int) ($agent['user_id'] ?? 0) === (int) ($_SESSION['user_id'] ?? 0);
     }
 
     private function getAgent(int $id): ?array
@@ -1717,6 +1852,83 @@ class ClientController extends Controller
         return $agent;
     }
 
+    /**
+     * POST /clients/{id}/rotate-key
+     *
+     * Returns the new key so the page can show it and rebuild the install
+     * command without a reload. It is shown in full because the admin has to
+     * copy it onto the client — unlike an API token, this one is recoverable
+     * from the client page afterwards, since the install command needs it.
+     */
+    public function rotateApiKey(int $id): void
+    {
+        $this->requireAuth();
+        $this->verifyCsrf();
+
+        $agent = $this->getAgent($id);
+        if (!$agent) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+
+        // Rotating revokes the running agent and returns the new key, which
+        // authenticates as that agent. Same rule as delete and the Install
+        // tab: admins, or the client's owner (GHSA-f9mm-7r3c-wmw2).
+        if (!$this->isOwnerOrAdmin($agent)) {
+            $this->json(['error' => "Only an admin or the client's owner can rotate its key."], 403);
+        }
+
+        $svc = new \BBS\Services\AgentKeyService();
+        $key = $svc->rotate($id, $_SESSION['username'] ?? null);
+        [$location, $instructions] = $svc->reconfigureHint($agent);
+
+        $this->json([
+            'status' => 'ok',
+            'api_key' => $key,
+            'reconfigure_location' => $location,
+            'reconfigure_instructions' => $instructions,
+        ]);
+    }
+
+    /**
+     * POST /clients/{id}/reprovision-ssh
+     *
+     * New SSH key pair, Unix user and authorized_keys on this server, for a
+     * client whose borg connections fail with "Permission denied (publickey)"
+     * (#537). The private key is not returned: the agent fetches it over the
+     * API when it restarts. Same rule as rotate-key: admins, or the owner.
+     */
+    public function reprovisionSsh(int $id): void
+    {
+        $this->requireAuth();
+        $this->verifyCsrf();
+
+        $agent = $this->getAgent($id);
+        if (!$agent) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+
+        if (!$this->isOwnerOrAdmin($agent)) {
+            $this->json(['error' => "Only an admin or the client's owner can repair its SSH access."], 403);
+        }
+
+        $blocked = SshKeyManager::reprovisionBlockedReason($id);
+        if ($blocked !== null) {
+            $this->json(['error' => $blocked], 409);
+        }
+
+        $result = SshKeyManager::reprovisionClient($agent, $_SESSION['username'] ?? null);
+        if (!$result) {
+            $this->json(['error' => 'SSH access repair failed: ' . (SshKeyManager::getLastHelperError() ?? 'unknown error')], 500);
+        }
+
+        $this->json([
+            'status' => 'ok',
+            'ssh_unix_user' => $result['unix_user'],
+            'ssh_home_dir' => $result['home_dir'],
+            'restart_instructions' => SshKeyManager::restartAgentHint($agent),
+        ]);
+    }
+
     public function updateBorg(int $id): void
     {
         $this->requireAuth();
@@ -1727,6 +1939,11 @@ class ClientController extends Controller
             http_response_code(404);
             echo 'Not found';
             return;
+        }
+
+        if (!$this->isOwnerOrAdmin($agent)) {
+            $this->flash('danger', "Only an admin or the client's owner can update borg on it.");
+            $this->redirect("/clients/{$id}");
         }
 
         // Create an update_borg job
@@ -1758,6 +1975,11 @@ class ClientController extends Controller
             return;
         }
 
+        if (!$this->isOwnerOrAdmin($agent)) {
+            $this->flash('danger', "Only an admin or the client's owner can update its agent.");
+            $this->redirect("/clients/{$id}");
+        }
+
         $this->db->insert('backup_jobs', [
             'agent_id' => $id,
             'task_type' => 'update_agent',
@@ -1784,7 +2006,9 @@ class ClientController extends Controller
     public function browse(int $id): void
     {
         $this->requireAuth();
-        if (!$this->canAccessAgent($id)) {
+        // Lists directories on the client machine; it is the folder picker
+        // for backup plans, so it needs the plan permission, not just access.
+        if (!$this->hasPermission(PermissionService::MANAGE_PLANS, $id)) {
             $this->json(['error' => 'Access denied'], 403);
         }
         $this->verifyCsrf();
@@ -1810,10 +2034,14 @@ class ClientController extends Controller
             $id,
             md5("{$path}|{$depth}|" . ($showHidden ? '1' : '0') . '|' . ($showAll ? '1' : '0'))
         );
-        $cached = $cache->get($cacheKey);
+        // Absolute TTL, not sliding. This caches what another machine's
+        // filesystem looked like, and re-setting it on every read meant it
+        // never expired while anyone was looking — so someone who had just
+        // added a mount and kept reopening the picker to find it was, each
+        // time, extending the life of the listing that didn't have it (#429).
+        // Fifteen minutes from the moment it was fetched, and no longer.
+        $cached = !empty($input['refresh']) ? null : $cache->get($cacheKey);
         if (is_array($cached)) {
-            // Sliding TTL — every access resets the clock
-            $cache->set($cacheKey, $cached, 900);
             $this->json(['status' => 'completed', 'tree' => $cached, 'cached' => true]);
             return;
         }
@@ -1843,7 +2071,9 @@ class ClientController extends Controller
     public function browsePoll(int $id, int $taskId): void
     {
         $this->requireAuth();
-        if (!$this->canAccessAgent($id)) {
+        // Lists directories on the client machine; it is the folder picker
+        // for backup plans, so it needs the plan permission, not just access.
+        if (!$this->hasPermission(PermissionService::MANAGE_PLANS, $id)) {
             $this->json(['error' => 'Access denied'], 403);
         }
 

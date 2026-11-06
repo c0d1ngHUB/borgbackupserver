@@ -4,9 +4,14 @@
 #
 # Usage:
 #   bbs-ssh-helper create-user <username> <home_dir> <public_key>
+#   bbs-ssh-helper rekey-user <username> <home_dir> <public_key>
 #   bbs-ssh-helper create-repo-dir <repo_dir>
 #   bbs-ssh-helper borg-init <repo_path> <encryption> [passphrase]
+#   bbs-ssh-helper borg-passphrase <username> <repo_path>   (old/new on stdin)
 #   bbs-ssh-helper delete-user <username>
+#   bbs-ssh-helper cert-status [domain]
+#   bbs-ssh-helper cert-renew [domain] [--force]
+#   bbs-ssh-helper cert-email <address|--remove>
 #   bbs-ssh-helper install-gate
 #   bbs-ssh-helper update-all-keys
 #
@@ -45,6 +50,9 @@ is_allowed_path() {
     if [ -f /etc/bbs/allowed-storage-paths ]; then
         while IFS= read -r allowed_path; do
             [ -z "$allowed_path" ] && continue
+            # An entry such as "/" or a system directory (written before
+            # update-allowed-paths validated its input) is ignored.
+            is_safe_storage_root "$allowed_path" || continue
             local ALLOWED_NORM
             ALLOWED_NORM=$(readlink -m "$allowed_path" 2>/dev/null || echo "$allowed_path")
             [[ "$NORMALIZED" == "$ALLOWED_NORM" ]] && return 0
@@ -52,6 +60,83 @@ is_allowed_path() {
         done < /etc/bbs/allowed-storage-paths
     fi
     return 1
+}
+
+# Is this a directory that may be registered as a storage root? Absolute,
+# canonical, and not the filesystem root or a system directory:
+# every subcommand trusts the allow-list built from these, so one bad entry
+# would open the whole filesystem to root operations.
+is_safe_storage_root() {
+    local P
+    [[ "${1:-}" == /* ]] || return 1
+    P=$(readlink -m "$1" 2>/dev/null) || return 1
+    case "$P" in
+        /|/bin|/bin/*|/boot|/boot/*|/dev|/dev/*|/etc|/etc/*|/lib|/lib/*|/lib32|/lib32/*|/lib64|/lib64/*|/libx32|/libx32/*|\
+        /proc|/proc/*|/root|/root/*|/run|/run/*|/sbin|/sbin/*|/sys|/sys/*|/usr|/usr/*|/var|/var/lib|/var/lib/*|\
+        /var/log|/var/log/*|/var/www|/var/www/*|/var/spool|/var/spool/*|/var/cache|/var/cache/*|/home|/tmp|/opt|/srv|/mnt|/media)
+            return 1 ;;
+    esac
+    return 0
+}
+
+# A client's home directory: <base>/<numeric agent id>, not a symlink, with
+# a base that is not a system directory. Homes live under the storage_path
+# setting, which need not be a registered storage location.
+is_client_home() {
+    local P
+    [[ "${1:-}" == /* ]] || return 1
+    [ -L "$1" ] && return 1
+    P=$(readlink -m "$1" 2>/dev/null) || return 1
+    [[ "$(basename "$P")" =~ ^[0-9]+$ ]] || return 1
+    is_safe_storage_root "$(dirname "$P")" || [[ "$(dirname "$P")" =~ ^/var/bbs(/|$) ]]
+}
+
+# One public key on one line: type, base64 body, optional comment. The key
+# goes into authorized_keys after a command="..." restriction, so a value
+# with a newline would add a second, unrestricted line and give the client a
+# shell on the server; a quote could end the restriction early.
+is_public_key() {
+    local K="${1:-}"
+    [[ "$K" == *$'\n'* || "$K" == *$'\r'* ]] && return 1
+    [[ "$K" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521))\ [A-Za-z0-9+/]+=?=?=?(\ [A-Za-z0-9._@+-]+)?$ ]]
+}
+
+# Point a client's Unix user at its home folder and install its public key,
+# restricted to bbs-ssh-gate. Shared by create-user (new client) and
+# rekey-user (new key for an existing client). The user must exist.
+write_client_ssh_access() {
+    local USERNAME="$1" HOME_DIR="$2" PUBLIC_KEY="$3"
+
+    # Set ownership: user owns, www-data group for server-side borg operations (init, prune, compact)
+    # This MUST succeed — sshd requires correct ownership of home/.ssh for key auth.
+    # If this fails (e.g. NAS/NFS mount), the SSH home dir must be on a local filesystem.
+    if ! chown "$USERNAME":www-data "$HOME_DIR" 2>&1; then
+        echo "Error: chown failed on $HOME_DIR — SSH home directories must be on a local filesystem, not a NAS/NFS mount. Check your storage_path setting."
+        exit 1
+    fi
+    chmod 750 "$HOME_DIR"
+
+    # Add user to www-data group so catalog files can be chgrp'd to www-data
+    # (needed on FUSE/shfs filesystems like Unraid where setgid is not honored)
+    usermod -a -G www-data "$USERNAME" 2>/dev/null || true
+
+    # Configure SSH authorized_keys with gate dispatcher
+    local SSH_DIR="$HOME_DIR/.ssh"
+    mkdir -p "$SSH_DIR"
+    chmod 700 "$SSH_DIR"
+
+    local AUTHORIZED_KEYS="$SSH_DIR/authorized_keys"
+    local RESTRICT_CMD="command=\"/usr/local/bin/bbs-ssh-gate $HOME_DIR\",restrict"
+
+    echo "$RESTRICT_CMD $PUBLIC_KEY" > "$AUTHORIZED_KEYS"
+    chmod 600 "$AUTHORIZED_KEYS"
+    chown -R "$USERNAME":"$USERNAME" "$SSH_DIR"
+
+    # Create catalog log directory with setgid so files inherit www-data group
+    local CATALOG_DIR="$HOME_DIR/.catalog-logs"
+    mkdir -p "$CATALOG_DIR"
+    chown "$USERNAME":www-data "$CATALOG_DIR"
+    chmod 2770 "$CATALOG_DIR"
 }
 
 case "$ACTION" in
@@ -71,6 +156,16 @@ case "$ACTION" in
             exit 1
         fi
 
+        if ! is_client_home "$HOME_DIR"; then
+            echo "Error: home dir must be <storage path>/<client id>, not a symlink or system directory"
+            exit 1
+        fi
+
+        if ! is_public_key "$PUBLIC_KEY"; then
+            echo "Error: public key must be one line: <type> <base64> [comment]"
+            exit 1
+        fi
+
         # Create home directory if needed
         mkdir -p "$HOME_DIR"
 
@@ -82,36 +177,65 @@ case "$ACTION" in
             echo "Created user: $USERNAME"
         fi
 
-        # Set ownership: user owns, www-data group for server-side borg operations (init, prune, compact)
-        # This MUST succeed — sshd requires correct ownership of home/.ssh for key auth.
-        # If this fails (e.g. NAS/NFS mount), the SSH home dir must be on a local filesystem.
-        if ! chown "$USERNAME":www-data "$HOME_DIR" 2>&1; then
-            echo "Error: chown failed on $HOME_DIR — SSH home directories must be on a local filesystem, not a NAS/NFS mount. Check your storage_path setting."
+        write_client_ssh_access "$USERNAME" "$HOME_DIR" "$PUBLIC_KEY"
+
+        echo "OK"
+        ;;
+
+    rekey-user)
+        # Give an existing client a new SSH key: rewrite authorized_keys,
+        # recreate the Unix user if it is gone, and point it at the home
+        # folder the database records. For a client whose server-side SSH
+        # access broke (#537); the agent fetches the matching private key
+        # from the server when it restarts.
+        USERNAME="${2:-}"
+        HOME_DIR="${3:-}"
+        PUBLIC_KEY="${4:-}"
+
+        if [ -z "$USERNAME" ] || [ -z "$HOME_DIR" ] || [ -z "$PUBLIC_KEY" ]; then
+            echo "Usage: bbs-ssh-helper rekey-user <username> <home_dir> <public_key>"
             exit 1
         fi
-        chmod 750 "$HOME_DIR"
 
-        # Add user to www-data group so catalog files can be chgrp'd to www-data
-        # (needed on FUSE/shfs filesystems like Unraid where setgid is not honored)
-        usermod -a -G www-data "$USERNAME" 2>/dev/null || true
+        if [[ ! "$USERNAME" =~ ^bbs-[a-z0-9_-]+$ ]]; then
+            echo "Error: username must match bbs-[a-z0-9_-]+"
+            exit 1
+        fi
 
-        # Configure SSH authorized_keys with gate dispatcher
-        SSH_DIR="$HOME_DIR/.ssh"
-        mkdir -p "$SSH_DIR"
-        chmod 700 "$SSH_DIR"
+        if ! is_client_home "$HOME_DIR"; then
+            echo "Error: home dir must be <storage path>/<client id>, not a symlink or system directory"
+            exit 1
+        fi
 
-        AUTHORIZED_KEYS="$SSH_DIR/authorized_keys"
-        RESTRICT_CMD="command=\"/usr/local/bin/bbs-ssh-gate $HOME_DIR\",restrict"
+        if ! is_public_key "$PUBLIC_KEY"; then
+            echo "Error: public key must be one line: <type> <base64> [comment]"
+            exit 1
+        fi
 
-        echo "$RESTRICT_CMD $PUBLIC_KEY" > "$AUTHORIZED_KEYS"
-        chmod 600 "$AUTHORIZED_KEYS"
-        chown -R "$USERNAME":"$USERNAME" "$SSH_DIR"
+        mkdir -p "$HOME_DIR"
 
-        # Create catalog log directory with setgid so files inherit www-data group
-        CATALOG_DIR="$HOME_DIR/.catalog-logs"
-        mkdir -p "$CATALOG_DIR"
-        chown "$USERNAME":www-data "$CATALOG_DIR"
-        chmod 2770 "$CATALOG_DIR"
+        if id "$USERNAME" &>/dev/null; then
+            # The account may point at a folder other than the one the
+            # database records (an update moved it, #532). Follow the
+            # database — but only within the same client: the folder name
+            # is the client id, and a user must not be moved onto another
+            # client's folder, which would hand this key that client's repos.
+            CUR_HOME=$(getent passwd "$USERNAME" | cut -d: -f6)
+            if [ "$CUR_HOME" != "$HOME_DIR" ]; then
+                if [ "$(basename "$CUR_HOME")" != "$(basename "$HOME_DIR")" ]; then
+                    echo "Error: $USERNAME belongs to client folder $CUR_HOME, not $HOME_DIR"
+                    exit 1
+                fi
+                usermod -d "$HOME_DIR" "$USERNAME"
+                echo "Moved $USERNAME home from $CUR_HOME to $HOME_DIR"
+            fi
+            echo "Replaced key for $USERNAME"
+        else
+            useradd --shell /bin/sh --home-dir "$HOME_DIR" --no-create-home "$USERNAME"
+            echo "Recreated user: $USERNAME"
+        fi
+
+        write_client_ssh_access "$USERNAME" "$HOME_DIR" "$PUBLIC_KEY"
 
         echo "OK"
         ;;
@@ -191,11 +315,14 @@ case "$ACTION" in
             exit 1
         fi
 
-        # Safety: tmpdir must be under /tmp
-        if [[ ! "$TMPDIR" =~ ^/tmp/ ]]; then
-            echo "Error: tmpdir must be under /tmp/"
+        # Safety: staging must be a bbs-download-/bbs-restore- directory under
+        # the data volume's tmp (preferred, #344) or legacy /tmp. Checked on
+        # the canonical path so "/tmp/../etc" cannot pass, and not a symlink.
+        if [ -L "$TMPDIR" ] || [[ ! "$(readlink -m "$TMPDIR")" =~ ^(/var/bbs/tmp|/tmp)/bbs-(download|restore)-[A-Za-z0-9]+$ ]]; then
+            echo "Error: tmpdir must be /var/bbs/tmp/bbs-download-* (or /tmp/bbs-download-*)"
             exit 1
         fi
+        TMPDIR=$(readlink -m "$TMPDIR")
 
         # Ensure tmpdir exists and is writable by the user
         mkdir -p "$TMPDIR"
@@ -536,7 +663,7 @@ case "$ACTION" in
         # wrappers), create, mount, serve, export-tar, config — is rejected.
         BORG_SUBCMD="$1"
         case "$BORG_SUBCMD" in
-            prune|compact|check|break-lock|delete|info) ;;
+            prune|compact|check|break-lock|delete|info|rename) ;;
             *)
                 echo "Error: borg subcommand '$BORG_SUBCMD' is not permitted via borg-cmd"
                 exit 1
@@ -600,6 +727,59 @@ case "$ACTION" in
             BORG_BASE_DIR="$BORG_DIR" \
             HOME="$BORG_DIR" \
             borg "$SUBCMD" "${BORG_EXTRA_OPTS[@]}" "$@" 2>&1
+
+        exit $?
+        ;;
+
+    borg-passphrase)
+        # Change a repository's passphrase (#412).
+        # Usage: bbs-ssh-helper borg-passphrase <username> <repo_path>
+        #        old and new passphrases on stdin, one per line.
+        #
+        # Not part of borg-cmd: that wrapper takes a single passphrase and an
+        # allow-list this subcommand is deliberately absent from, and passing a
+        # second secret through it would widen an interface used by everything
+        # else.
+        USERNAME="${2:-}"
+        REPO_PATH="${3:-}"
+
+        if [ -z "$USERNAME" ] || [ -z "$REPO_PATH" ]; then
+            echo "Usage: bbs-ssh-helper borg-passphrase <username> <repo_path>  (passphrases on stdin)"
+            exit 1
+        fi
+        if [[ ! "$USERNAME" =~ ^bbs-[a-z0-9_-]+$ ]]; then
+            echo "Error: username must match bbs-[a-z0-9_-]+"
+            exit 1
+        fi
+        if ! is_allowed_path "$REPO_PATH"; then
+            echo "Error: repo path must be under /var/bbs/ or a registered storage location"
+            exit 1
+        fi
+
+        # Read both secrets from stdin so neither appears in argv or `ps`.
+        IFS= read -r OLD_PP || OLD_PP=""
+        IFS= read -r NEW_PP || NEW_PP=""
+        if [ -z "$NEW_PP" ]; then
+            echo "Error: new passphrase is empty"
+            exit 1
+        fi
+
+        BORG_DIR="/var/bbs/cache/$USERNAME"
+        mkdir -p "$BORG_DIR"
+        chown "$USERNAME":"$USERNAME" "$BORG_DIR"
+
+        # --lock-wait is short on purpose. The caller has already checked that
+        # no job is using this repository; if something took the lock in the
+        # meantime, failing quickly is better than holding the request open for
+        # ten minutes while a backup runs.
+        sudo -u "$USERNAME" \
+            BORG_PASSPHRASE="$OLD_PP" \
+            BORG_NEW_PASSPHRASE="$NEW_PP" \
+            BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=yes \
+            BORG_RELOCATED_REPO_ACCESS_IS_OK=yes \
+            BORG_BASE_DIR="$BORG_DIR" \
+            HOME="$BORG_DIR" \
+            borg key change-passphrase -v --lock-wait 30 "$REPO_PATH" 2>&1
 
         exit $?
         ;;
@@ -697,41 +877,266 @@ case "$ACTION" in
         ;;
 
     update-borg)
-        # Download and install a borg binary to /usr/local/bin/borg
-        # Usage: bbs-ssh-helper update-borg <download_url> <expected_version>
-        DOWNLOAD_URL="${2:-}"
+        # Download (or take from BBS's own server-hosted copies) and install a
+        # borg binary to /usr/local/bin/borg. Nothing is made executable or run
+        # before it has been checked.
+        # Usage: bbs-ssh-helper update-borg <github_url> <expected_version> <sha256>
+        #        bbs-ssh-helper update-borg <path under /var/www/bbs/public/borg> <expected_version>
+        SOURCE="${2:-}"
         EXPECTED_VERSION="${3:-}"
+        EXPECTED_SHA256="${4:-}"
 
-        if [ -z "$DOWNLOAD_URL" ] || [ -z "$EXPECTED_VERSION" ]; then
-            echo "Usage: bbs-ssh-helper update-borg <download_url> <expected_version>"
+        if [ -z "$SOURCE" ] || [ -z "$EXPECTED_VERSION" ]; then
+            echo "Usage: bbs-ssh-helper update-borg <download_url|server_path> <expected_version> [sha256]"
             exit 1
         fi
-
-        # Safety: only allow downloads from GitHub
-        if [[ ! "$DOWNLOAD_URL" =~ ^https://github\.com/borgbackup/borg/releases/ ]]; then
-            echo "Error: download URL must be from github.com/borgbackup/borg/releases"
+        if [[ ! "$EXPECTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: invalid version"
             exit 1
         fi
 
         BORG_PATH="/usr/local/bin/borg"
-        BORG_TMP="/usr/local/bin/borg.tmp"
+        BORG_TMP=$(mktemp /usr/local/bin/.borg.XXXXXX)
+        SIG_TMP=$(mktemp)
+        KEYRING=$(mktemp --suffix=.gpg)
+        trap 'rm -f "$BORG_TMP" "$SIG_TMP" "$KEYRING"' EXIT
 
-        # Download binary
-        if ! curl -sL -o "$BORG_TMP" "$DOWNLOAD_URL"; then
-            rm -f "$BORG_TMP"
-            echo "Error: failed to download from $DOWNLOAD_URL"
-            exit 1
+        # Signing keys live in this root-owned script, not next to the
+        # binaries: /var/www/bbs belongs to the web user.
+        borg_release_key() {
+            # Thomas Waldmann (borg releases), 6D5B EF9A DD20 7580 5747 B70F 9F88 FB52 FAF7 B393
+            base64 -d <<'KEY'
+mQINBEs1R4UBEADIWIzcXDVr6Gal4Aar4Wau6Z4JQ8mOsYZ9KEZxD1ncxlNdLsUUMdxu+ABjXOm+
+jTP+Gu8wJImavkwWwUZ+QRzQgKOj3B+wzLiRRpWWdgeiLmohPT558WqrUqeuzCAB69IrgxNIB2oa
+0gUxYqeYBW9ozv1d6vN3/Nuw0mG9ULQusl0oe3Kt1U4h6SmcA7Eo+Kctzgy00ji5e7CvuAKTXG2J
+I7v1jTMsr4IK1wh2swTIrvIs4A/uSWkiTktn53K/OncKhcC9NVZMNVovK+zomkURZ6YFSF+gRH/Z
+XSRHqPdCfpk9sLkiAI0lrKK3cvgIsU1ium25p1fXp44h88BLUPK+dS2I/Ir2/drWFkafmQpZ48fq
+zHYv1g/dMzTLdxtnZ/blfcPOEklnl36XuEdD5Q/E9rmzrVNtkBJRz19z7gAl0aOuzNw2BI8vcmWg
+x4tsysEC6IZ/X78sq/H//E9E7faEFRGyFfsxOvxurYXdfAcb2fCtfo4vHuqjBVqEYPHvL4XrEyTg
+04bekDNsaEkprhxpNa+wtK369FE0AnZfkS704cNd9gAkzIeA5X7M7hw+5LT6ArP/CFPnHDb43Iem
++3BhYLJP29ZO4EPGq+T1laDUL7i9Zuqw30fwGNEfVo90YqSjVS7jPWsYYvOaClawR6Lo6WK4e248
+8buEt+gKcpyGiQARAQABtC1UaG9tYXMgV2FsZG1hbm4gPHRob21hcy5qLndhbGRtYW5uQGdtYWls
+LmNvbT6JAk4EEwEKADgCGwMFCwkIBwMFFQoJCAsFFgIDAQACHgECF4AWIQRtW++a3SB1gFdHtw+f
+iPtS+vezkwUCZc4y/AAKCRCfiPtS+vezk5VzEAC4oQosGwoAy/Bq9gily6LJbCezGYzGvWySOnLC
+6Nd7enCJJN0185gU4zgPl2r6+pbKt3pUrueSPKba0Ga2RxcJiKVJpEKX5bmiOmgaWvJmq1EhHWBc
+luURnMiEifNGn14cdjhcYg5DTbI1O8BSfXdKDVZeOEkHET2pow3lbvm32vA2ISMZFNI0JqTXR9cX
+N8MANopmL0+TyUBVOO2F7LNcgXbo81q/Oz3tnrmG97/rQOzLPMqbAH5thJE2xtejPp7LpNQ5HbXm
+IloAPwJUhwSv5NUxpFdZ9izH92P3w77xUnzZaj5Rq3AS5uZ97T2z/KV+hQxKjTx0UakCJy9RgPFY
+j3ZWtr6dtk47I0YHlTXPs+QWTAQbUlwgpW1u5JXTeZN4BQW7el5lm7YbVQ9xb3ZBEKJqFUIZ5Q3U
+TOu4MyK4wLtJpqHDNZGIuf8SyquyCEFyJhgSkZzQ4cFVdyF3zidckgvkroKktUUTKMrupWRFVmyw
+AoSoxayeOOJX0Kn1idz5rv0nszDT/6Xv6AnyXJpJSbArCeUKMy0ncJP5GqEooJSRdFrjAIE6VB8J
+nzBqsn9g1ItevWt+1fTUyjG/ufGWrkunYTZw8WrFTPp+JiDf4O/otbJ6bUgergHCXAAbMhxeEq0s
+hMs/spc0XWF/fcYuGbP5SHYX08w4o38yLOc3WrQiVGhvbWFzIFdhbGRtYW5uIDx0dy1wdWJsaWNA
+Z214LmRlPokCTgQTAQoAOAIbAwIeAQIXgAULCQgHAwUVCgkICwUWAgMBABYhBG1b75rdIHWAV0e3
+D5+I+1L697OTBQJlzjL8AAoJEJ+I+1L697OTbqQP/2pKjCO6lOaeQMpxmaUkeAiWGaMQ08IRaqNk
+G5z3vzQ4S8NdfdFu0u0ZC2gw8tytbT2DyG2wR9dd2BQerpjpYbqvILF/vvbj9hrP27hYwkzDLpOZ
+36sFhsGEDUcMsHOCjYpKEwOy8oy2EemRs0gO8v0IKb9zTMYp85LpAbmJOrEMMM0vxZef5rOkLhvb
+2Pa3r5K3eGRyzC6EDjHPAY7HDyMoNOKmYMKm1t7/JfDqavqUEF1rM107JqXuaU6ZNnRGBZiIol+E
+GaDUBdNPT51Ulw6ZZjClSGKjNw+RCWDRIDOMp7V0bEd9fV5aXJpeitGNRxTQQwPucg0L95slNII4
+Rfi9wXWp0TkVeixmPuFFjjn/ESPxQMaCLOyKm3Z40BRqUSgDVOOgoi70eMhSCQIq+8coUrf3UEJk
+3e9Qq/iv2MdPesJtN0U05chSIxG9O8c6j26+10KEdNF2hkNHCSk8HrBYi0upwn0AroG5ZC+UInCC
+RNiYeYHB7cQYarXF0hqiE5C5xpX68YsYPoxyXyO28eAquIf4dhv/0OwghlrO72zxp/sKItgH9j7Z
+4jGT2yGXtUZru77h38tohO5NNZy05znuLKKoI/CkAHJEe8diSnx5y6OBM69KShDwWB/KKdwfxMie
+L4He6SLTM/RSJ+pg+jV/fBGCbq8LjSrn6NRXSNantCRUaG9tYXMgV2FsZG1hbm4gPHR3QHdhbGRt
+YW5uLWVkdi5kZT6JAlEEEwEKADsCGwMCHgECF4ACGQEFCwkIBwMFFQoJCAsFFgIDAQAWIQRtW++a
+3SB1gFdHtw+fiPtS+vezkwUCZc4y/AAKCRCfiPtS+vezk/lsD/0buKcUZ5VlVfgykYNhO90ulsAL
+56UpnqN+3ugbDLha73MM5vkiSq/MoQBUUenBBvd19Q+lxi58yGkt8BBQX53iWXaOq6q5uhUDZY5c
+7xLZ0W2oK7jmB9ob/lSibQygG4SNksCR8HpKNOzK+MPaq5Zaf0jMZzs9860rAS5InKgXaJFoNVAe
+EfIJTyrrbLjjefgomhWFuoY4WrV++FwVGzr3g1lIxLMBJoE8gAYCKon3v7rw5mTyCvVf3lY03joi
+M4Zz2aAgjP3QOvnDXp7zWPfaz440eyBjk1eFtRueN5srHRtxWIcOqCJrMfPWAQzKHoUjERPHbXQ+
+KGgYaM8LC1hXd2mySXtKSV57wOIwlHSaGGEeI0odhEdwddrvpWMiImLgNpy0GOHMUTsADK0QtnLA
+D7W0ho2o1YeQuLYQUbKink1TJLCjjSozNUuYcU9w7zp0bk/90v0AA2nnKkr67DnJszkqF94E/kgm
+7D9F07wlL76puZ2pYEiMF3yjUWDA66pbRWdJe5n5jTxDLOEBbe9528ZG1A9ub8r2tI4heuSMCQ0F
+5SK4AL322AoX3REUI0QtmBDtDSyeeClqYFsYHj+3GL98R90yIgYBAuDCURUOnUucXXbh0tUfVFEW
+u5lSx55gm4d1ZOeCej5bSnFX9GkgAKn/VLVhNT7usVMOhQJ9L7QmVGhvbWFzIFdhbGRtYW5uIDx0
+d2FsZG1hbm5AdGhpbmttby5kZT6JAk4EEwEKADgCGwMFCwkIBwMFFQoJCAsFFgIDAQACHgECF4AW
+IQRtW++a3SB1gFdHtw+fiPtS+vezkwUCZc4y/AAKCRCfiPtS+vezkz6ED/46c8GMDi6Ki2Gg+Bbe
+W8fma61X4gWNQdw5NttPfDeF4VgvwAkY16/I4rbqaBlgrOviIfvml3PI2WjDSBV09fr729Iia1YF
+ud3zicM82+EjfLVjyk5kqp7vR8twahcifV5hZqpNxW8dN8Z01SFQQVdsGVxWvqm3Om0aFd+M/Req
+7Vy867bNhl1p4dfxVDsGZVfLgz2bKngjSE48Gq/qt/AGu4dSz8s2laLvx9xgUeNk7b0EWEB/sjqe
+hQAESV3iMkJmTi7A428UdYpNHa7wf7suOY/R3PamOv8jPcM6bifUY7+VGQPZt3/sLvQDBqHHrDm8
+nNe11WDqvy21GWgQ6gHZuJw8Up2VNfy/ZDF2TnW/XsSauXFJ10MXHz4gROeexPjQmtu+sT2jLfVo
+BzIHuwL9X/HteiaG3PR6An+T2TKsWZwn3FK5BkGpFE/7RlEwQM5tyTxrXGCcvUrY5zHQ5xcr+oZq
+JFVZGbBqRHU40sSiFp91G7puRuCXD9aZdYi5/op9ZjouC/QGmPWwqhCB7mYwXxe7FFyvpI8+Yq6J
+xqr47iUH8mcLjBRjJos85xK/8T0xYfrmX6EIy0heP1qtjWqRnuQXgSqbzk4nIkeW0gmvPoogWWHH
+9iMYXVg7BZLfXkFV5dLJs8/U2pbp3Kp+RAYYU2H6q3mY9MrRSPjdXP/GJ7kCDQRUm2cPARAAtt/u
+Z/Pe+0qPQNKgEa6gK0tanqdoUMw7Pkq92IxRObE/dAwKtHxC48T/cGIvx39bJWJeHd64XBy+gkMG
+d63rtoMSqz29rkCxsojRFxQJbeoD4bFx+loxUxxzZmyocjwN+JTDlWPZdFOVrXO9ppYnpm5l2ti3
+5O94Y0PwnKtUH8f9Jg/qIWDzONR+YdhKHSt0fTTTcojn5itTw7y8+De8DK08SAAEHccyKUYzKDa7
+TVJ8jJFNqr8lxuUv/YQbVhviGEAoxRPQkfhlhEab8LgDJUabhLaQp1ISpr8oI2kuW13Wzb1/LS7N
+tNGP0nCItYYcJhdu3iA5sS6OC9lcqbvZ+kZEn8C76OndZaBX8+DcBNmDn9EBNWo/XxUylMOAUVWn
+YHiqXZMvVkEk+Ra/OQ4xpgz+XEJA8+FX4UJW4xOFsTRXDntcigrBloJ7+l3KFmDXwW9RTdiemck0
+RvOLNkyxFbZ2zILzVe6/rtK/Smt86RZr3TyJtm4q60rRQ9cp1wufJ7SwYA8aurSuODTRQk0iazTR
+mx4eazCRNCy4tRFeZDVpG8bvLKhMDlfGu8vH5yvmbNWJKFblGrl6yLqfbsC29BmiSv+IExQcMM1K
+dmpgFIOeQlvoCwvdV9O6ukL0Pl42968AkBRMbx50596f7H7f41wvH/OZIh+GbpFwDWOK6c8AEQEA
+AYkCPAQYAQoAJgIbDBYhBG1b75rdIHWAV0e3D5+I+1L697OTBQJplY7mBQkancJRAAoJEJ+I+1L6
+97OTV/AP/i+BZlJM7oQULTDpXTa/94wkCn4zR4A57fovA3apgqkk2+F5ADSlYLRBxpRJcQbzO5IV
+pcB1c+2QDJ2kQasQn1Ay8GRz923FgpWCna2DEh2vVa5m5hXik8Jv26Q23+icLFdm8aO4HMKFeN2M
+t5RJUuRzZfyH16PLYsYhRnu7UCONIzp5F2EptzERXWsRa5uBmJfVXKKQRGvmVDedy9elWjSon5Ib
+6yNHObAwz/Swxc2Bxrxnzj6VRSVDQE4Gli+8j+iAEJ/wB+mhgPekTmKxPmrtA8FiUDL+ukF9+6oU
+qaelnnvAJddagPMALuAqKg1loipxEBEs01yjKpVDIODp+JEUi2HCEnEXVZCTi0+u+lj0QaMexFVk
+0grf+4Na3iYnxAH7XJZtQsIFhzpLGhh2xMAm7o+h8ImsTnI5czTByKSV5onpfQJ32d/k6sjIVNB2
+lxZFqhZhfb/H+lX0l0pzFTm0hjtYn91r2fVarWEy3zY/Se65pbEEcBYlPoBdFbWgYkiw3JPiLlXP
+jLw6D5yA9pZTL2bRmh4mnU64qvbX1sRhBy2BMOEhohippKS407b3rOQCkuOgD++tReD+gIDoTfEk
+SHgtZaFpwG31p4g+Ltxr8RwL2M+xFms5KJzzjd7V5oPmRZVO4F7K1lDF+8OSekJf9qJD9+cwUMPZ
+tbm5d1ZSuQINBFSbZscBEADeJdOR2L9v2Q7cXXEqar4eSUI30OdPeuugzVqoCew/ESC5rK/waXRR
+5Ppvf8SOXri3C6Yk/yIywxWWrf29nC2R7PLpQFXsMz2MUGEwy+0FjtBq+5a6A1OGqTOH1fTnD6y1
+JE93L5UAC1a0jmIbCqVZ7DM71Y+PJm8FJCqnOiyVbkMP/ktYWtNvHtJ+k5GIm0U7183zkyKFVPDM
+5+qkHZ5GzvpNOcDasc42mV7eqLF0GMQQxO4HZzlbBkZMeTq0iAs6AC1VkSENaj+gd87iybx/rQXt
+M2VrhCWiDTcVKaMlieKFhVx4NxObwPt/jsve1LqL4lKgPlkDc70RbqC30liDSDva0Ypse237WT8y
+HqKZ8aFXfx975jm5Us+BgV3O5puTgayI+otvcYOE3AOXLtfZZaA84zbSfHJGgTnR0BfPlbceYMwk
+R3oLGiVz3+u12MApl7ESN93aU2D6Fj/aZ8rML2fqLLHOBNzi/zEBmrz7rJ0P8gjR5ARA4KPwnmRI
+wGS0QFGFfVWZHJ3yqKjhh5kal5Aq0cJCjdwrcGCmygErZCQfQngupoY+jgyN6Iccky+cyn5G4AZ8
+xMC67MKFUHb2Yx9Z2Z1m6pwgxb+ItpQgfe0AABncpVekaJ+OiCN/VsqS3hvd+hcLGpfLtfwmxELV
+w9exIZ2CxY0Yp+ik6H7ZhwARAQABiQRbBBgBCgAmAhsCFiEEbVvvmt0gdYBXR7cPn4j7Uvr3s5MF
+AmmVjuAFCRqdwpkCKQkQn4j7Uvr3s5PBXSAEGQEKAAYFAlSbZscACgkQJDrPqVH3jgGRixAAmxVE
+5lY07giTfHsAzR/8YE+QlQzG1fLCSTJLBCc/yQ5HwWzhsLBdxeK+OzWMF+JAIGf8nu5lrAHwse5R
+WqWG/7EoNVLKVx7xgQ3dVtGUm7QkL/BY57qrZlMV6WfmIZME2O9AnPrV0gRNcCDDyuLLYE/sqyg3
+yPLAkpC4JE6E1tWMvwI2ub3CKEIZ0PsnViIKxIQNuz8Sh0XYgLAUxsehEbjBWV/nUN64lEslZo8n
+E0uema1k4qA0pTA44w2fxQVovDaoiyCiJZ1Wzr4GXuafuVVNrt3q0NIq6F2NXESOfWNOnOzquosS
+O1e92AdVsgHNbnql9BkcFeKb6UGhZRh+WKdTnq0mEVqh4G75kKRFom7oYJpflXcBfx5F4sDDZb2m
+k3rioklCGQph1qS1JZgyD7A0hhEy9N+Kh+mf1eopAb0SDQZnU97xJVG7kWgUh3PUcJxWqgG9KerM
+cq4O/BH69xw5qYqfihWgJNSK2FOFML97UdQ4KPt4uU4LQeHWhDnNquN0lgO0gE/XInLW+FORN4tG
+b4k684Wppi5GyaigodfPy2CdTg/yZRrhGVRfph2ziihnUKEqnKsYf5wUhJc6RZLnKs1vp3Vi6Xl5
+ezwophWeJ0sP9O2frElLyuY/7zAVTQlfM5a6wsoIRqmszBpJsbmTxVO55aKlCjh7byIQ1xt5cA/+
+Jhyo6CkIqRkHYJ41RvfHzCc6CaePYRaETpARgDc/Zp6aw7MxL63ynZN5H+n8nJrvwZar1hRvfkKG
+lESn1kZip7qBVT2iXVsnaAivlGP5LSrz6K3MfPVvKtaukM+MBprzjAGba0pCOMZLCWQmDLAGUt0g
+rQjUFZ+ZrJxTz2U/XxSohfgWuZ0KwQ93tAGjsfyqFs6/xrsYskYbXX1b/rdx1+INEBHdeQs3m1Yo
+GyyUrOqPbnIP64Koqit0Sm1ip3412K6/V1zzmGjJi4fK4dA/QUcRk6w8NjQJZ4CNXk7VS3nq3i0Y
+zEkAMWPwT846CJPCV1XlwsSHRioCUlD+KtNPcdSgRZXszXbHSTbClHKm2Lseer7rpgmy0QAuSUpb
+P+zjUP+A5B4niEYLjtpAlzxrVj1hxlidHy5HKX4UAzgPCNrsoQJEd6hyHMBjYaWCJmEPoPthKATe
+kyMfGPX8/Wr520lU0Bd8rQHmkVnt+2+Y3bZ4DV/bMBDJdob3Uf/MW7wC6dd+zEyd+hKfglZslqzY
+ceZWZRmIk04T9tlarkgDZWUyKuV+ipuras6//g3QAxUZ1H13IBnSWvn/uiCGqNycxtt6/OGhOWo6
+6WJyyBxPGoBXfC6GikJ2tL275RShcO7q1KmkLbYOcVTwltPS2RI/kJ8mjfgj48tTAIknzvRmIHY=
+KEY
+        }
+        bbs_release_key() {
+            # Marc Pope (BBS server-hosted borg builds), 83DC EED9 45B6 1B33 4FC5 0655 4F82 8665 1C8B B8C4
+            base64 -d <<'KEY'
+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
+91VlMydtG2KePfyokYHWQ2aCW3yIT0TW
+KEY
+        }
+
+        SIGNED=""
+        # Signature checks need gpgv. Ubuntu always has it (apt depends on
+        # it); minimal images may not, so say so instead of failing vaguely.
+        need_gpgv() {
+            if ! command -v gpgv >/dev/null 2>&1; then
+                echo "Error: gpgv is not installed, so the borg signature cannot be checked (install the gpgv package)"
+                exit 1
+            fi
+        }
+        if [[ "$SOURCE" == https://* ]]; then
+            # Official release: only from github.com/borgbackup/borg
+            if [[ ! "$SOURCE" =~ ^https://github\.com/borgbackup/borg/releases/download/[0-9A-Za-z._-]+/[0-9A-Za-z._-]+$ ]] \
+               || [[ "$SOURCE" == *..* ]] || [[ "$SOURCE" == *%* ]]; then
+                echo "Error: download URL must be from github.com/borgbackup/borg/releases"
+                exit 1
+            fi
+            if [[ ! "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+                echo "Error: the release's SHA-256 digest is required; check for borg versions again and retry"
+                exit 1
+            fi
+            if ! curl -fsSL --proto '=https' --proto-redir '=https' --max-filesize 209715200 -o "$BORG_TMP" "$SOURCE"; then
+                echo "Error: failed to download from $SOURCE"
+                exit 1
+            fi
+            ACTUAL_SHA256=$(sha256sum "$BORG_TMP" | cut -d' ' -f1)
+            if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+                echo "Error: download does not match the release's SHA-256 digest"
+                exit 1
+            fi
+            # Some release binaries are also signed; check the signature when there is one.
+            if curl -fsSL --proto '=https' --proto-redir '=https' --max-filesize 65536 -o "$SIG_TMP" "$SOURCE.asc" 2>/dev/null; then
+                need_gpgv
+                borg_release_key > "$KEYRING"
+                if ! gpgv --keyring "$KEYRING" "$SIG_TMP" "$BORG_TMP" >/dev/null 2>&1; then
+                    echo "Error: borg release signature check failed"
+                    exit 1
+                fi
+                SIGNED=" (signature verified)"
+            fi
+        else
+            # Server-hosted build shipped with BBS: must carry a valid
+            # signature from the BBS release key.
+            REAL=$(realpath -e -- "$SOURCE" 2>/dev/null) || { echo "Error: binary not found"; exit 1; }
+            if [[ ! "$REAL" =~ ^/var/www/bbs/public/borg/[0-9]+\.[0-9]+\.[0-9]+/borg-[A-Za-z0-9._-]+$ ]] || [[ "$REAL" == *.asc ]]; then
+                echo "Error: server binaries must come from /var/www/bbs/public/borg/<version>/"
+                exit 1
+            fi
+            if [ ! -f "$REAL.asc" ]; then
+                echo "Error: $REAL has no signature (.asc)"
+                exit 1
+            fi
+            # Copy first, then check the copy: the file that is checked is the one installed.
+            cp -- "$REAL" "$BORG_TMP"
+            cp -- "$REAL.asc" "$SIG_TMP"
+            need_gpgv
+            bbs_release_key > "$KEYRING"
+            if ! gpgv --keyring "$KEYRING" "$SIG_TMP" "$BORG_TMP" >/dev/null 2>&1; then
+                echo "Error: signature check failed for $REAL"
+                exit 1
+            fi
+            SIGNED=" (signature verified)"
         fi
 
         chmod 755 "$BORG_TMP"
 
         # Verify it runs and outputs expected version
         ACTUAL=$("$BORG_TMP" --version 2>/dev/null || true)
-        # Output may be "borg 1.4.3" or "borg.tmp 1.4.3" — extract version number
+        # Output may be "borg 1.4.3" or ".borg.XXXX 1.4.3" — extract version number
         ACTUAL_VER=$(echo "$ACTUAL" | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 
         if [ "$ACTUAL_VER" != "$EXPECTED_VERSION" ]; then
-            rm -f "$BORG_TMP"
             echo "Error: version mismatch — expected $EXPECTED_VERSION, got $ACTUAL_VER"
             exit 1
         fi
@@ -743,12 +1148,20 @@ case "$ACTION" in
 
         # Atomic replace
         mv "$BORG_TMP" "$BORG_PATH"
-        echo "Installed borg $EXPECTED_VERSION to $BORG_PATH"
+        echo "Installed borg $EXPECTED_VERSION to $BORG_PATH$SIGNED"
         echo "OK"
         ;;
 
     rclone-sync)
         # Run rclone sync as the repo-owning user
+        #
+        # The timeouts below matter more than they look. Without them an
+        # endpoint that drops packets rather than refusing them — a tunnel that
+        # went down, a firewall blackhole — leaves rclone waiting with no
+        # output but its 5-second stats line, showing 0 B/s forever, and the
+        # job sits in 'running' until someone notices (#438). They are connect
+        # and idle timeouts, so a slow transfer that is still moving is not
+        # affected.
         # Usage: bbs-ssh-helper rclone-sync <username> <local_path> <remote> <endpoint> <region> <access_key> <secret_key> [--bwlimit LIMIT]
         USERNAME="${2:-}"
         LOCAL_PATH="${3:-}"
@@ -802,9 +1215,130 @@ case "$ACTION" in
             --transfers 4 --checkers 8 \
             -v --stats-one-line --stats 5s \
             --s3-no-check-bucket \
+            --contimeout 30s --timeout 5m --retries 2 --low-level-retries 5 \
             "${EXTRA_ARGS[@]}" 2>&1
 
         exit $?
+        ;;
+
+    rclone-transfer)
+        # Sync a repository to or from an offsite destination as the repo-owning
+        # user (#413). The destination is any rclone backend: S3, SFTP, or a
+        # path on a registered storage location. Its settings, including
+        # credentials and SSH keys, arrive in a 0600 file of KEY=base64(value)
+        # lines rather than on the command line, so nothing secret shows in
+        # ps. The file is removed here whatever happens.
+        #
+        # Usage: bbs-ssh-helper rclone-transfer <username> <push|pull> <local_path> <remote> <envfile> [rclone flags...]
+        #   push: local_path -> remote     pull: remote -> local_path
+        # <remote> is "DEST:path" for a configured backend, or an absolute
+        # path under a registered storage location for a local copy.
+        USERNAME="${2:-}"
+        DIRECTION="${3:-}"
+        LOCAL_PATH="${4:-}"
+        REMOTE="${5:-}"
+        ENVFILE="${6:-}"
+        shift 6 2>/dev/null || true
+        EXTRA_ARGS=("$@")
+
+        # Always ends 0: bash 5 reports a failing last command in an EXIT
+        # trap as the script's exit status, which turned every successful
+        # transfer into a failed job.
+        cleanup_envfile() { if [ -n "$ENVFILE" ]; then rm -f "$ENVFILE"; fi; return 0; }
+        trap cleanup_envfile EXIT
+
+        if [ -z "$USERNAME" ] || [ -z "$LOCAL_PATH" ] || [ -z "$REMOTE" ] || [ -z "$ENVFILE" ]; then
+            echo "Usage: bbs-ssh-helper rclone-transfer <username> <push|pull> <local_path> <remote> <envfile> [rclone flags...]"
+            exit 1
+        fi
+        if [[ ! "$USERNAME" =~ ^bbs-[a-z0-9_-]+$ ]]; then
+            echo "Error: username must match bbs-[a-z0-9_-]+"
+            exit 1
+        fi
+        if [ "$DIRECTION" != "push" ] && [ "$DIRECTION" != "pull" ]; then
+            echo "Error: direction must be push or pull"
+            exit 1
+        fi
+        if ! is_allowed_path "$LOCAL_PATH"; then
+            echo "Error: local path must be under /var/bbs/ or a registered storage location"
+            exit 1
+        fi
+        if [ ! -f "$ENVFILE" ]; then
+            echo "Error: destination settings file not found"
+            exit 1
+        fi
+
+        # Destination settings: only rclone's DEST backend variables are
+        # accepted, so the file cannot redirect rclone anywhere else.
+        # Split on the first "=" only: base64 ends in "=" padding that an
+        # IFS split would strip.
+        DEST_ENV=()
+        while IFS= read -r LINE; do
+            K="${LINE%%=*}"
+            V="${LINE#*=}"
+            [[ "$K" =~ ^RCLONE_CONFIG_DEST_[A-Z0-9_]+$ ]] || continue
+            DEST_ENV+=("$K=$(printf '%s' "$V" | base64 -d 2>/dev/null)")
+        done < "$ENVFILE"
+        cleanup_envfile
+        ENVFILE=""
+
+        # A local copy: the destination is a bare path. It has to be on a
+        # registered storage location too, and the repo user needs to own
+        # the leaf so rclone can write it.
+        if [[ "$REMOTE" != DEST:* ]]; then
+            if ! is_allowed_path "$REMOTE"; then
+                echo "Error: destination path must be under /var/bbs/ or a registered storage location"
+                exit 1
+            fi
+            if [ "$DIRECTION" = "push" ]; then
+                # Intermediate folders (bbs-sync/<client>) are created
+                # root-owned and world-readable, so www-data can list them
+                # when looking for orphaned copies; the leaf belongs to the
+                # repo user so rclone can write it and www-data can add the
+                # manifest through the group.
+                mkdir -p "$REMOTE"
+                chown "$USERNAME":www-data "$REMOTE"
+                chmod 770 "$REMOTE"
+            fi
+        fi
+
+        if [ "$DIRECTION" = "pull" ]; then
+            PARENT_DIR=$(dirname "$LOCAL_PATH")
+            mkdir -p "$PARENT_DIR"
+            if [[ "$PARENT_DIR" =~ ^/var/bbs/home/[0-9]+$ ]] && [ "$(stat -c '%U' "$PARENT_DIR")" = "root" ]; then
+                chown "$USERNAME":www-data "$PARENT_DIR"
+                chmod 750 "$PARENT_DIR"
+            fi
+            mkdir -p "$LOCAL_PATH"
+            chown "$USERNAME":www-data "$LOCAL_PATH"
+            chmod 770 "$LOCAL_PATH"
+        fi
+
+        CACHE_DIR="/var/bbs/cache/$USERNAME/rclone"
+        mkdir -p "$CACHE_DIR"
+        chown -R "$USERNAME":"$USERNAME" "/var/bbs/cache/$USERNAME"
+
+        if [ "$DIRECTION" = "push" ]; then SRC="$LOCAL_PATH"; DST="$REMOTE"; else SRC="$REMOTE"; DST="$LOCAL_PATH"; fi
+
+        # Timeouts: see rclone-sync (#438).
+        sudo -u "$USERNAME" env \
+            "HOME=/var/bbs/cache/$USERNAME" \
+            "XDG_CACHE_HOME=$CACHE_DIR" \
+            "XDG_CONFIG_HOME=/var/bbs/cache/$USERNAME" \
+            "RCLONE_CONFIG=/dev/null" \
+            "${DEST_ENV[@]}" \
+            rclone sync "$SRC" "$DST" \
+            --transfers 4 --checkers 8 \
+            -v --stats-one-line --stats 5s \
+            --contimeout 30s --timeout 5m --retries 2 --low-level-retries 5 \
+            "${EXTRA_ARGS[@]}" 2>&1
+        EXIT_CODE=$?
+
+        if [ "$DIRECTION" = "pull" ]; then
+            chown -R "$USERNAME":www-data "$LOCAL_PATH"
+            chmod 770 "$LOCAL_PATH"
+        fi
+        exit $EXIT_CODE
         ;;
 
     rclone-restore)
@@ -879,6 +1413,7 @@ case "$ACTION" in
             --transfers 4 --checkers 8 \
             -v --stats-one-line --stats 5s \
             --s3-no-check-bucket \
+            --contimeout 30s --timeout 5m --retries 2 --low-level-retries 5 \
             "${EXTRA_ARGS[@]}" 2>&1
 
         EXIT_CODE=$?
@@ -920,13 +1455,26 @@ case "$ACTION" in
             exit 1
         fi
 
-        # Safety: refuse to delete system directories
-        case "$STORAGE_DIR" in
-            /|/bin|/boot|/dev|/etc|/home|/lib*|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/www|/var/www/bbs)
-                echo "Error: refusing to delete system directory: $STORAGE_DIR"
-                exit 1
-                ;;
-        esac
+        # Safety: only a directory inside /var/bbs or a registered storage
+        # location, strictly below its root, and not itself a symlink.
+        if [ -L "$STORAGE_DIR" ] || { ! is_allowed_path "$STORAGE_DIR" && ! is_client_home "$STORAGE_DIR"; }; then
+            echo "Error: refusing to delete $STORAGE_DIR (not inside a storage location)"
+            exit 1
+        fi
+        STORAGE_DIR=$(readlink -m "$STORAGE_DIR")
+        REFUSE_ROOT=false
+        for ROOT in /var/bbs /var/bbs/home /var/bbs/tmp /var/bbs/cache /var/bbs/config /var/bbs/mysql /var/bbs/clickhouse /var/bbs/backups; do
+            [ "$STORAGE_DIR" = "$ROOT" ] && REFUSE_ROOT=true
+        done
+        if [ -f /etc/bbs/allowed-storage-paths ]; then
+            while IFS= read -r ROOT; do
+                [ -n "$ROOT" ] && [ "$STORAGE_DIR" = "$(readlink -m "$ROOT")" ] && REFUSE_ROOT=true
+            done < /etc/bbs/allowed-storage-paths
+        fi
+        if [ "$REFUSE_ROOT" = true ]; then
+            echo "Error: refusing to delete a storage root: $STORAGE_DIR"
+            exit 1
+        fi
 
         if [ -d "$STORAGE_DIR" ]; then
             rm -rf "$STORAGE_DIR"
@@ -1010,6 +1558,42 @@ case "$ACTION" in
 
         mv "$OLD_DIR" "$NEW_DIR"
         echo "OK"
+        ;;
+
+    set-repo-id)
+        # Give a repository a new random borg ID.
+        # Usage: bbs-ssh-helper set-repo-id <repo_dir>
+        # A copy restored from an offsite sync is a byte-for-byte clone that
+        # shares the original's ID, so borg's per-ID security state rejects
+        # it as a replay ("multiple repos with same ID", #523). Copies are
+        # read-only in BBS, so the key they share with the original is never
+        # used to write and cannot reuse nonces. Prints the new ID.
+        REPO_DIR="${2:-}"
+        if [ -z "$REPO_DIR" ]; then
+            echo "Usage: bbs-ssh-helper set-repo-id <repo_dir>"
+            exit 1
+        fi
+        if ! is_allowed_path "$REPO_DIR"; then
+            echo "Error: repo dir must be under /var/bbs/ or a registered storage location"
+            exit 1
+        fi
+        CONFIG="$REPO_DIR/config"
+        if [ -L "$CONFIG" ] || [ ! -f "$CONFIG" ] || ! grep -q '^\[repository\]' "$CONFIG"; then
+            echo "Error: $REPO_DIR is not a borg repository"
+            exit 1
+        fi
+        NEW_ID=$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
+        TMP_CONFIG="$CONFIG.bbs-new-id"
+        sed "s/^id = .*/id = $NEW_ID/" "$CONFIG" > "$TMP_CONFIG"
+        if ! grep -qx "id = $NEW_ID" "$TMP_CONFIG"; then
+            rm -f "$TMP_CONFIG"
+            echo "Error: could not set a new id in $CONFIG"
+            exit 1
+        fi
+        chown --reference="$CONFIG" "$TMP_CONFIG"
+        chmod --reference="$CONFIG" "$TMP_CONFIG"
+        mv -f "$TMP_CONFIG" "$CONFIG"
+        echo "$NEW_ID"
         ;;
 
     clear-borg-cache)
@@ -1097,13 +1681,134 @@ case "$ACTION" in
             rclone sync "$LOCAL_DIR" "$REMOTE" \
             --include 'bbs-backup-*.tar.gz' \
             --transfers 2 -v \
-            --s3-no-check-bucket 2>&1
+            --s3-no-check-bucket \
+            --contimeout 30s --timeout 5m --retries 2 --low-level-retries 5 2>&1
 
         EXIT_CODE=$?
         if [ $EXIT_CODE -eq 0 ]; then
             echo "OK"
         fi
         exit $EXIT_CODE
+        ;;
+
+    rclone-server-list)
+        # List server backups in the S3 _server-backups folder as rclone
+        # lsjson output (the web UI's Restore from S3 Backup card, #342).
+        # Usage: bbs-ssh-helper rclone-server-list <endpoint> <region> <bucket> <access_key> <secret_key> [path_prefix]
+        S3_ENDPOINT="${2:-}"
+        S3_REGION="${3:-}"
+        S3_BUCKET="${4:-}"
+        S3_ACCESS_KEY="${5:-}"
+        S3_SECRET_KEY="${6:-}"
+        S3_PREFIX="${7:-}"
+
+        if [ -z "$S3_ENDPOINT" ] || [ -z "$S3_BUCKET" ] || [ -z "$S3_ACCESS_KEY" ]; then
+            echo "Usage: bbs-ssh-helper rclone-server-list <endpoint> <region> <bucket> <access_key> <secret_key> [path_prefix]"
+            exit 1
+        fi
+
+        REMOTE="S3:${S3_BUCKET}/${S3_PREFIX:+${S3_PREFIX}/}_server-backups/"
+        CACHE_DIR="/var/bbs/cache/server-backup"
+        mkdir -p "$CACHE_DIR"
+
+        env \
+            "HOME=$CACHE_DIR" \
+            "XDG_CACHE_HOME=$CACHE_DIR" \
+            "XDG_CONFIG_HOME=$CACHE_DIR" \
+            "RCLONE_CONFIG=/dev/null" \
+            "RCLONE_CONFIG_S3_TYPE=s3" \
+            "RCLONE_CONFIG_S3_PROVIDER=Other" \
+            "RCLONE_CONFIG_S3_ACCESS_KEY_ID=${S3_ACCESS_KEY}" \
+            "RCLONE_CONFIG_S3_SECRET_ACCESS_KEY=${S3_SECRET_KEY}" \
+            "RCLONE_CONFIG_S3_ENDPOINT=${S3_ENDPOINT}" \
+            "RCLONE_CONFIG_S3_REGION=${S3_REGION}" \
+            rclone lsjson "$REMOTE" \
+            --include 'bbs-backup-*.tar.gz' \
+            --s3-no-check-bucket \
+            --contimeout 30s --timeout 5m --retries 2 --low-level-retries 5
+        exit $?
+        ;;
+
+    rclone-server-download)
+        # Download one server backup into a restore staging directory.
+        # Usage: bbs-ssh-helper rclone-server-download <filename> <dest_dir> <endpoint> <region> <bucket> <access_key> <secret_key> [path_prefix]
+        FILENAME="${2:-}"
+        DEST_DIR="${3:-}"
+        S3_ENDPOINT="${4:-}"
+        S3_REGION="${5:-}"
+        S3_BUCKET="${6:-}"
+        S3_ACCESS_KEY="${7:-}"
+        S3_SECRET_KEY="${8:-}"
+        S3_PREFIX="${9:-}"
+
+        if [ -z "$FILENAME" ] || [ -z "$DEST_DIR" ] || [ -z "$S3_ENDPOINT" ] || [ -z "$S3_BUCKET" ] || [ -z "$S3_ACCESS_KEY" ]; then
+            echo "Usage: bbs-ssh-helper rclone-server-download <filename> <dest_dir> <endpoint> <region> <bucket> <access_key> <secret_key> [path_prefix]"
+            exit 1
+        fi
+        if [[ ! "$FILENAME" =~ ^bbs-backup-[A-Za-z0-9._-]+\.tar\.gz$ ]]; then
+            echo "Error: filename must match bbs-backup-*.tar.gz"
+            exit 1
+        fi
+        if [[ ! "$DEST_DIR" =~ ^(/var/bbs/tmp|/tmp)/bbs-restore-[0-9a-f]+$ ]]; then
+            echo "Error: dest_dir must be a bbs-restore-* staging directory under /var/bbs/tmp or /tmp"
+            exit 1
+        fi
+
+        REMOTE="S3:${S3_BUCKET}/${S3_PREFIX:+${S3_PREFIX}/}_server-backups/${FILENAME}"
+        CACHE_DIR="/var/bbs/cache/server-backup"
+        mkdir -p "$CACHE_DIR" "$DEST_DIR"
+
+        env \
+            "HOME=$CACHE_DIR" \
+            "XDG_CACHE_HOME=$CACHE_DIR" \
+            "XDG_CONFIG_HOME=$CACHE_DIR" \
+            "RCLONE_CONFIG=/dev/null" \
+            "RCLONE_CONFIG_S3_TYPE=s3" \
+            "RCLONE_CONFIG_S3_PROVIDER=Other" \
+            "RCLONE_CONFIG_S3_ACCESS_KEY_ID=${S3_ACCESS_KEY}" \
+            "RCLONE_CONFIG_S3_SECRET_ACCESS_KEY=${S3_SECRET_KEY}" \
+            "RCLONE_CONFIG_S3_ENDPOINT=${S3_ENDPOINT}" \
+            "RCLONE_CONFIG_S3_REGION=${S3_REGION}" \
+            rclone copy "$REMOTE" "$DEST_DIR/" \
+            --s3-no-check-bucket \
+            --contimeout 30s --timeout 5m --retries 2 --low-level-retries 5 2>&1
+
+        EXIT_CODE=$?
+        # The web server user needs to stat the file to confirm the download
+        chmod 755 "$DEST_DIR" 2>/dev/null || true
+        chmod 644 "$DEST_DIR/$FILENAME" 2>/dev/null || true
+        [ $EXIT_CODE -eq 0 ] && echo "OK"
+        exit $EXIT_CODE
+        ;;
+
+    server-restore)
+        # Restore a downloaded server backup via bbs-restore --yes. Only
+        # accepts files inside a /tmp/bbs-restore-* staging directory that
+        # the download subcommand above created.
+        # Usage: bbs-ssh-helper server-restore <backup_file>
+        BACKUP_FILE="${2:-}"
+
+        if [ -z "$BACKUP_FILE" ]; then
+            echo "Usage: bbs-ssh-helper server-restore <backup_file>"
+            exit 1
+        fi
+        if [[ ! "$BACKUP_FILE" =~ ^(/var/bbs/tmp|/tmp)/bbs-restore-[0-9a-f]+/bbs-backup-[A-Za-z0-9._-]+\.tar\.gz$ ]]; then
+            echo "Error: backup file must be inside a bbs-restore-* staging directory under /var/bbs/tmp or /tmp"
+            exit 1
+        fi
+        if [ ! -f "$BACKUP_FILE" ]; then
+            echo "Error: backup file not found: $BACKUP_FILE"
+            exit 1
+        fi
+
+        RESTORE_SCRIPT="/var/www/bbs/bin/bbs-restore"
+        if [ ! -f "$RESTORE_SCRIPT" ]; then
+            echo "Error: bbs-restore not found at $RESTORE_SCRIPT"
+            exit 1
+        fi
+
+        bash "$RESTORE_SCRIPT" --yes "$BACKUP_FILE"
+        exit $?
         ;;
 
     install-gate)
@@ -1123,24 +1828,31 @@ case "$ACTION" in
         chown root:root "$GATE_DST"
         echo "Installed bbs-ssh-gate to $GATE_DST"
 
-        # Ensure sshd accepts legacy ssh-rsa host key algorithm for older clients
-        # (CentOS 6 with OpenSSH 5.3 cannot negotiate modern algorithms)
+        # Ensure sshd accepts legacy algorithms for older clients. OpenSSH 10
+        # (Debian 13) dropped both ssh-rsa (SHA-1) host keys and the SHA-1
+        # Diffie-Hellman kex algorithms, so old clients — Windows Server 2016,
+        # Dropbear NAS boxes, CentOS 6/7 — are closed at key exchange (#352).
+        # Rewritten whenever the desired content changes so existing installs
+        # pick up new entries (not just when the file is missing).
         SSHD_LEGACY="/etc/ssh/sshd_config.d/bbs-legacy-compat.conf"
         SSHD_CONF_DIR="/etc/ssh/sshd_config.d"
-        if [ -d "$SSHD_CONF_DIR" ] && [ ! -f "$SSHD_LEGACY" ]; then
-            cat > "$SSHD_LEGACY" <<'SSHEOF'
+        read -r -d '' SSHD_LEGACY_CONTENT <<'SSHEOF' || true
 # Added by BBS to support agents on older OS with legacy SSH clients
 HostKeyAlgorithms +ssh-rsa
 PubkeyAcceptedAlgorithms +ssh-rsa
+KexAlgorithms +diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1,diffie-hellman-group1-sha1
 SSHEOF
+        if [ -d "$SSHD_CONF_DIR" ] && { [ ! -f "$SSHD_LEGACY" ] || [ "$(cat "$SSHD_LEGACY" 2>/dev/null)" != "$SSHD_LEGACY_CONTENT" ]; }; then
+            OLD_LEGACY="$(cat "$SSHD_LEGACY" 2>/dev/null || true)"
+            printf '%s\n' "$SSHD_LEGACY_CONTENT" > "$SSHD_LEGACY"
             chmod 644 "$SSHD_LEGACY"
-            # Validate config before restarting
+            # Validate config before restarting; restore prior content on error
             if sshd -t 2>/dev/null; then
                 systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
                 echo "Enabled legacy SSH compatibility"
             else
-                rm -f "$SSHD_LEGACY"
-                echo "Warning: sshd config invalid, removed legacy compat"
+                if [ -n "$OLD_LEGACY" ]; then printf '%s\n' "$OLD_LEGACY" > "$SSHD_LEGACY"; else rm -f "$SSHD_LEGACY"; fi
+                echo "Warning: sshd config invalid, reverted legacy compat"
             fi
         fi
         echo "OK"
@@ -1203,7 +1915,21 @@ SSHEOF
             exit 1
         fi
 
+        if ! is_client_home "$HOME_DIR"; then
+            echo "Error: home dir must be <storage path>/<client id>, not a symlink or system directory"
+            exit 1
+        fi
         PATHS_FILE="$HOME_DIR/.storage-paths"
+        if [ -L "$PATHS_FILE" ]; then
+            echo "Error: $PATHS_FILE is a symlink"
+            exit 1
+        fi
+        for P in "${@:3}"; do
+            if ! is_allowed_path "$P"; then
+                echo "Error: storage path '$P' is not inside a storage location"
+                exit 1
+            fi
+        done
 
         # Ensure home directory exists (may not if user creation used a different path)
         if [ ! -d "$HOME_DIR" ]; then
@@ -1243,11 +1969,16 @@ SSHEOF
         if [ $# -le 1 ]; then
             rm -f "$CONFIG_FILE"
         else
-            > "$CONFIG_FILE"
+            TMP_CONFIG=$(mktemp "$CONFIG_DIR/.allowed.XXXXXX")
             shift 1
             for P in "$@"; do
-                echo "$P" >> "$CONFIG_FILE"
+                if is_safe_storage_root "$P"; then
+                    readlink -m "$P" >> "$TMP_CONFIG"
+                else
+                    echo "Warning: refusing storage path '$P' (the filesystem root or a system directory)" >&2
+                fi
             done
+            mv -f "$TMP_CONFIG" "$CONFIG_FILE"
         fi
 
         [ -f "$CONFIG_FILE" ] && chmod 644 "$CONFIG_FILE"
@@ -1264,22 +1995,144 @@ SSHEOF
             exit 1
         fi
 
-        # Safety: tmpdir must be under /tmp
-        if [[ ! "$TMPDIR" =~ ^/tmp/bbs-download- ]]; then
-            echo "Error: tmpdir must be under /tmp/bbs-download-*"
+        # Safety: must be a download staging dir on the data volume (or legacy /tmp)
+        if [ -L "$TMPDIR" ] || [[ ! "$(readlink -m "$TMPDIR")" =~ ^(/var/bbs/tmp|/tmp)/bbs-download-[A-Za-z0-9]+$ ]]; then
+            echo "Error: tmpdir must be under /var/bbs/tmp/bbs-download-* or /tmp/bbs-download-*"
             exit 1
         fi
+        TMPDIR=$(readlink -m "$TMPDIR")
 
         if [ -d "$TMPDIR" ]; then
-            chgrp -R www-data "$TMPDIR"
+            # Owner, not just group: the staging tree lives in a sticky
+            # directory, where only its owner can remove it afterwards.
+            # chown -R changes symlinks themselves, never their targets.
+            chown -R www-data:www-data "$TMPDIR"
             find "$TMPDIR" -type d -exec chmod 770 {} +
             find "$TMPDIR" -type f -exec chmod 660 {} +
         fi
         echo "OK"
         ;;
 
+    cert-status)
+        # Report the Apache TLS certificate: domain, issuer, expiry.
+        # Usage: bbs-ssh-helper cert-status [domain]
+        # Reads certbot's own view first; falls back to the live cert file so a
+        # certificate issued by hand is still reported rather than shown as
+        # "none".
+        DOMAIN="${2:-}"
+
+        if command -v certbot >/dev/null 2>&1; then
+            certbot certificates ${DOMAIN:+--cert-name "$DOMAIN"} 2>/dev/null || true
+        fi
+
+        # A parseable block regardless of certbot's output format.
+        LIVE_DIR="/etc/letsencrypt/live"
+        if [ -n "$DOMAIN" ] && [ -f "$LIVE_DIR/$DOMAIN/cert.pem" ]; then
+            CERT="$LIVE_DIR/$DOMAIN/cert.pem"
+        else
+            CERT="$(ls -1 "$LIVE_DIR"/*/cert.pem 2>/dev/null | head -1 || true)"
+        fi
+
+        if [ -n "$CERT" ] && [ -f "$CERT" ]; then
+            echo "---BBS-CERT---"
+            echo "path=$CERT"
+            echo "subject=$(openssl x509 -in "$CERT" -noout -subject 2>/dev/null | sed 's/^subject=//')"
+            echo "issuer=$(openssl x509 -in "$CERT" -noout -issuer 2>/dev/null | sed 's/^issuer=//')"
+            echo "not_after=$(openssl x509 -in "$CERT" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+            echo "domains=$(openssl x509 -in "$CERT" -noout -ext subjectAltName 2>/dev/null | tr -d ' ' | grep -o 'DNS:[^,]*' | sed 's/DNS://' | paste -sd, -)"
+        else
+            echo "---BBS-CERT---"
+            echo "path="
+        fi
+
+        # Why the last renewal attempt failed, if it did. "DNS problem:
+        # NXDOMAIN looking up A for ..." tells an admin what to fix; a bare
+        # "expires in 7 days" does not.
+        LE_LOG="/var/log/letsencrypt/letsencrypt.log"
+        if [ -f "$LE_LOG" ]; then
+            LAST_ERR="$(grep -aiE '^[0-9-]+ [0-9:,]+ (ERROR|CRITICAL)|Domain: .*Detail:|Detail: ' "$LE_LOG" 2>/dev/null \
+                | tail -1 | sed -E 's/^[0-9-]+ [0-9:,]+ [A-Z]+ +//' | cut -c1-300)"
+            [ -n "$LAST_ERR" ] && echo "last_error=$LAST_ERR"
+        fi
+
+        # The renewal timer is what actually keeps the certificate alive, so
+        # say whether it is armed rather than only when the cert expires.
+        if systemctl list-timers --all 2>/dev/null | grep -q certbot; then
+            echo "timer=active"
+        elif [ -f /etc/cron.d/certbot ]; then
+            echo "timer=cron"
+        else
+            echo "timer=none"
+        fi
+        ;;
+
+    cert-renew)
+        # Renew now. Usage: bbs-ssh-helper cert-renew [domain] [--force]
+        # Output is returned verbatim to the caller — certbot explains its own
+        # failures better than a summary would.
+        DOMAIN="${2:-}"
+        FORCE="${3:-}"
+
+        if ! command -v certbot >/dev/null 2>&1; then
+            echo "Error: certbot is not installed on this server"
+            exit 1
+        fi
+
+        if [ -n "$DOMAIN" ] && [[ ! "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+            echo "Error: invalid domain"
+            exit 1
+        fi
+        ARGS=(renew)
+        [ -n "$DOMAIN" ] && ARGS+=(--cert-name "$DOMAIN")
+        [ "$FORCE" = "--force" ] && ARGS+=(--force-renewal)
+
+        certbot "${ARGS[@]}" --non-interactive 2>&1
+        RC=$?
+        if [ $RC -eq 0 ]; then
+            apache2ctl configtest >/dev/null 2>&1 && systemctl reload apache2 >/dev/null 2>&1 || true
+        fi
+        exit $RC
+        ;;
+
+    cert-email)
+        # Set the Let's Encrypt account contact address.
+        # Usage: bbs-ssh-helper cert-email <address|--remove>
+        # The installer runs before the admin account exists, so it registers
+        # with whatever it was given (often nothing). This is how the address
+        # collected later in the panel reaches the ACME account.
+        ADDR="${2:-}"
+
+        if [ -z "$ADDR" ]; then
+            echo "Usage: bbs-ssh-helper cert-email <address|--remove>"
+            exit 1
+        fi
+        if ! command -v certbot >/dev/null 2>&1; then
+            echo "Error: certbot is not installed on this server"
+            exit 1
+        fi
+
+        if [ "$ADDR" = "--remove" ]; then
+            certbot update_account --register-unsafely-without-email --non-interactive 2>&1
+            exit $?
+        fi
+
+        case "$ADDR" in
+            *@*.*) : ;;
+            *) echo "Error: '$ADDR' is not an email address"; exit 1 ;;
+        esac
+
+        certbot update_account --email "$ADDR" --non-interactive 2>&1
+        exit $?
+        ;;
+
     *)
-        echo "Usage: bbs-ssh-helper {create-user|create-repo-dir|borg-init|verify-repo|borg-extract|fix-repo-perms|fix-download-perms|delete-user|install-gate|update-all-keys|rclone-sync|rclone-restore|get-size|delete-storage|clear-borg-cache|update-storage-paths|update-allowed-paths} [args...]"
+        # Self-maintaining action list — the old hardcoded usage string went
+        # stale as subcommands were added, which made "unknown action" errors
+        # (usually an outdated installed helper, #342) very confusing.
+        echo "Error: unknown action '${ACTION}'"
+        echo "This usually means BBS components are out of sync — update to the latest release (Settings -> Update, or restart the Docker container) to bring everything current."
+        echo "Available actions:"
+        grep -oE '^    [a-z][a-z0-9-]*\)' "$0" | tr -d ' )' | sort | sed 's/^/  /'
         exit 1
         ;;
 esac

@@ -25,9 +25,11 @@
             'update_borg' => '<i class="bi bi-arrow-up-square text-info me-1"></i>',
             'update_agent' => '<i class="bi bi-arrow-up-square text-info me-1"></i>',
             'plugin_test' => '<i class="bi bi-pencil text-secondary me-1"></i>',
+            'plugin_post' => '<i class="bi bi-terminal text-secondary me-1"></i>',
             's3_sync' => '<i class="bi bi-cloud-upload text-info me-1"></i>',
             's3_restore' => '<i class="bi bi-cloud-download text-info me-1"></i>',
             'catalog_sync' => '<i class="bi bi-list-ul text-success me-1"></i>',
+            'archive_lock' => '<i class="bi bi-lock text-warning me-1"></i>',
             default => '<i class="bi bi-gear text-muted me-1"></i>',
         };
     }
@@ -266,13 +268,26 @@
                     <tr style="cursor: pointer;" onclick="window.location='/queue/<?= $job['id'] ?>'">
                         <td class="small text-nowrap"><?= \BBS\Core\TimeHelper::format($job['queued_at'], 'M j, g:i A') ?></td>
                         <td><?= htmlspecialchars($job['agent_name']) ?></td>
-                        <td class="text-nowrap"><?= jobTypeIcon($job['task_type']) ?><?= htmlspecialchars(ucfirst(str_replace('_', ' ', $job['task_type']))) ?></td>
-                        <td class="d-none d-md-table-cell"><?= number_format($job['files_total'] ?? 0) ?></td>
+                        <td class="text-nowrap"><?= jobTypeIcon($job['task_type']) ?><?= htmlspecialchars(\BBS\Core\JobType::label($job['task_type'])) ?></td>
+                        <td class="d-none d-md-table-cell"><?= in_array($job['task_type'], ['repo_check', 'repo_repair', 'archive_delete'], true) ? '--' : number_format($job['files_total'] ?? 0) ?></td>
                         <td>
+                            <?php
+                            // Percent from file counts when the total is known
+                            // (backups pre-count; restores get it from the
+                            // catalog at queue time), else from byte totals
+                            // (borg extract reports byte offsets). Clamped —
+                            // extract's item counter includes directories, so
+                            // it can slightly overshoot a file-only total.
+                            $pct = null;
+                            if (($job['files_total'] ?? 0) > 0) {
+                                $pct = min(100, round(($job['files_processed'] / $job['files_total']) * 100));
+                            } elseif (($job['bytes_total'] ?? 0) > 0 && ($job['bytes_processed'] ?? 0) > 0) {
+                                $pct = min(100, round(($job['bytes_processed'] / $job['bytes_total']) * 100));
+                            }
+                            ?>
                             <?php if ($job['status'] === 'queued'): ?>
                                 <span class="text-muted">Waiting</span>
-                            <?php elseif (($job['files_total'] ?? 0) > 0): ?>
-                                <?php $pct = round(($job['files_processed'] / $job['files_total']) * 100); ?>
+                            <?php elseif ($pct !== null): ?>
                                 <div class="progress queue-progress" style="height: 18px; min-width: 80px;">
                                     <div class="progress-bar progress-bar-striped progress-bar-animated bg-success" style="width: <?= $pct ?>%">
                                         <?= $pct ?>%
@@ -298,6 +313,10 @@
                             };
                             ?>
                             <span class="badge text-bg-<?= $sc ?>"><?= $job['status'] ?></span>
+                            <?php if ($job['status'] === 'running' && !empty($job['started_at'])):
+                                $since = strtotime($job['started_at'] . ' UTC'); ?>
+                            <div class="small text-muted text-nowrap" data-running-since="<?= $since ?>"><?= htmlspecialchars(\BBS\Core\TimeHelper::duration(max(0, time() - $since))) ?></div>
+                            <?php endif; ?>
                         </td>
                         <td class="text-end" onclick="event.stopPropagation()">
                             <a href="/queue/<?= $job['id'] ?>" class="btn btn-sm btn-outline-secondary" title="View Details"><i class="bi bi-eye"></i></a>
@@ -351,8 +370,8 @@
                     <tr style="cursor: pointer;" onclick="window.location='/queue/<?= $job['id'] ?>'">
                         <td class="small text-nowrap" title="<?= \BBS\Core\TimeHelper::format($job['completed_at'], 'M j, Y g:i A') ?>"><?= \BBS\Core\TimeHelper::ago($job['completed_at']) ?></td>
                         <td><?= htmlspecialchars($job['agent_name']) ?></td>
-                        <td class="text-nowrap"><?= jobTypeIcon($job['task_type']) ?><?= htmlspecialchars(ucfirst(str_replace('_', ' ', $job['task_type']))) ?></td>
-                        <td class="d-none d-md-table-cell"><?= number_format($job['files_total'] ?? 0) ?></td>
+                        <td class="text-nowrap"><?= jobTypeIcon($job['task_type']) ?><?= htmlspecialchars(\BBS\Core\JobType::label($job['task_type'])) ?></td>
+                        <td class="d-none d-md-table-cell"><?= in_array($job['task_type'], ['repo_check', 'repo_repair', 'archive_delete'], true) ? '--' : number_format($job['files_total'] ?? 0) ?></td>
                         <td class="d-none d-md-table-cell"><?= htmlspecialchars($job['repo_name'] ?? '--') ?></td>
                         <td class="d-none d-md-table-cell">
                             <?php
@@ -429,10 +448,7 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => new bootst
         return '<span class="badge text-bg-' + (colors[status] || 'secondary') + '">' + esc(status) + '</span>';
     }
 
-    function taskTypeLabel(type) {
-        const s = String(type || '').replace(/_/g, ' ');
-        return s.charAt(0).toUpperCase() + s.slice(1);
-    }
+    function taskTypeLabel(type) { return window.bbsTaskLabel(type); }
 
     function jobTypeIcon(type) {
         const icons = {
@@ -446,19 +462,28 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => new bootst
             'update_borg': '<i class="bi bi-arrow-up-square text-info me-1"></i>',
             'update_agent': '<i class="bi bi-arrow-up-square text-info me-1"></i>',
             'plugin_test': '<i class="bi bi-pencil text-secondary me-1"></i>',
+            'plugin_post': '<i class="bi bi-terminal text-secondary me-1"></i>',
             's3_sync': '<i class="bi bi-cloud-upload text-info me-1"></i>',
             's3_restore': '<i class="bi bi-cloud-download text-info me-1"></i>',
-            'catalog_sync': '<i class="bi bi-list-ul text-success me-1"></i>'
+            'catalog_sync': '<i class="bi bi-list-ul text-success me-1"></i>',
+            'archive_lock': '<i class="bi bi-lock text-warning me-1"></i>'
         };
         return icons[type] || '<i class="bi bi-gear text-muted me-1"></i>';
     }
 
     function buildInProgressRow(job) {
         let progress;
+        // Same fallback chain as the PHP render: file counts, then byte
+        // totals (restores without a catalog count), clamped at 100.
+        let pct = null;
+        if ((job.files_total || 0) > 0) {
+            pct = Math.min(100, Math.round((job.files_processed / job.files_total) * 100));
+        } else if ((job.bytes_total || 0) > 0 && (job.bytes_processed || 0) > 0) {
+            pct = Math.min(100, Math.round((job.bytes_processed / job.bytes_total) * 100));
+        }
         if (job.status === 'queued') {
             progress = '<span class="text-muted">Waiting</span>';
-        } else if ((job.files_total || 0) > 0) {
-            const pct = Math.round((job.files_processed / job.files_total) * 100);
+        } else if (pct !== null) {
             progress = '<div class="progress queue-progress" style="height:18px;min-width:80px;">' +
                 '<div class="progress-bar progress-bar-striped progress-bar-animated bg-success" style="width:' + pct + '%">' + pct + '%</div></div>';
         } else if (job.status_message) {
@@ -467,6 +492,13 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => new bootst
             progress = '<div class="progress queue-progress" style="height:18px;min-width:80px;">' +
                 '<div class="progress-bar progress-bar-striped progress-bar-animated bg-info" style="width:100%">Preparing...</div></div>';
         }
+
+        // How long a running job has been going (#533); the shared ticker
+        // keeps it current between polls.
+        const since = job.status === 'running' ? window.BBS.utcSeconds(job.started_at) : null;
+        const elapsed = since
+            ? '<div class="small text-muted text-nowrap" data-running-since="' + since + '">' + window.BBS.formatElapsed(window.BBS.serverNow() - since) + '</div>'
+            : '';
 
         let actions = '<a href="/queue/' + job.id + '" class="btn btn-sm btn-outline-secondary" title="View Details"><i class="bi bi-eye"></i></a>';
         if (job.status === 'queued' || job.status === 'sent' || job.status === 'running') {
@@ -479,10 +511,10 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => new bootst
             '<td class="small text-nowrap">' + formatDate(job.queued_at) + '</td>' +
             '<td>' + esc(job.agent_name) + '</td>' +
             '<td class="text-nowrap">' + jobTypeIcon(job.task_type) + esc(taskTypeLabel(job.task_type)) + '</td>' +
-            '<td class="d-none d-md-table-cell">' + Number(job.files_total || 0).toLocaleString() + '</td>' +
+            '<td class="d-none d-md-table-cell">' + (['repo_check','repo_repair','archive_delete'].includes(job.task_type) ? '--' : Number(job.files_total || 0).toLocaleString()) + '</td>' +
             '<td>' + progress + '</td>' +
             '<td class="d-none d-md-table-cell">' + esc(job.repo_name || '--') + '</td>' +
-            '<td>' + statusBadge(job.status) + '</td>' +
+            '<td>' + statusBadge(job.status) + elapsed + '</td>' +
             '<td class="text-end" onclick="event.stopPropagation()">' + actions + '</td></tr>';
     }
 
@@ -510,7 +542,7 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => new bootst
             '<td class="small text-nowrap">' + formatDate(job.completed_at) + '</td>' +
             '<td>' + esc(job.agent_name) + '</td>' +
             '<td class="text-nowrap">' + jobTypeIcon(job.task_type) + esc(taskTypeLabel(job.task_type)) + '</td>' +
-            '<td class="d-none d-md-table-cell">' + Number(job.files_total || 0).toLocaleString() + '</td>' +
+            '<td class="d-none d-md-table-cell">' + (['repo_check','repo_repair','archive_delete'].includes(job.task_type) ? '--' : Number(job.files_total || 0).toLocaleString()) + '</td>' +
             '<td class="d-none d-md-table-cell">' + esc(job.repo_name || '--') + '</td>' +
             '<td class="d-none d-md-table-cell">' + durationBar(job.duration_seconds, maxDuration, job.status) + '</td>' +
             '<td class="text-center">' + statusHtml + '</td>' +

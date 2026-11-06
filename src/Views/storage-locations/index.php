@@ -176,6 +176,46 @@ function escapeHtml(value) {
     </div>
 </form>
 
+<!-- Restore from S3 Backup (#342) — recover a server from the daily
+     server backups synced to S3, e.g. onto a fresh install after the
+     original server died. -->
+<div class="card border-0 shadow-sm mt-4">
+    <div class="card-header fw-semibold">
+        <i class="bi bi-cloud-download me-1"></i> Restore from S3 Backup
+    </div>
+    <div class="card-body">
+        <p class="text-muted small mb-3">
+            Recover this server from a server backup stored in S3 — for example onto a fresh install
+            after the original server was lost. Save the same S3 credentials the previous server used
+            (above), then list the available backups. Restoring replaces this server's
+            <strong>database, configuration, and SSH keys</strong>; repository data is not included and
+            is recovered separately (repos restore from S3 per repository, or can be imported from disk).
+        </p>
+        <div class="d-flex flex-wrap gap-2 align-items-center">
+            <button type="button" class="btn btn-sm btn-outline-primary" id="btnListS3Backups">
+                <i class="bi bi-search me-1"></i> List Available Backups
+            </button>
+            <button type="button" class="btn btn-sm btn-outline-success" id="btnBackupNow">
+                <i class="bi bi-shield-plus me-1"></i> Back Up Now
+            </button>
+            <span id="backupNowResult" class="small ms-1"></span>
+        </div>
+        <div class="form-text mt-2">
+            Selecting a backup's name downloads a copy. <strong>Back Up Now</strong> takes a fresh
+            server backup immediately — worth doing before an upgrade or a configuration change —
+            and uploads it if off-site sync is enabled.
+        </div>
+        <div id="s3BackupListError" class="alert alert-danger d-none mt-3"></div>
+        <div id="s3BackupList" class="mt-3" style="display:none;"></div>
+        <div id="s3RestoreProgress" class="alert alert-warning mt-3" style="display:none;">
+            <span class="spinner-border spinner-border-sm me-2"></span>
+            <strong>Restoring…</strong> Downloading the backup and restoring the database. This can take
+            several minutes — do not close this page.
+        </div>
+        <div id="s3RestoreResult" class="mt-3" style="display:none;"></div>
+    </div>
+</div>
+
 <script>
 // KMS key field visibility
 document.getElementById('s3SseMode')?.addEventListener('change', function() {
@@ -188,10 +228,13 @@ document.getElementById('btnTestS3')?.addEventListener('click', function() {
     btn.disabled = true;
     result.textContent = 'Testing...';
     result.className = 'd-flex align-items-center ms-2 small text-muted';
+    // Send the form as it stands, so a change is tested before it is saved (#441).
+    var params = new URLSearchParams(new FormData(btn.closest('form')));
+    params.set('csrf_token', document.querySelector('input[name=csrf_token]').value);
     fetch('/storage-locations/s3/test', {
         method: 'POST',
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-        body: 'csrf_token=' + encodeURIComponent(document.querySelector('input[name=csrf_token]').value)
+        body: params.toString()
     })
     .then(function(r) { return r.json(); })
     .then(function(data) {
@@ -210,6 +253,265 @@ document.getElementById('btnTestS3')?.addEventListener('click', function() {
         result.className = 'd-flex align-items-center ms-2 small text-danger fw-semibold';
     });
 });
+
+// --- Restore from S3 Backup (#342) -----------------------------------
+(function () {
+    var listBtn = document.getElementById('btnListS3Backups');
+    if (!listBtn) return;
+    var listDiv = document.getElementById('s3BackupList');
+    var errDiv = document.getElementById('s3BackupListError');
+    var progress = document.getElementById('s3RestoreProgress');
+    var resultDiv = document.getElementById('s3RestoreResult');
+    var csrf = function () { return document.querySelector('input[name=csrf_token]').value; };
+
+    function fmtBytes(b) {
+        var units = ['B', 'KB', 'MB', 'GB'];
+        var i = 0; b = Number(b) || 0;
+        while (b >= 1024 && i < units.length - 1) { b /= 1024; i++; }
+        return (Math.round(b * 10) / 10) + ' ' + units[i];
+    }
+
+    var backupNowBtn = document.getElementById('btnBackupNow');
+    var backupNowResult = document.getElementById('backupNowResult');
+    if (backupNowBtn) {
+        backupNowBtn.addEventListener('click', function () {
+            backupNowResult.textContent = '';
+            backupNowResult.className = 'small ms-1';
+            backupNowBtn.disabled = true;
+            backupNowBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> Backing up...';
+            fetch('/storage-locations/s3/backup-now', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: 'csrf_token=' + encodeURIComponent(csrf()),
+                credentials: 'same-origin'
+            })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                backupNowBtn.disabled = false;
+                backupNowBtn.innerHTML = '<i class="bi bi-shield-plus me-1"></i> Back Up Now';
+                if (!data.success) {
+                    backupNowResult.className = 'small ms-1 text-danger';
+                    backupNowResult.textContent = data.error || 'Backup failed.';
+                    return;
+                }
+                // The backup itself worked; the upload is reported separately
+                // so a sync failure isn't hidden behind a green message.
+                if (data.sync_message && !data.synced) {
+                    backupNowResult.className = 'small ms-1 text-warning';
+                    backupNowResult.textContent = (data.filename || 'Backup created')
+                        + ' — created locally, but the off-site upload failed: ' + data.sync_message;
+                    return;
+                }
+                backupNowResult.className = 'small ms-1 text-success';
+                backupNowResult.textContent = (data.filename || 'Backup created')
+                    + (data.synced ? ' — uploaded off-site' : '');
+                // Refresh the list so the new backup is there to download
+                if (data.synced) { listBtn.click(); }
+            })
+            .catch(function () {
+                backupNowBtn.disabled = false;
+                backupNowBtn.innerHTML = '<i class="bi bi-shield-plus me-1"></i> Back Up Now';
+                backupNowResult.className = 'small ms-1 text-danger';
+                backupNowResult.textContent = 'Request failed.';
+            });
+        });
+    }
+
+    listBtn.addEventListener('click', function () {
+        errDiv.classList.add('d-none');
+        listBtn.disabled = true;
+        listBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> Listing...';
+        fetch('/storage-locations/s3/list-backups', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: 'csrf_token=' + encodeURIComponent(csrf()),
+            credentials: 'same-origin'
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            listBtn.disabled = false;
+            listBtn.innerHTML = '<i class="bi bi-search me-1"></i> List Available Backups';
+            if (!data.success) {
+                errDiv.textContent = data.error || 'Failed to list backups.';
+                errDiv.classList.remove('d-none');
+                return;
+            }
+            renderList(data.backups || []);
+        })
+        .catch(function () {
+            listBtn.disabled = false;
+            listBtn.innerHTML = '<i class="bi bi-search me-1"></i> List Available Backups';
+            errDiv.textContent = 'Request failed.';
+            errDiv.classList.remove('d-none');
+        });
+    });
+
+    function renderList(backups) {
+        listDiv.innerHTML = '';
+        listDiv.style.display = '';
+        if (!backups.length) {
+            var p = document.createElement('div');
+            p.className = 'alert alert-secondary small mb-0';
+            p.textContent = 'No server backups found in the _server-backups folder of this bucket.';
+            listDiv.appendChild(p);
+            return;
+        }
+        var wrap = document.createElement('div');
+        wrap.className = 'table-responsive';
+        var table = document.createElement('table');
+        table.className = 'table table-sm table-hover align-middle mb-0';
+        table.innerHTML = '<thead><tr><th>Backup</th><th>Size</th><th>Date</th><th></th></tr></thead>';
+        var tbody = document.createElement('tbody');
+        backups.forEach(function (b) {
+            var tr = document.createElement('tr');
+            var tdName = document.createElement('td');
+            tdName.className = 'font-monospace small';
+            // Clickable filename: the quickest way to keep a copy of your own
+            var nameLink = document.createElement('a');
+            nameLink.href = '#';
+            nameLink.className = 'text-decoration-none';
+            nameLink.title = 'Download this backup';
+            nameLink.textContent = b.filename;
+            nameLink.addEventListener('click', function (e) { e.preventDefault(); downloadBackup(b.filename); });
+            tdName.appendChild(nameLink);
+            tr.appendChild(tdName);
+            var tdSize = document.createElement('td');
+            tdSize.className = 'text-nowrap';
+            tdSize.textContent = fmtBytes(b.size);
+            tr.appendChild(tdSize);
+            var tdDate = document.createElement('td');
+            tdDate.className = 'text-nowrap small';
+            tdDate.textContent = (b.modified || '').replace('T', ' ').substring(0, 19);
+            tr.appendChild(tdDate);
+            var tdBtn = document.createElement('td');
+            tdBtn.className = 'text-end text-nowrap';
+            var dlBtn = document.createElement('button');
+            dlBtn.type = 'button';
+            dlBtn.className = 'btn btn-sm btn-outline-secondary me-2';
+            dlBtn.innerHTML = '<i class="bi bi-download me-1"></i>Download';
+            dlBtn.title = 'Save a copy of this backup';
+            dlBtn.addEventListener('click', function () { downloadBackup(b.filename); });
+            tdBtn.appendChild(dlBtn);
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'btn btn-sm btn-danger';
+            btn.innerHTML = '<i class="bi bi-cloud-download me-1"></i>Restore';
+            btn.addEventListener('click', function () { startRestore(b.filename); });
+            tdBtn.appendChild(btn);
+            tr.appendChild(tdBtn);
+            tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+        wrap.appendChild(table);
+        listDiv.appendChild(wrap);
+    }
+
+    var downloadFrameSeq = 0;
+
+    // Submitted as a normal form rather than fetch(): the response is a file,
+    // and this way the browser's own downloader handles it — progress, resume
+    // and "save as" all come free, and a large backup never sits in memory.
+    //
+    // It targets a hidden iframe so the page itself never navigates. A file
+    // download leaves that iframe untouched, so anything that does load in it
+    // is the server reporting a problem — which is read back out and shown
+    // here instead of silently disappearing.
+    function downloadBackup(filename) {
+        var errBox = document.getElementById('s3BackupListError');
+        errBox.classList.add('d-none');
+
+        var frameName = 'bbsBackupDownload' + (++downloadFrameSeq);
+        var frame = document.createElement('iframe');
+        frame.name = frameName;
+        frame.style.display = 'none';
+        frame.addEventListener('load', function () {
+            var message = 'Could not download that backup.';
+            try {
+                var body = frame.contentDocument.body.innerText || '';
+                var parsed = JSON.parse(body);
+                if (parsed && parsed.error) { message = parsed.error; }
+            } catch (e) { /* not JSON, or not readable — keep the generic message */ }
+            errBox.textContent = message;
+            errBox.classList.remove('d-none');
+            frame.remove();
+        });
+        document.body.appendChild(frame);
+
+        var form = document.createElement('form');
+        form.method = 'POST';
+        form.action = '/storage-locations/s3/download-backup';
+        form.target = frameName;
+        form.style.display = 'none';
+        var f1 = document.createElement('input');
+        f1.type = 'hidden'; f1.name = 'csrf_token'; f1.value = csrf();
+        var f2 = document.createElement('input');
+        f2.type = 'hidden'; f2.name = 'filename'; f2.value = filename;
+        form.appendChild(f1); form.appendChild(f2);
+        document.body.appendChild(form);
+        form.submit();
+        setTimeout(function () { form.remove(); }, 1000);
+    }
+
+    function startRestore(filename) {
+        if (!confirm('Restore this server from "' + filename + '"?\n\n'
+            + 'This REPLACES the current database, configuration, and SSH keys with the backup\'s contents. '
+            + 'All current settings, clients, and users on THIS server are overwritten.\n\n'
+            + 'Your session will end and a NEW admin password will be generated and shown ONCE.')) {
+            return;
+        }
+        listDiv.style.display = 'none';
+        errDiv.classList.add('d-none');
+        resultDiv.style.display = 'none';
+        progress.style.display = '';
+        fetch('/storage-locations/s3/restore-backup', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: 'csrf_token=' + encodeURIComponent(csrf()) + '&filename=' + encodeURIComponent(filename),
+            credentials: 'same-origin'
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            progress.style.display = 'none';
+            resultDiv.style.display = '';
+            if (data.success) {
+                resultDiv.innerHTML = '';
+                var box = document.createElement('div');
+                box.className = 'alert alert-success mb-0';
+                box.innerHTML = '<h6 class="alert-heading"><i class="bi bi-check-circle me-1"></i>Restore complete</h6>'
+                    + '<p class="mb-2">The server was restored and is now in <strong>maintenance mode</strong>. '
+                    + 'A new admin password was generated — <strong>save it now, it is shown only once</strong>:</p>';
+                var creds = document.createElement('div');
+                creds.className = 'p-2 bg-body-secondary rounded font-monospace';
+                creds.textContent = 'Username: ' + (data.username || 'admin') + '   Password: ' + (data.password || '');
+                box.appendChild(creds);
+                var foot = document.createElement('p');
+                foot.className = 'mb-0 mt-2 small';
+                foot.textContent = 'Log in with these credentials, review Storage and Clients, restore repositories from S3 as needed, then turn off maintenance mode in Settings.';
+                box.appendChild(foot);
+                resultDiv.appendChild(box);
+            } else {
+                var err = document.createElement('div');
+                err.className = 'alert alert-danger mb-0';
+                err.textContent = 'Restore failed: ' + (data.error || 'unknown error');
+                if (data.output) {
+                    var pre = document.createElement('pre');
+                    pre.className = 'small mt-2 mb-0';
+                    pre.style.whiteSpace = 'pre-wrap';
+                    pre.textContent = data.output;
+                    err.appendChild(pre);
+                }
+                resultDiv.innerHTML = '';
+                resultDiv.appendChild(err);
+            }
+        })
+        .catch(function () {
+            progress.style.display = 'none';
+            resultDiv.style.display = '';
+            resultDiv.innerHTML = '<div class="alert alert-danger mb-0">Restore request failed — the connection may have dropped. '
+                + 'Check the server log; if the restore completed, the new admin password is in the restore output on the server.</div>';
+        });
+    }
+})();
 </script>
 
 <?php elseif ($section === 'wizard'): ?>
@@ -275,9 +577,38 @@ document.getElementById('btnTestS3')?.addEventListener('click', function() {
 
 <!-- BorgBase Wizard Form -->
 <div id="wizardBorgbase" style="display:none">
-    <div class="card border-0 shadow-sm">
+    <div class="card border-0 shadow-sm mb-3">
         <div class="card-header fw-semibold" style="background:rgba(200,170,50,0.12)">
-            <img src="/images/borgbase.svg" alt="" style="width:18px;height:18px;border-radius:50%;vertical-align:text-bottom" class="me-1"> BorgBase Setup
+            <img src="/images/borgbase.svg" alt="" style="width:18px;height:18px;border-radius:50%;vertical-align:text-bottom" class="me-1"> Connect a BorgBase Account
+        </div>
+        <div class="card-body">
+            <p class="text-muted small mb-3">
+                BorgBase gives every repository its own SSH login, so BBS groups them by account. Paste an API token and BBS registers its own SSH key on the account,
+                shows the plan's storage and repository limits, and creates repositories there for your clients.
+            </p>
+            <form method="POST" action="/borgbase-accounts/create" autocomplete="off">
+                <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                <div class="mb-3">
+                    <label class="form-label fw-semibold">API Token</label>
+                    <input type="text" class="form-control font-monospace" name="api_token" required autocomplete="new-password" data-lpignore="true" data-1p-ignore="true" spellcheck="false" placeholder="eyJhbGciOi...">
+                    <div class="form-text">In BorgBase go to <strong>Account &rarr; API &rarr; New Token</strong>. Name it (for example "BBS") and choose <strong>Full Access</strong> so BBS can create and delete repositories. A Read Only token shows usage but can't manage repositories. The token is encrypted before it is stored.</div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-semibold">Name</label>
+                    <input type="text" class="form-control" name="name" placeholder="BorgBase" style="max-width:320px">
+                    <div class="form-text">How this account appears in BBS. Useful when you have more than one.</div>
+                </div>
+                <div class="d-flex gap-2 align-items-center">
+                    <button type="submit" class="btn btn-sm btn-primary"><i class="bi bi-plug me-1"></i> Connect Account</button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" onclick="hideWizardForm()">Cancel</button>
+                    <a class="small ms-auto" data-bs-toggle="collapse" href="#bbLegacyForm" role="button">Set up a single repository without a token</a>
+                </div>
+            </form>
+        </div>
+    </div>
+    <div class="card border-0 shadow-sm collapse" id="bbLegacyForm">
+        <div class="card-header fw-semibold" style="background:rgba(200,170,50,0.12)">
+            <img src="/images/borgbase.svg" alt="" style="width:18px;height:18px;border-radius:50%;vertical-align:text-bottom" class="me-1"> Single BorgBase Repository
         </div>
         <div class="card-body">
             <p class="text-muted small mb-3">Paste the SSH connection string from your <a href="https://www.borgbase.com" target="_blank">BorgBase</a> repository page, then paste your SSH private key below.</p>
@@ -1116,13 +1447,21 @@ function applyRemotePreset(select, form) {
                                 <input type="text" class="form-control" name="path" placeholder="/mnt/storage2" required>
                                 <div class="form-text">Absolute path to the storage directory. Must exist and be writable.</div>
                             </div>
-                            <div class="col-md-2 d-flex align-items-center pt-4">
+                            <div class="col-md-2">
+                                <label class="form-label fw-semibold">Capacity</label>
+                                <div class="input-group">
+                                    <input type="number" class="form-control" name="capacity_gb" min="0" step="0.001" placeholder="auto">
+                                    <span class="input-group-text">GB</span>
+                                </div>
+                                <div class="form-text">Only for mounts that can't report their own size, such as WebDAV. Leave blank to measure it.</div>
+                            </div>
+                            <div class="col-md-1 d-flex align-items-center pt-4">
                                 <div class="form-check">
                                     <input class="form-check-input" type="checkbox" name="is_default" id="newIsDefault">
                                     <label class="form-check-label" for="newIsDefault">Default</label>
                                 </div>
                             </div>
-                            <div class="col-md-2 d-flex align-items-end">
+                            <div class="col-md-1 d-flex align-items-end">
                                 <button type="submit" class="btn btn-sm btn-success w-100">Create</button>
                             </div>
                         </div>
@@ -1149,15 +1488,54 @@ function applyRemotePreset(select, form) {
                         </h6>
                         <code class="small text-muted"><?= htmlspecialchars($loc['path']) ?></code>
                     </div>
-                    <?php if (!$loc['is_default'] && $loc['repo_count'] === 0): ?>
-                    <form method="POST" action="/storage-locations/<?= $loc['id'] ?>/delete"
-                          onsubmit="return confirm('Delete storage location \'<?= htmlspecialchars($loc['label'], ENT_QUOTES) ?>\'?')">
-                        <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-                        <button type="submit" class="btn btn-sm btn-outline-danger" title="Delete">
-                            <i class="bi bi-trash"></i>
+                    <div class="d-flex gap-1">
+                        <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse"
+                                data-bs-target="#editLoc<?= $loc['id'] ?>" title="Edit">
+                            <i class="bi bi-pencil"></i>
                         </button>
+                        <?php if (!$loc['is_default'] && $loc['repo_count'] === 0): ?>
+                        <form method="POST" action="/storage-locations/<?= $loc['id'] ?>/delete"
+                              onsubmit="return confirm('Delete storage location \'<?= htmlspecialchars($loc['label'], ENT_QUOTES) ?>\'?')">
+                            <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                            <button type="submit" class="btn btn-sm btn-outline-danger" title="Delete">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        </form>
+                        <?php endif; ?>
+                    </div>
+                </div>
+
+                <div class="collapse mb-3" id="editLoc<?= $loc['id'] ?>">
+                    <form method="POST" action="/storage-locations/<?= $loc['id'] ?>/update" class="border rounded p-2 bg-body-tertiary">
+                        <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                        <div class="mb-2">
+                            <label class="form-label small fw-semibold mb-1">Label</label>
+                            <input type="text" class="form-control form-control-sm" name="label"
+                                   value="<?= htmlspecialchars($loc['label']) ?>" required>
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label small fw-semibold mb-1">Capacity</label>
+                            <div class="input-group input-group-sm">
+                                <input type="number" class="form-control" name="capacity_gb" min="0" step="0.001"
+                                       placeholder="auto"
+                                       value="<?= !empty($loc['capacity_bytes']) ? rtrim(rtrim(number_format($loc['capacity_bytes'] / 1073741824, 3, '.', ''), '0'), '.') : '' ?>">
+                                <span class="input-group-text">GB</span>
+                            </div>
+                            <div class="form-text">Blank measures the filesystem. Set this only for mounts that can't report their own size, such as WebDAV — BBS then counts what it has written here.</div>
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label small fw-semibold mb-1">Max concurrent jobs</label>
+                            <input type="number" class="form-control form-control-sm" name="max_concurrent" min="0" max="<?= $maxQueue ?>"
+                                   placeholder="global limit" value="<?= !empty($loc['max_concurrent']) ? (int) $loc['max_concurrent'] : '' ?>">
+                            <div class="form-text">Jobs that may touch this disk at once: backups, restores, prunes, checks, catalog rebuilds and offsite syncs of the repositories stored here. Blank uses the global limit (<?= $maxQueue ?>). 1 keeps a spinning disk sequential. Can't go above Max Concurrent Jobs in Settings.</div>
+                        </div>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" name="is_default" id="defLoc<?= $loc['id'] ?>"
+                                   <?= $loc['is_default'] ? 'checked' : '' ?>>
+                            <label class="form-check-label small" for="defLoc<?= $loc['id'] ?>">Default location</label>
+                        </div>
+                        <button type="submit" class="btn btn-sm btn-primary">Save</button>
                     </form>
-                    <?php endif; ?>
                 </div>
 
                 <!-- Disk Usage -->
@@ -1176,7 +1554,15 @@ function applyRemotePreset(select, form) {
                     </div>
                     <div class="text-muted small mt-1">
                         <?= formatStorageBytes($loc['disk_total']) ?> total &middot; <?= $pct ?>% used
+                        <?php if (($loc['capacity_source'] ?? '') === 'stated'): ?>
+                        <span class="ms-1" title="This mount can't report its own size, so BBS uses the capacity you set and counts what it has written there.">(stated)</span>
+                        <?php endif; ?>
                     </div>
+                </div>
+                <?php elseif (!empty($loc['capacity_unknown_reason'])): ?>
+                <div class="small text-muted mb-2">
+                    <i class="bi bi-question-circle me-1"></i>Capacity unknown
+                    <div class="mt-1"><?= htmlspecialchars($loc['capacity_unknown_reason']) ?></div>
                 </div>
                 <?php else: ?>
                 <div class="text-muted small mb-2"><i class="bi bi-exclamation-triangle me-1"></i>Path not accessible</div>
@@ -1185,6 +1571,9 @@ function applyRemotePreset(select, form) {
                 <!-- Stats -->
                 <div class="d-flex gap-3 small text-muted">
                     <span><i class="bi bi-archive me-1"></i><?= $loc['repo_count'] ?> repo<?= $loc['repo_count'] !== 1 ? 's' : '' ?></span>
+                    <?php if (!empty($loc['max_concurrent'])): ?>
+                    <span title="At most this many jobs touch this disk at once"><i class="bi bi-speedometer2 me-1"></i><?= (int) $loc['max_concurrent'] ?> at a time</span>
+                    <?php endif; ?>
                     <span><i class="bi bi-database me-1"></i><?= formatStorageBytes($loc['total_size']) ?></span>
                 </div>
             </div>
@@ -1207,10 +1596,52 @@ function applyRemotePreset(select, form) {
     </div>
     <div class="card-body">
 
-<?php if (empty($remoteSshConfigs)): ?>
+<?php if (empty($remoteSshConfigs) && empty($borgBaseAccounts)): ?>
 <div class="alert alert-info mb-0">No remote SSH hosts configured. <a href="/storage-locations?section=wizard">Add one</a> to get started.</div>
 <?php else: ?>
 <div class="row g-3">
+    <?php foreach ($borgBaseAccounts ?? [] as $ba): ?>
+    <?php
+    $baPlanBytes = $ba['plan_max_size_gb'] !== null ? (int) $ba['plan_max_size_gb'] * 1000 * 1000 * 1000 : 0;
+    $baUsed = (int) ($ba['usage_bytes'] ?? 0);
+    $baPct = $baPlanBytes > 0 ? min(100, round($baUsed / $baPlanBytes * 100, 1)) : null;
+    $baColor = $baPct === null ? 'secondary' : ($baPct >= 90 ? 'danger' : ($baPct >= 75 ? 'warning' : 'success'));
+    $baLimit = (int) ($ba['plan_max_repos'] ?? 0);
+    $baRemote = (int) ($ba['remote_repo_count'] ?? 0);
+    ?>
+    <div class="col-xl-4 col-lg-6">
+        <a href="/borgbase-accounts/<?= $ba['id'] ?>" class="text-decoration-none text-reset">
+        <div class="card border-0 shadow-sm h-100 storage-account-card">
+            <div class="card-body">
+                <div class="d-flex align-items-start gap-2 mb-2">
+                    <div class="flex-shrink-0 mt-1"><img src="/images/borgbase.svg" alt="" style="width:24px;height:24px;border-radius:50%"></div>
+                    <div class="flex-grow-1" style="min-width:0">
+                        <h6 class="mb-0"><?= htmlspecialchars($ba['name']) ?></h6>
+                        <div class="small text-muted text-truncate"><?= $ba['plan_name'] ? htmlspecialchars($ba['plan_name']) : 'BorgBase account' ?><?= $ba['username'] ? ' &middot; ' . htmlspecialchars($ba['username']) : '' ?></div>
+                    </div>
+                    <span class="badge bg-warning text-dark">Account</span>
+                </div>
+                <div class="d-flex gap-3 small text-muted">
+                    <span><i class="bi bi-archive me-1"></i><?= $baRemote ?><?= $baLimit > 0 ? ' of ' . $baLimit : '' ?> repos on BorgBase</span>
+                    <span><i class="bi bi-hdd me-1"></i><?= (int) $ba['repo_count'] ?> in BBS</span>
+                </div>
+                <?php if ($ba['checked_at']): ?>
+                <div class="mt-2">
+                    <div class="d-flex justify-content-between small text-muted mb-1">
+                        <span><?= formatStorageBytesDecimal($baUsed) ?> used</span>
+                        <span><?= $baPlanBytes > 0 ? formatStorageBytesDecimal(max(0, $baPlanBytes - $baUsed)) . ' free' : '' ?></span>
+                    </div>
+                    <div class="progress" style="height: 6px;"><div class="progress-bar bg-<?= $baColor ?>" style="width: <?= $baPct ?? 0 ?>%"></div></div>
+                    <div class="text-muted small mt-1"><?= $baPlanBytes > 0 ? formatStorageBytesDecimal($baPlanBytes) . ' plan &middot; ' . $baPct . '% used &middot; ' : '' ?>checked <?= \BBS\Core\TimeHelper::ago($ba['checked_at']) ?></div>
+                    <?php if (!empty($ba['check_error'])): ?><div class="small text-danger mt-1"><?= htmlspecialchars($ba['check_error']) ?></div><?php endif; ?>
+                </div>
+                <?php endif; ?>
+                <div class="small mt-2"><i class="bi bi-box-arrow-up-right me-1"></i>Manage repositories</div>
+            </div>
+        </div>
+        </a>
+    </div>
+    <?php endforeach; ?>
     <?php foreach ($remoteSshConfigs as $rsc): ?>
     <?php $isBorgBase = (($rsc['provider'] ?? '') === 'borgbase') || str_contains((string)($rsc['remote_host'] ?? ''), '.repo.borgbase.com'); ?>
     <div class="col-xl-4 col-lg-6">
@@ -1260,6 +1691,9 @@ function applyRemotePreset(select, form) {
                 </div>
                 <div class="d-flex gap-3 small text-muted">
                     <span><i class="bi bi-archive me-1"></i><?= $rsc['repo_count'] ?> repo<?= $rsc['repo_count'] !== 1 ? 's' : '' ?></span>
+                    <?php if (!empty($rsc['max_concurrent'])): ?>
+                    <span title="At most this many jobs touch this host at once"><i class="bi bi-speedometer2 me-1"></i><?= (int) $rsc['max_concurrent'] ?> at a time</span>
+                    <?php endif; ?>
                     <span class="badge bg-success"><i class="bi bi-check-circle me-1"></i>Active</span>
                 </div>
                 <?php
@@ -1292,7 +1726,20 @@ function applyRemotePreset(select, form) {
                     <?php endif; ?>
                 </div>
                 <?php elseif ($wasChecked): ?>
-                <div class="mt-2 small text-muted"><i class="bi bi-exclamation-triangle me-1"></i><?= $isBorgBase ? 'Set quota manually or use API' : 'Quota unavailable — provider does not support disk usage queries' ?></div>
+                <div class="mt-2 small text-muted"><i class="bi bi-exclamation-triangle me-1"></i><?php
+                    if ($isBorgBase) {
+                        echo 'Set quota manually or use API';
+                    } elseif (!empty($rsc['disk_check_error'])) {
+                        // The recorded reason, rather than blaming the provider
+                        // for what is usually a name, key or firewall problem.
+                        echo 'Quota unavailable — ' . htmlspecialchars($rsc['disk_check_error']);
+                    } else {
+                        echo 'Quota unavailable — not checked yet';
+                    }
+                ?></div>
+                <?php endif; ?>
+                <?php if ($isBorgBase): ?>
+                <div class="small text-muted mt-2"><i class="bi bi-info-circle me-1"></i>Not grouped under an account. <a href="/storage-locations?section=wizard">Connect the BorgBase account</a> with an API token to manage its repositories together.</div>
                 <?php endif; ?>
                 <div id="remoteSshTestResult<?= $rsc['id'] ?>" class="mt-2"></div>
             </div>
@@ -1347,6 +1794,12 @@ function applyRemotePreset(select, form) {
                             <input class="form-check-input" type="checkbox" name="append_repo_name" value="1" id="editAppendRepoName<?= $rsc['id'] ?>" <?= ($rsc['append_repo_name'] ?? 1) ? 'checked' : '' ?>>
                             <label class="form-check-label" for="editAppendRepoName<?= $rsc['id'] ?>">Append repository name to base path</label>
                             <div class="form-text">Uncheck for providers like BorgBase where each SSH user maps to a single fixed repo path.</div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-semibold">Max Concurrent Jobs <span class="text-muted fw-normal">(optional)</span></label>
+                            <input type="number" class="form-control" name="max_concurrent" min="0" max="<?= $maxQueue ?>"
+                                   placeholder="global limit" value="<?= !empty($rsc['max_concurrent']) ? (int) $rsc['max_concurrent'] : '' ?>">
+                            <div class="form-text">Jobs that may touch this host at once: backups, restores, prunes, checks, catalog rebuilds and offsite syncs of the repositories stored here. Blank uses the global limit (<?= $maxQueue ?>). 1 keeps a spinning disk sequential. Can't go above Max Concurrent Jobs in Settings.</div>
                         </div>
                         <?php if ($isBorgBase): ?>
                         <hr>
@@ -1469,6 +1922,7 @@ $s3SyncServerBackups = ($settings['s3_sync_server_backups'] ?? '0') === '1';
                 <th>Client</th>
                 <th>Destination</th>
                 <th class="text-end">Repositories Syncing</th>
+                <th class="text-end" title="Syncs and restores that may run against this destination at once; set on the client's Plugins tab">Max Jobs</th>
                 <th></th>
             </tr>
         </thead>
@@ -1488,6 +1942,7 @@ $s3SyncServerBackups = ($settings['s3_sync_server_backups'] ?? '0') === '1';
                     <?php endif; ?>
                 </td>
                 <td class="text-end"><?= (int) $dest['repo_count'] ?></td>
+                <td class="text-end"><?= (int) ($destCfg['max_concurrent'] ?? 0) > 0 ? (int) $destCfg['max_concurrent'] : '<span class="text-muted">global</span>' ?></td>
                 <td class="text-end">
                     <a class="btn btn-sm btn-outline-secondary" href="/clients/<?= $dest['agent_id'] ?>?tab=plugins" title="Edit on the client's Plugins tab">
                         <i class="bi bi-gear"></i>
@@ -1526,6 +1981,12 @@ function testRemoteSsh(id, triggerEl) {
     .then(function(data) {
         if (data.status === 'ok') {
             resultDiv.innerHTML = '<span class="badge bg-success"><i class="bi bi-check-circle me-1"></i>Connected' + (data.version ? ' — ' + data.version.replace(/</g, '&lt;') : '') + '</span>';
+            // The test re-reads the quota, so reload to show it rather than
+            // leaving a stale "unavailable" under a green Connected badge.
+            if (data.quota_changed) {
+                resultDiv.insertAdjacentHTML('beforeend', ' <span class="small text-muted">updating quota…</span>');
+                setTimeout(function () { window.location.reload(); }, 900);
+            }
         } else {
             resultDiv.innerHTML = '<span class="badge bg-danger"><i class="bi bi-x-circle me-1"></i>' + (data.error || 'Failed').replace(/</g, '&lt;') + '</span>';
         }

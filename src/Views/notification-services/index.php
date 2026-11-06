@@ -20,8 +20,9 @@ $eventGroups = [
     ],
     'Storage' => [
         'storage_low' => 'Storage Low',
-        's3_sync_failed' => 'S3 Sync Failed',
-        's3_sync_done' => 'S3 Sync Done',
+        'certificate_expiring' => 'SSL Certificate Expiring',
+        's3_sync_failed' => 'Offsite Sync Failed',
+        's3_sync_done' => 'Offsite Sync Done',
     ],
     'Schedules' => [
         'missed_schedule' => 'Missed Schedule',
@@ -49,6 +50,7 @@ $eventColors = [
     'backup_warning' => 'warning',
     'agent_offline' => 'warning',
     'storage_low' => 'warning',
+    'certificate_expiring' => 'warning',
     'missed_schedule' => 'warning',
 ];
 ?>
@@ -82,7 +84,7 @@ $eventColors = [
                             <strong>Pushover:</strong> pover://user@token
                         </div>
                         <div class="col-md-6">
-                            <strong>ntfy:</strong> ntfy://topic<br>
+                            <strong>ntfy:</strong> ntfy://topic or ntfys://host/topic?token=tk_...<br>
                             <strong>Gotify:</strong> gotify://hostname/token<br>
                             <strong>Email:</strong> mailto://user:pass@smtp.example.com<br>
                             <strong>Webhook:</strong> json://your-webhook-url
@@ -162,7 +164,7 @@ $eventColors = [
                             <div class="form-check">
                                 <input class="form-check-input" type="checkbox" name="events[<?= $event ?>]"
                                        value="1" id="addEvent_<?= $event ?>"
-                                       <?= str_contains($event, 'failed') || $event === 'agent_offline' || $event === 'storage_low' || $event === 'missed_schedule' ? 'checked' : '' ?>>
+                                       <?= str_contains($event, 'failed') || $event === 'agent_offline' || $event === 'storage_low' || $event === 'certificate_expiring' || $event === 'missed_schedule' ? 'checked' : '' ?>>
                                 <label class="form-check-label" for="addEvent_<?= $event ?>">
                                     <?= htmlspecialchars($label) ?>
                                 </label>
@@ -329,15 +331,15 @@ $eventColors = [
                                     </button>
                                 </div>
                                 <div>
-                                    <form method="POST" action="/notification-services/<?= $service['id'] ?>/toggle" class="d-inline toggle-form">
-                                        <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-                                        <button type="submit" class="btn btn-sm btn-outline-<?= $service['enabled'] ? 'warning' : 'success' ?>">
-                                            <i class="bi bi-<?= $service['enabled'] ? 'pause-circle' : 'play-circle' ?> me-1"></i>
-                                            <?= $service['enabled'] ? 'Disable' : 'Enable' ?>
-                                        </button>
-                                    </form>
+                                    <button type="submit" class="btn btn-sm btn-outline-<?= $service['enabled'] ? 'warning' : 'success' ?>" form="svcToggle_<?= $service['id'] ?>">
+                                        <i class="bi bi-<?= $service['enabled'] ? 'pause-circle' : 'play-circle' ?> me-1"></i>
+                                        <?= $service['enabled'] ? 'Disable' : 'Enable' ?>
+                                    </button>
                                 </div>
                             </div>
+                        </form>
+                        <form id="svcToggle_<?= $service['id'] ?>" method="POST" action="/notification-services/<?= $service['id'] ?>/toggle" class="d-none">
+                            <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                         </form>
                     </td>
                 </tr>
@@ -436,13 +438,13 @@ $eventColors = [
                             <button type="button" class="btn btn-sm btn-outline-secondary ms-2"
                                     data-bs-toggle="collapse" data-bs-target="#editMobile_<?= $service['id'] ?>">Cancel</button>
                         </div>
-                        <form method="POST" action="/notification-services/<?= $service['id'] ?>/toggle" class="d-inline toggle-form">
-                            <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
-                            <button type="submit" class="btn btn-sm btn-outline-<?= $service['enabled'] ? 'warning' : 'success' ?>">
-                                <?= $service['enabled'] ? 'Disable' : 'Enable' ?>
-                            </button>
-                        </form>
+                        <button type="submit" class="btn btn-sm btn-outline-<?= $service['enabled'] ? 'warning' : 'success' ?>" form="svcToggleMobile_<?= $service['id'] ?>">
+                            <?= $service['enabled'] ? 'Disable' : 'Enable' ?>
+                        </button>
                     </div>
+                </form>
+                <form id="svcToggleMobile_<?= $service['id'] ?>" method="POST" action="/notification-services/<?= $service['id'] ?>/toggle" class="d-none">
+                    <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                 </form>
             </div>
         </div>
@@ -617,14 +619,31 @@ const serviceSchemas = {
         label: 'ntfy',
         fields: [
             { name: 'topic', label: 'Topic', type: 'text', required: true, placeholder: 'my-backup-alerts', width: 'col-md-6' },
-            { name: 'server', label: 'Server (optional)', type: 'text', placeholder: 'ntfy.sh', width: 'col-md-6' }
+            { name: 'server', label: 'Server (optional)', type: 'text', placeholder: 'ntfy.sh', width: 'col-md-6' },
+            { name: 'secure', label: 'Connection', type: 'select', width: 'col-md-6', options: [
+                { value: 'https', label: 'HTTPS' },
+                { value: 'http', label: 'HTTP' }
+            ]},
+            { name: 'token', label: 'Access token (optional)', type: 'password', placeholder: 'tk_...', width: 'col-md-6' }
         ],
-        help: 'Subscribe to the topic in your ntfy app. Default server is ntfy.sh',
+        help: 'Subscribe to the topic in your ntfy app. Leave Server empty for ntfy.sh. The access token is for servers or topics that need a login.',
         build: function(f) {
-            if (f.server && f.server !== 'ntfy.sh') {
-                return `ntfy://${f.server}/${f.topic || ''}`;
+            // Accept a pasted URL in Server: its scheme picks the connection (#550).
+            let server = (f.server || '').trim();
+            let secure = f.secure !== 'http';
+            const m = server.match(/^(https?|ntfys?):\/\//i);
+            if (m) {
+                secure = /^(https|ntfys)$/i.test(m[1]);
+                server = server.slice(m[0].length);
             }
-            return `ntfy://${f.topic || ''}`;
+            server = server.replace(/\/+$/, '');
+            const topic = f.topic || '';
+            const token = (f.token || '').trim();
+            const query = token ? `?token=${encodeURIComponent(token)}` : '';
+            if (server && server.toLowerCase() !== 'ntfy.sh') {
+                return `${secure ? 'ntfys' : 'ntfy'}://${server}/${topic}${query}`;
+            }
+            return `ntfy://${topic}${query}`;
         }
     },
     gotify: {

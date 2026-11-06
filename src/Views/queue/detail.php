@@ -11,6 +11,10 @@ $statusLabel = ($job['status'] === 'completed' && !empty($job['had_warnings']))
     : ucfirst($job['status']);
 
 $durLabel = \BBS\Core\TimeHelper::duration((int) ($job['duration_seconds'] ?? 0));
+// A running job shows how long it has been running (#533); the page's
+// ticker keeps it current.
+$runningSince = ($job['status'] === 'running' && !empty($job['started_at'])) ? strtotime($job['started_at'] . ' UTC') : null;
+$runningLabel = $runningSince ? \BBS\Core\TimeHelper::duration(max(0, time() - $runningSince)) : '';
 
 $pct = 0;
 if (($job['files_total'] ?? 0) > 0 && $job['files_processed'] > 0) {
@@ -27,8 +31,19 @@ function formatBytes($bytes) {
 }
 
 $isActive = in_array($job['status'], ['queued', 'sent', 'running']);
-$isServerSide = in_array($job['task_type'], ['prune', 'compact', 's3_sync', 's3_restore', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full']);
-$taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
+// Repo check/repair report borg's phase counts (segments, archives) rather
+// than files, with the phase named in status_message (#464).
+// Check and archive delete jobs report borg's own progress (phase text and
+// counts, not files and bytes).
+$isCheckJob = in_array($job['task_type'], ['repo_check', 'repo_repair', 'archive_delete'], true);
+$isServerSide = $isCheckJob || in_array($job['task_type'], ['prune', 'compact', 's3_sync', 's3_restore', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_lock']);
+$taskLabel = \BBS\Core\JobType::label($job['task_type']);
+// Restores report bytes but no file total, so fall back to the byte
+// percentage when there are no file counts to go on (#546).
+$byBytes = $pct === 0 && !$isCheckJob && $bytesPct > 0;
+if ($byBytes) {
+    $pct = $bytesPct;
+}
 ?>
 
 <style>
@@ -130,11 +145,12 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
 <div class="card border-0 shadow-sm queue-detail-hero mb-4">
     <div class="card-body d-flex align-items-center justify-content-between flex-wrap gap-3">
         <div class="d-flex align-items-center gap-3">
-            <a href="/queue" class="btn btn-sm btn-outline-secondary" title="Back to Queue"><i class="bi bi-arrow-left"></i></a>
+            <a href="<?= htmlspecialchars($backUrl ?? '/queue') ?>" class="btn btn-sm btn-outline-secondary" title="<?= ($backUrl ?? '/queue') === '/queue' ? 'Back to Queue' : 'Back' ?>"><i class="bi bi-arrow-left"></i></a>
             <div>
                 <h4 class="mb-1">
                     Job #<?= $job['id'] ?>
                     <span class="badge text-bg-<?= $statusClass ?> fs-6 ms-2"><?= htmlspecialchars($statusLabel) ?></span>
+                    <span id="jobElapsed" class="text-muted fs-6 fw-normal ms-2"<?= $runningSince ? ' data-running-since="' . $runningSince . '" data-running-prefix="Running for "' : ' hidden' ?>><?= $runningSince ? 'Running for ' . htmlspecialchars($runningLabel) : '' ?></span>
                 </h4>
                 <div class="queue-meta-strip">
                     <span class="queue-meta-pill"><i class="bi bi-cpu me-1"></i><?= htmlspecialchars($taskLabel) ?></span>
@@ -158,12 +174,12 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
 <?php if ($isActive): ?>
 <div class="card border-0 shadow-sm mb-4 queue-progress-panel">
     <div class="card-body py-3">
-        <?php if ($isServerSide && $job['status'] === 'running'): ?>
-            <div class="text-white fw-semibold mb-1"><i class="bi bi-hdd me-1"></i> <?= ucfirst($job['task_type']) ?> running on server...</div>
+        <?php if ($isServerSide && !$isCheckJob && $job['status'] === 'running'): ?>
+            <div class="text-white fw-semibold mb-1"><i class="bi bi-hdd me-1"></i> <?= htmlspecialchars($taskLabel) ?> running on server...</div>
             <div class="progress mb-1" style="height: 22px; background-color: rgba(255,255,255,0.15);">
                 <div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar"
                      style="width: 100%; background-color: #5b9bd5;">
-                    Server-side <?= $job['task_type'] ?>
+                    Server-side <?= htmlspecialchars(strtolower($taskLabel)) ?>
                 </div>
             </div>
             <div class="text-white-50 small">This task runs directly on the backup server — no agent involved</div>
@@ -175,16 +191,16 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
                     Queued for server
                 </div>
             </div>
-            <div class="text-white-50 small">This <?= $job['task_type'] ?> job runs server-side and will be picked up by the scheduler within 60 seconds</div>
+            <div class="text-white-50 small">This <?= htmlspecialchars(strtolower($taskLabel)) ?> job runs server-side and will be picked up by the scheduler within 60 seconds</div>
         <?php elseif ($job['status'] === 'running' && $pct > 0): ?>
             <div class="d-flex justify-content-between text-white mb-1">
-                <span class="fw-semibold"><?= $taskLabel ?>... <?= $pct ?>%</span>
-                <span class="small text-white-50"><?= formatBytes($job['bytes_processed']) ?><?= ($job['bytes_total'] ?? 0) > 0 ? ' of ' . formatBytes($job['bytes_total']) : '' ?> processed</span>
+                <span class="fw-semibold"><?= $isCheckJob && !empty($job['status_message']) ? htmlspecialchars($job['status_message']) : $taskLabel . '... ' . $pct . '%' ?></span>
+                <span class="small text-white-50"><?= $isCheckJob ? '' : formatBytes($job['bytes_processed']) . ((($job['bytes_total'] ?? 0) > 0) ? ' of ' . formatBytes($job['bytes_total']) : '') . ' processed' ?></span>
             </div>
             <div class="progress mb-1" style="height: 22px; background-color: rgba(255,255,255,0.15);">
                 <div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar"
                      style="width: <?= $pct ?>%; background-color: #5b9bd5;" aria-valuenow="<?= $pct ?>" aria-valuemin="0" aria-valuemax="100">
-                    <?= number_format($job['files_processed']) ?> / <?= number_format($job['files_total']) ?> files
+                    <?= $byBytes ? formatBytes($job['bytes_processed']) . ' / ' . formatBytes($job['bytes_total']) : number_format($job['files_processed']) . ' / ' . number_format($job['files_total']) . ($isCheckJob ? '' : ' files') ?>
                 </div>
             </div>
             <div class="text-white-50 small text-truncate" id="currentFile" style="max-width: 100%;"></div>
@@ -232,7 +248,7 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
             </div>
             <div class="text-white-50 small">
                 <i class="bi bi-clock text-info me-1"></i>
-                This <?= $job['task_type'] ?> job will run server-side when a queue slot opens
+                This <?= htmlspecialchars(strtolower($taskLabel)) ?> job will run server-side when a queue slot opens
             </div>
         <?php else: ?>
             <?php
@@ -269,13 +285,25 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
         <?php endif; ?>
     </div>
 </div>
+<?php elseif ($job['status'] === 'completed' && $isCheckJob && !empty($job['had_warnings'])): ?>
+<div class="card border-0 shadow-sm mb-4 bg-warning-subtle">
+    <div class="card-body py-3">
+        <div class="fw-semibold text-warning-emphasis mb-1"><i class="bi bi-exclamation-triangle me-1"></i> <?= $taskLabel ?> completed with problems</div>
+        <div class="progress mb-1" style="height: 22px;">
+            <div class="progress-bar bg-warning" role="progressbar" style="width: 100%;">
+                borg reported problems
+            </div>
+        </div>
+        <div class="text-warning-emphasis small mt-1"><i class="bi bi-info-circle me-1"></i>Duration: <?= $durLabel ?> &middot; see the activity log below for what borg found</div>
+    </div>
+</div>
 <?php elseif ($job['status'] === 'completed' && $isServerSide): ?>
 <div class="card border-0 shadow-sm mb-4 bg-success-subtle">
     <div class="card-body py-3">
-        <div class="fw-semibold text-success mb-1"><i class="bi bi-hdd me-1"></i> <?= ucfirst($job['task_type']) ?> Completed</div>
+        <div class="fw-semibold text-success mb-1"><i class="bi bi-hdd me-1"></i> <?= htmlspecialchars($taskLabel) ?> Completed</div>
         <div class="progress mb-1" style="height: 22px;">
             <div class="progress-bar bg-success" role="progressbar" style="width: 100%;">
-                Server-side <?= $job['task_type'] ?> finished
+                Server-side <?= htmlspecialchars(strtolower($taskLabel)) ?> finished
             </div>
         </div>
         <div class="text-muted small">Duration: <?= $durLabel ?> &middot; See activity log below for details</div>
@@ -357,8 +385,9 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
                                 'compact' => 'arrows-collapse',
                                 'update_borg' => 'arrow-up-circle',
                                 's3_sync' => 'cloud-upload',
+                                's3_restore' => 'cloud-download',
                                 default => 'gear',
-                            } ?> me-1"></i><?= ucfirst(str_replace('_', ' ', $job['task_type'])) ?></td>
+                            } ?> me-1"></i><?= htmlspecialchars($taskLabel) ?></td>
                         </tr>
                         <tr>
                             <td class="text-muted fw-semibold ps-3">Repository</td>
@@ -384,7 +413,7 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
                         </tr>
                         <tr>
                             <td class="text-muted fw-semibold ps-3">Duration</td>
-                            <td><?= $durLabel ?></td>
+                            <td<?= $runningSince ? ' data-running-since="' . $runningSince . '" data-running-suffix=" (in progress)"' : '' ?>><?= $runningSince ? htmlspecialchars($runningLabel) . ' (in progress)' : $durLabel ?></td>
                         </tr>
                     </tbody>
                 </table>
@@ -449,6 +478,16 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
             <div class="card-body p-0">
                 <table class="table table-borderless mb-0">
                     <tbody>
+                        <?php if ($isCheckJob): ?>
+                        <tr>
+                            <td class="text-muted fw-semibold ps-3" style="width: 160px;">Phase</td>
+                            <td><?= !empty($job['status_message']) ? htmlspecialchars($job['status_message']) : '--' ?></td>
+                        </tr>
+                        <tr>
+                            <td class="text-muted fw-semibold ps-3"><?= $job['task_type'] === 'archive_delete' ? 'Processed' : 'Checked' ?></td>
+                            <td><?= $job['files_total'] ? number_format((int) $job['files_processed']) . ' / ' . number_format($job['files_total']) : '--' ?></td>
+                        </tr>
+                        <?php else: ?>
                         <tr>
                             <td class="text-muted fw-semibold ps-3" style="width: 160px;">Files Total</td>
                             <td><?= $job['files_total'] ? number_format($job['files_total']) : '--' ?></td>
@@ -465,6 +504,13 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
                             <td class="text-muted fw-semibold ps-3">Bytes Processed</td>
                             <td><?= formatBytes($job['bytes_processed']) ?></td>
                         </tr>
+                        <?php endif; ?>
+                        <?php if (($job['task_type'] ?? '') === 'backup'): ?>
+                        <tr>
+                            <td class="text-muted fw-semibold ps-3">Deduplicated Size</td>
+                            <td><?= !empty($jobArchive) ? formatBytes($jobArchive['deduplicated_size']) : '--' ?></td>
+                        </tr>
+                        <?php endif; ?>
                         <?php if ($job['directories']): ?>
                         <tr>
                             <td class="text-muted fw-semibold ps-3">Directories</td>
@@ -486,6 +532,61 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
 </div>
 
 <!-- Error Log (if failed) -->
+<?php
+// Dry run results (#257): summary + capped sample lists from task_result
+$dryRunResult = null;
+if ($job['task_type'] === 'backup_dry_run' && !empty($job['task_result'])) {
+    $decoded = json_decode($job['task_result'], true);
+    if (is_array($decoded) && !empty($decoded['dry_run'])) $dryRunResult = $decoded;
+}
+?>
+<?php if ($dryRunResult !== null): ?>
+<div class="card border-0 shadow-sm mb-4">
+    <div class="card-header card-head-gradient fw-semibold">
+        <i class="bi bi-eyeglasses me-1"></i> Dry Run Results
+    </div>
+    <div class="card-body">
+        <p class="mb-2">
+            <span class="badge text-bg-success me-1"><?= number_format($dryRunResult['would_backup'] ?? 0) ?></span> items would be backed up<?php if (isset($dryRunResult['would_backup_bytes'])): ?>
+            (<?= formatBytes((int) $dryRunResult['would_backup_bytes']) ?> on disk, before compression and deduplication)<?php endif; ?>,
+            <span class="badge text-bg-secondary me-1"><?= number_format($dryRunResult['excluded'] ?? 0) ?></span> excluded by patterns.
+            Nothing was written to the repository.
+        </p>
+        <?php if (!empty($dryRunLog)): ?>
+        <div class="d-flex flex-wrap align-items-center gap-2 mb-3">
+            <a class="btn btn-sm btn-outline-primary" href="/queue/<?= (int) $job['id'] ?>/dry-run-log">
+                <i class="bi bi-download me-1"></i> Download full list (<?= formatBytes($dryRunLog['size']) ?>)
+            </a>
+            <?php if (!empty($canDeleteDryRunLog)): ?>
+            <form method="POST" action="/queue/<?= (int) $job['id'] ?>/dry-run-log/delete" class="d-inline"
+                  data-confirm="Delete this dry run's file list now? It is removed automatically after a day.">
+                <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                <button type="submit" class="btn btn-sm btn-outline-danger"><i class="bi bi-trash me-1"></i> Delete list</button>
+            </form>
+            <?php endif; ?>
+            <span class="small text-muted">Kept until <?= \BBS\Core\TimeHelper::format(date('Y-m-d H:i:s', $dryRunLog['mtime'] + \BBS\Services\DryRunLogService::KEEP_SECONDS), 'M j, g:i A') ?></span>
+        </div>
+        <?php elseif (array_key_exists('full_list', $dryRunResult)): ?>
+        <p class="small text-muted mb-3">The full file list is no longer available. Lists are kept for one day.</p>
+        <?php endif; ?>
+        <?php foreach ([['excluded_sample', 'Excluded items', 'excluded'], ['included_sample', 'Items that would be backed up', 'would_backup']] as [$key, $label, $totalKey]): ?>
+            <?php $sample = $dryRunResult[$key] ?? []; $totalCount = (int) ($dryRunResult[$totalKey] ?? 0); ?>
+            <?php if (!empty($sample)): ?>
+            <div class="mb-2">
+                <a class="text-decoration-none small" data-bs-toggle="collapse" href="#dryrun-<?= $key ?>">
+                    <i class="bi bi-chevron-expand"></i> <?= $label ?>
+                    (<?= count($sample) < $totalCount ? 'first ' . count($sample) . ' of ' . number_format($totalCount) : count($sample) ?>)
+                </a>
+                <div class="collapse" id="dryrun-<?= $key ?>">
+                    <pre class="small bg-body-secondary rounded p-2 mt-1 mb-0" style="max-height: 300px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;"><?= htmlspecialchars(implode("\n", $sample)) ?></pre>
+                </div>
+            </div>
+            <?php endif; ?>
+        <?php endforeach; ?>
+    </div>
+</div>
+<?php endif; ?>
+
 <?php if ($job['status'] === 'failed' && $job['error_log']): ?>
 <div id="error-section" class="card border-0 shadow-sm mb-4 border-danger">
     <div class="card-header card-head-gradient fw-semibold text-danger">
@@ -599,15 +700,19 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
         const container = document.getElementById('progress-section');
         if (!container) return;
 
-        const isServerSide = ['prune','compact','s3_sync','s3_restore','repo_check','repo_repair','break_lock','catalog_sync','catalog_rebuild','catalog_rebuild_full'].includes(job.task_type);
-        const pct = (job.files_total > 0 && job.files_processed > 0) ? Math.round((job.files_processed / job.files_total) * 100) : 0;
+        const isServerSide = ['prune','compact','s3_sync','s3_restore','repo_check','repo_repair','break_lock','catalog_sync','catalog_rebuild','catalog_rebuild_full','archive_delete','archive_lock'].includes(job.task_type);
+        let pct = (job.files_total > 0 && job.files_processed > 0) ? Math.round((job.files_processed / job.files_total) * 100) : 0;
+        // Restores report bytes but no file total: use the byte percentage (#546)
+        const byBytes = pct === 0 && !['repo_check','repo_repair','archive_delete'].includes(job.task_type)
+            && job.bytes_total > 0 && job.bytes_processed > 0;
+        if (byBytes) pct = Math.round((job.bytes_processed / job.bytes_total) * 100);
         const isJobActive = ['queued','sent','running'].includes(job.status);
 
         if (job.status === 'completed') {
             if (isServerSide) {
                 container.innerHTML = '<div class="card border-0 shadow-sm mb-4 bg-success-subtle"><div class="card-body py-3">' +
-                    '<div class="fw-semibold text-success mb-1"><i class="bi bi-hdd me-1"></i> ' + esc(job.task_type[0].toUpperCase()+job.task_type.slice(1)) + ' Completed</div>' +
-                    '<div class="progress mb-1" style="height:22px"><div class="progress-bar bg-success" style="width:100%">Server-side ' + esc(job.task_type) + ' finished</div></div>' +
+                    '<div class="fw-semibold text-success mb-1"><i class="bi bi-hdd me-1"></i> ' + esc(window.bbsTaskLabel(job.task_type)) + ' Completed</div>' +
+                    '<div class="progress mb-1" style="height:22px"><div class="progress-bar bg-success" style="width:100%">Server-side ' + esc(((window.BBS_TASK_LABELS || {})[job.task_type] || job.task_type).toLowerCase()) + ' finished</div></div>' +
                     '<div class="text-muted small">Duration: ' + window.BBS.formatDuration(job.duration_seconds) + ' &middot; See activity log below for details</div></div></div>';
             } else {
                 container.innerHTML = '<div class="card border-0 shadow-sm mb-4 bg-success-subtle"><div class="card-body py-3">' +
@@ -622,8 +727,13 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
                 (job.error_log ? '<div class="text-danger small mt-1"><i class="bi bi-exclamation-triangle me-1"></i>' + esc(job.error_log.substring(0,200)) + '</div>' : '') +
                 '</div></div>';
         } else if (isJobActive && job.status === 'running' && pct > 0) {
-            var taskLabel = (job.task_type || 'backup').replace('_',' ').replace(/^\w/, c => c.toUpperCase());
-            var bytesText = fmtBytes(job.bytes_processed) + (job.bytes_total > 0 ? ' of ' + fmtBytes(job.bytes_total) : '') + ' processed';
+            var taskLabel = window.bbsTaskLabel(job.task_type || 'backup');
+            var isCheckJob = ['repo_check','repo_repair','archive_delete'].includes(job.task_type);
+            var headText = (isCheckJob && job.status_message) ? job.status_message : taskLabel + '... ' + pct + '%';
+            var barText = byBytes
+                ? fmtBytes(job.bytes_processed) + ' / ' + fmtBytes(job.bytes_total)
+                : Number(job.files_processed).toLocaleString() + ' / ' + Number(job.files_total).toLocaleString() + (isCheckJob ? '' : ' files');
+            var bytesText = isCheckJob ? '' : fmtBytes(job.bytes_processed) + (job.bytes_total > 0 ? ' of ' + fmtBytes(job.bytes_total) : '') + ' processed';
             var currentFile = data.currentFile ? data.currentFile.replace(/\/+$/, '') : '';
             var fileHtml = currentFile ? '<div class="text-white-50 small text-truncate" style="max-width:100%;" title="' + esc(currentFile) + '">' + esc(currentFile) + '</div>' : '';
             var headerRow = container.querySelector('.d-flex.justify-content-between');
@@ -632,8 +742,8 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
                 const bar = container.querySelector('.progress-bar');
                 const label = headerRow.querySelector('.fw-semibold');
                 const bytesEl = headerRow.querySelector('.text-white-50');
-                if (bar) { bar.style.width = pct + '%'; bar.textContent = Number(job.files_processed).toLocaleString() + ' / ' + Number(job.files_total).toLocaleString() + ' files'; }
-                if (label) label.textContent = taskLabel + '... ' + pct + '%';
+                if (bar) { bar.style.width = pct + '%'; bar.textContent = barText; }
+                if (label) label.textContent = headText;
                 if (bytesEl) bytesEl.textContent = bytesText;
                 var fileEl = container.querySelector('.text-truncate');
                 if (fileEl && currentFile) { fileEl.textContent = currentFile; fileEl.title = currentFile; }
@@ -641,13 +751,13 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
             } else {
                 // Full replace (transitioning from pre-progress state)
                 container.innerHTML = '<div class="card border-0 shadow-sm mb-4 queue-progress-panel"><div class="card-body py-3">' +
-                    '<div class="d-flex justify-content-between text-white mb-1"><span class="fw-semibold">' + esc(taskLabel) + '... ' + pct + '%</span><span class="small text-white-50">' + bytesText + '</span></div>' +
-                    '<div class="progress mb-1" style="height:22px;background-color:rgba(255,255,255,0.15)"><div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:' + pct + '%;background-color:#5b9bd5">' + Number(job.files_processed).toLocaleString() + ' / ' + Number(job.files_total).toLocaleString() + ' files</div></div>' +
+                    '<div class="d-flex justify-content-between text-white mb-1"><span class="fw-semibold">' + esc(headText) + '</span><span class="small text-white-50">' + bytesText + '</span></div>' +
+                    '<div class="progress mb-1" style="height:22px;background-color:rgba(255,255,255,0.15)"><div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:' + pct + '%;background-color:#5b9bd5">' + barText + '</div></div>' +
                     fileHtml + '</div></div>';
             }
         } else if (isJobActive && job.status === 'running') {
             // Full replace when transitioning from queued/sent to running (pre-progress phase)
-            var taskLabel2 = (job.task_type || 'backup').replace('_',' ').replace(/^\w/, c => c.toUpperCase());
+            var taskLabel2 = window.bbsTaskLabel(job.task_type || 'backup');
             var msg = job.status_message ? esc(job.status_message) : taskLabel2 + ' in progress...';
             var sub = job.status_message ? '' : '<div class="text-white-50 small">' + (isServerSide ? 'Running on server...' : 'Waiting for progress data from agent...') + '</div>';
             container.innerHTML = '<div class="card border-0 shadow-sm mb-4 queue-progress-panel"><div class="card-body py-3">' +
@@ -671,13 +781,17 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
     }
 
     function updateDetails(job) {
+        const runningSince = job.status === 'running' ? window.BBS.utcSeconds(job.started_at) : null;
         // Update stats
         const statsMap = {
             'Files Total': job.files_total ? Number(job.files_total).toLocaleString() : '--',
             'Files Processed': job.files_processed ? Number(job.files_processed).toLocaleString() : '--',
             'Bytes Total': fmtBytes(job.bytes_total),
             'Bytes Processed': fmtBytes(job.bytes_processed),
+            'Phase': job.status_message || '--',
+            'Checked': job.files_total ? Number(job.files_processed || 0).toLocaleString() + ' / ' + Number(job.files_total).toLocaleString() : '--',
         };
+        if (job._archive) statsMap['Deduplicated Size'] = fmtBytes(job._archive.deduplicated_size);
         document.querySelectorAll('table.table-borderless td.text-muted').forEach(td => {
             const key = td.textContent.trim();
             if (statsMap[key] !== undefined) {
@@ -685,8 +799,29 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
             }
             if (key === 'Started At' && job.started_at) td.nextElementSibling.textContent = fmtDate(job.started_at);
             if (key === 'Completed At' && job.completed_at) td.nextElementSibling.textContent = fmtDate(job.completed_at);
-            if (key === 'Duration') td.nextElementSibling.textContent = window.BBS.formatDuration(job.duration_seconds);
+            if (key === 'Duration') {
+                const cell = td.nextElementSibling;
+                if (runningSince) {
+                    cell.setAttribute('data-running-since', runningSince);
+                    cell.setAttribute('data-running-suffix', ' (in progress)');
+                } else {
+                    cell.removeAttribute('data-running-since');
+                    cell.textContent = window.BBS.formatDuration(job.duration_seconds);
+                }
+            }
         });
+        const elapsed = document.getElementById('jobElapsed');
+        if (elapsed) {
+            if (runningSince) {
+                elapsed.setAttribute('data-running-since', runningSince);
+                elapsed.setAttribute('data-running-prefix', 'Running for ');
+                elapsed.hidden = false;
+            } else {
+                elapsed.removeAttribute('data-running-since');
+                elapsed.hidden = true;
+            }
+        }
+        window.BBS.tickElapsed();
     }
 
     function updateLogs(logs) {
@@ -731,6 +866,7 @@ $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
             .then(function(data) {
                 const job = data.job;
                 updateProgressBar(job, data);
+                job._archive = data.archive || null;
                 updateDetails(job);
                 updateLogs(data.logs);
                 if (job.status !== previousStatus) {

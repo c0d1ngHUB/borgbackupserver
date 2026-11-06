@@ -73,10 +73,13 @@ DESIRED_CH_GID="${CH_PGID:-$PREV_CH_GID}"
 
 # --- Preflight guards ---
 abort_config() {
-    echo ""
-    echo "!!! FATAL: invalid UID/GID configuration !!!"
-    echo "  $1"
-    echo "  Fix the offending env var (e.g. in docker-compose.yml / .env) and restart."
+    # stderr: also called from inside $(...), where stdout would be captured
+    {
+        echo ""
+        echo "!!! FATAL: invalid UID/GID configuration !!!"
+        echo "  $1"
+        echo "  Fix the offending env var (e.g. in docker-compose.yml / .env) and restart."
+    } >&2
     exit 1
 }
 
@@ -113,15 +116,84 @@ for uidfile in /var/bbs/home/*/.uid; do
     done
 done
 
+# --- Container identity helper ---
+# Args: service new_uid new_gid
+# Sets the in-container user/group to the desired IDs. /etc/passwd and
+# /etc/group live in the container filesystem, not the volume, so a
+# recreate (every image upgrade) puts them back to the image defaults.
+# This therefore runs on every start, independent of the volume state
+# (#520). Prints the UID/GID the user had before, so the caller can
+# repair files written under the wrong IDs.
+apply_service_identity() {
+    local service="$1" new_uid="$2" new_gid="$3"
+    local cur_uid cur_gid
+    cur_uid=$(id -u "$service" 2>/dev/null) || return 0
+    cur_gid=$(getent group "$service" 2>/dev/null | cut -d: -f3)
+    if [ "$cur_uid" = "$new_uid" ] && [ "$cur_gid" = "$new_gid" ]; then
+        return 0
+    fi
+
+    if [ "$cur_gid" != "$new_gid" ]; then
+        local clash
+        clash=$(getent group "$new_gid" 2>/dev/null | cut -d: -f1)
+        if [ -n "$clash" ] && [ "$clash" != "$service" ]; then
+            local tmp=$((new_gid + 10000))
+            log_mig "  note: GID $new_gid is taken by group '$clash' — moving it to GID $tmp to free the slot" >&2
+            groupmod -g "$tmp" "$clash" || abort_config "Failed to move group '$clash' out of GID $new_gid"
+        fi
+        log_mig "  setting group '$service' GID $cur_gid -> $new_gid" >&2
+        groupmod -g "$new_gid" "$service" || abort_config "Failed to set group '$service' to GID $new_gid"
+    fi
+
+    if [ "$cur_uid" != "$new_uid" ]; then
+        local clash
+        clash=$(getent passwd "$new_uid" 2>/dev/null | cut -d: -f1)
+        if [ -n "$clash" ] && [ "$clash" != "$service" ]; then
+            local tmp=$((new_uid + 10000))
+            log_mig "  note: UID $new_uid is taken by user '$clash' — moving it to UID $tmp to free the slot" >&2
+            usermod -u "$tmp" "$clash" || abort_config "Failed to move user '$clash' out of UID $new_uid"
+        fi
+        log_mig "  setting user '$service' UID $cur_uid -> $new_uid" >&2
+        usermod -u "$new_uid" "$service" || abort_config "Failed to set user '$service' to UID $new_uid"
+    fi
+    echo "$cur_uid $cur_gid"
+}
+
+# --- Stray-file repair ---
+# Args: old_uid old_gid new_uid new_gid find_args... -- path...
+# Re-owns entries still carrying the IDs the service ran under by mistake.
+repair_stray_ownership() {
+    local old_uid="$1" old_gid="$2" new_uid="$3" new_gid="$4"
+    shift 4
+    local opts=()
+    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do opts+=("$1"); shift; done
+    shift
+    local path n
+    for path in "$@"; do
+        [ -e "$path" ] || continue
+        if [ "$old_uid" != "$new_uid" ]; then
+            n=$(find "$path" "${opts[@]}" -uid "$old_uid" 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$n" != "0" ]; then
+                log_mig "  [$path] re-owning $n entries left at UID $old_uid"
+                find "$path" "${opts[@]}" -uid "$old_uid" -exec chown -h "$new_uid" {} + 2>/dev/null || true
+            fi
+        fi
+        if [ "$old_gid" != "$new_gid" ]; then
+            find "$path" "${opts[@]}" -gid "$old_gid" -exec chgrp -h "$new_gid" {} + 2>/dev/null || true
+        fi
+    done
+}
+
 # --- Migration helper ---
-# Args: service_name display_name old_uid old_gid new_uid new_gid path1 path2 ...
-# Remaps the in-container user/group to the new IDs, then chowns files on the
-# given volume paths that still reference the old IDs. Only runs if IDs changed.
+# Args: display_name old_uid old_gid new_uid new_gid path1 path2 ...
+# Chowns files on the given volume paths that still reference the IDs the
+# volume was last migrated to. Only runs if the recorded IDs changed. The
+# in-container user is already set by apply_service_identity above.
 migrate_service_uid() {
-    local service="$1" label="$2"
-    local old_uid="$3" old_gid="$4"
-    local new_uid="$5" new_gid="$6"
-    shift 6
+    local label="$1"
+    local old_uid="$2" old_gid="$3"
+    local new_uid="$4" new_gid="$5"
+    shift 5
     local paths=("$@")
 
     if [ "$old_uid" = "$new_uid" ] && [ "$old_gid" = "$new_gid" ]; then
@@ -132,32 +204,6 @@ migrate_service_uid() {
     log_mig "--- $label migration ---"
     log_mig "  from: UID=$old_uid GID=$old_gid"
     log_mig "  to:   UID=$new_uid GID=$new_gid"
-
-    # Remap in-container group (if GID changed)
-    if [ "$old_gid" != "$new_gid" ]; then
-        local clash
-        clash=$(getent group "$new_gid" 2>/dev/null | cut -d: -f1)
-        if [ -n "$clash" ] && [ "$clash" != "$service" ]; then
-            local tmp=$((new_gid + 10000))
-            log_mig "  note: GID $new_gid is taken by group '$clash' — moving it to GID $tmp to free the slot"
-            groupmod -g "$tmp" "$clash" || abort_config "Failed to move group '$clash' out of GID $new_gid"
-        fi
-        log_mig "  remapping group '$service' from GID $old_gid to $new_gid"
-        groupmod -g "$new_gid" "$service" || abort_config "Failed to set group '$service' to GID $new_gid"
-    fi
-
-    # Remap in-container user (if UID changed)
-    if [ "$old_uid" != "$new_uid" ]; then
-        local clash
-        clash=$(getent passwd "$new_uid" 2>/dev/null | cut -d: -f1)
-        if [ -n "$clash" ] && [ "$clash" != "$service" ]; then
-            local tmp=$((new_uid + 10000))
-            log_mig "  note: UID $new_uid is taken by user '$clash' — moving it to UID $tmp to free the slot"
-            usermod -u "$tmp" "$clash" || abort_config "Failed to move user '$clash' out of UID $new_uid"
-        fi
-        log_mig "  remapping user '$service' from UID $old_uid to $new_uid"
-        usermod -u "$new_uid" "$service" || abort_config "Failed to set user '$service' to UID $new_uid"
-    fi
 
     # Chown files that still reference the old IDs
     for path in "${paths[@]}"; do
@@ -181,6 +227,39 @@ migrate_service_uid() {
     done
 }
 
+# --- Container identity (every start) ---
+APP_WAS=$(apply_service_identity www-data "$DESIRED_APP_UID" "$DESIRED_APP_GID")
+MYSQL_WAS=$(apply_service_identity mysql "$DESIRED_MYSQL_UID" "$DESIRED_MYSQL_GID")
+CH_WAS=$(apply_service_identity clickhouse "$DESIRED_CH_UID" "$DESIRED_CH_GID")
+
+# The volume was already migrated to these IDs, but the container came up
+# with the image defaults: a recreate before #520 was fixed let the
+# services run under the wrong IDs and write files the right user can't
+# touch. Re-own those. The app only writes state near the top of its
+# directories, so repositories are not walked.
+if [ -f "$OWNERSHIP_FILE" ]; then
+    if [ -n "$APP_WAS" ] && [ "$PREV_APP_UID:$PREV_APP_GID" = "$DESIRED_APP_UID:$DESIRED_APP_GID" ]; then
+        log_mig "Container user www-data was reset to ${APP_WAS/ /:}; restored ${DESIRED_APP_UID}:${DESIRED_APP_GID}"
+        # shellcheck disable=SC2086
+        repair_stray_ownership $APP_WAS "$DESIRED_APP_UID" "$DESIRED_APP_GID" -- \
+            /var/bbs/cache /var/bbs/config /var/bbs/tmp /var/bbs/backups
+        # shellcheck disable=SC2086
+        repair_stray_ownership $APP_WAS "$DESIRED_APP_UID" "$DESIRED_APP_GID" -maxdepth 3 -- /var/bbs/home
+        # shellcheck disable=SC2086
+        repair_stray_ownership $APP_WAS "$DESIRED_APP_UID" "$DESIRED_APP_GID" -maxdepth 0 -- /var/bbs
+    fi
+    if [ -n "$MYSQL_WAS" ] && [ "$PREV_MYSQL_UID:$PREV_MYSQL_GID" = "$DESIRED_MYSQL_UID:$DESIRED_MYSQL_GID" ]; then
+        log_mig "Container user mysql was reset to ${MYSQL_WAS/ /:}; restored ${DESIRED_MYSQL_UID}:${DESIRED_MYSQL_GID}"
+        # shellcheck disable=SC2086
+        repair_stray_ownership $MYSQL_WAS "$DESIRED_MYSQL_UID" "$DESIRED_MYSQL_GID" -- /var/bbs/mysql
+    fi
+    if [ -n "$CH_WAS" ] && [ "$PREV_CH_UID:$PREV_CH_GID" = "$DESIRED_CH_UID:$DESIRED_CH_GID" ]; then
+        log_mig "Container user clickhouse was reset to ${CH_WAS/ /:}; restored ${DESIRED_CH_UID}:${DESIRED_CH_GID}"
+        # shellcheck disable=SC2086
+        repair_stray_ownership $CH_WAS "$DESIRED_CH_UID" "$DESIRED_CH_GID" -- /var/bbs/clickhouse
+    fi
+fi
+
 # --- Run migrations (if any) ---
 MIGRATION_NEEDED=0
 if [ "$PREV_APP_UID" != "$DESIRED_APP_UID" ] || [ "$PREV_APP_GID" != "$DESIRED_APP_GID" ] \
@@ -195,15 +274,15 @@ if [ "$MIGRATION_NEEDED" = "1" ]; then
     log_mig "Volume was configured as: app=${PREV_APP_UID}:${PREV_APP_GID}  mysql=${PREV_MYSQL_UID}:${PREV_MYSQL_GID}  clickhouse=${PREV_CH_UID}:${PREV_CH_GID}"
     log_mig "Reconfiguring to:         app=${DESIRED_APP_UID}:${DESIRED_APP_GID}  mysql=${DESIRED_MYSQL_UID}:${DESIRED_MYSQL_GID}  clickhouse=${DESIRED_CH_UID}:${DESIRED_CH_GID}"
 
-    migrate_service_uid "www-data" "app (www-data)" \
+    migrate_service_uid "app (www-data)" \
         "$PREV_APP_UID" "$PREV_APP_GID" "$DESIRED_APP_UID" "$DESIRED_APP_GID" \
         /var/bbs/home /var/bbs/cache /var/bbs/backups /var/bbs/tmp /var/bbs/config
 
-    migrate_service_uid "mysql" "MariaDB" \
+    migrate_service_uid "MariaDB" \
         "$PREV_MYSQL_UID" "$PREV_MYSQL_GID" "$DESIRED_MYSQL_UID" "$DESIRED_MYSQL_GID" \
         /var/bbs/mysql
 
-    migrate_service_uid "clickhouse" "ClickHouse" \
+    migrate_service_uid "ClickHouse" \
         "$PREV_CH_UID" "$PREV_CH_GID" "$DESIRED_CH_UID" "$DESIRED_CH_GID" \
         /var/bbs/clickhouse
 
@@ -261,6 +340,16 @@ ensure_dir /var/bbs/home            www-data:www-data   755
 ensure_dir /var/bbs/cache           www-data:www-data   755
 ensure_dir /var/bbs/backups         www-data:www-data   750
 ensure_dir /var/bbs/tmp             www-data:www-data   1777
+
+# PHP sessions live in TMPDIR (/var/bbs/tmp), which is on the persisted
+# volume. If the app UID drifts across a container recreate, the session
+# files written by the old www-data become unreadable to the new one
+# (mode 600, owner mismatch), so everyone who was logged in when the
+# update ran gets "Permission denied" from session_start() and cannot log
+# in until they clear the cookie (#508). Reset ownership of the session
+# files to the current app user on every start; they are tiny, so this is
+# instant even with many.
+find /var/bbs/tmp -maxdepth 1 -type f -name 'sess_*' -exec chown www-data:www-data {} + 2>/dev/null || true
 ensure_dir /var/bbs/config          www-data:www-data   755
 ensure_dir /var/bbs/clickhouse      clickhouse:clickhouse 750
 ensure_dir /var/bbs/mysql           mysql:mysql         750
@@ -365,6 +454,7 @@ tmpdir = /var/bbs/tmp
 MYCNF
 
 mariadbd-safe --datadir="$MYSQL_DATADIR" &
+MYSQL_PID=$!
 sleep 3
 
 # Wait for MySQL to be ready
@@ -483,6 +573,31 @@ APP_KEY=$APP_KEY
 EOF
 fi
 
+# The container always serves HTTP on 80 and SSH on 22. WEB_PORT and SSH_PORT
+# are the *host* side of the published mapping, so if APP_URL names a different
+# port from the one the web UI is published on, browsers reach BBS but every
+# agent is handed a URL that goes nowhere — and nothing else reports it (#436).
+APP_URL_PORT="$(printf '%s' "${APP_URL:-}" | sed -nE 's|^https?://[^/:]+:([0-9]+).*|\1|p')"
+if [ -z "$APP_URL_PORT" ]; then
+    case "${APP_URL:-}" in
+        https://*) APP_URL_PORT=443 ;;
+        http://*)  APP_URL_PORT=80 ;;
+    esac
+fi
+# https means something is terminating TLS in front of this container, and its
+# port has no reason to match the one we publish — that setup is documented, so
+# it must not warn. Only a plain-http APP_URL should agree with WEB_PORT.
+case "${APP_URL:-}" in https://*) APP_URL_PORT="" ;; esac
+
+if [ -n "${WEB_PORT:-}" ] && [ -n "$APP_URL_PORT" ] && [ "$WEB_PORT" != "$APP_URL_PORT" ]; then
+    echo ""
+    echo "  WARNING: APP_URL says port ${APP_URL_PORT} but WEB_PORT is ${WEB_PORT}."
+    echo "  Agents are given APP_URL, so they will try ${APP_URL_PORT} and fail."
+    echo "  Set both to the port you publish, e.g. APP_URL=http://host:${WEB_PORT}"
+    echo "  (unless a reverse proxy in front of this container makes that correct)."
+    echo ""
+fi
+
 chown www-data:www-data "$ENV_VOLUME"
 chmod 600 "$ENV_VOLUME"
 
@@ -515,6 +630,17 @@ if ! mysql -e "SELECT 1 FROM mysql.user WHERE user='bbs'" 2>/dev/null | grep -q 
     mysql -e "GRANT ALL PRIVILEGES ON bbs.* TO 'bbs'@'localhost';"
     mysql -e "GRANT ALL PRIVILEGES ON bbs.* TO 'bbs'@'127.0.0.1';"
     mysql -e "FLUSH PRIVILEGES;"
+fi
+
+# .env is the source of truth for the password. If the two disagree — a
+# server backup restored from another install brought its own DB_PASS, or
+# someone edited .env by hand — reset the user to match rather than start
+# a container that can't reach its own database (#447).
+if ! mysql -u bbs -p"$DB_PASS" -e "SELECT 1" >/dev/null 2>&1; then
+    echo "Database password in .env does not match the bbs user — updating the user to match..."
+    mysql -e "ALTER USER 'bbs'@'localhost' IDENTIFIED BY '$DB_PASS';" 2>/dev/null || true
+    mysql -e "ALTER USER 'bbs'@'127.0.0.1' IDENTIFIED BY '$DB_PASS';" 2>/dev/null || true
+    mysql -e "FLUSH PRIVILEGES;" 2>/dev/null || true
 fi
 
 # Set permissions on backups (recursive for nested content)
@@ -590,14 +716,16 @@ if [ "$FRESH_INSTALL" -eq 1 ]; then
     mysql -u bbs -p"$DB_PASS" bbs -e "UPDATE users SET password_hash = '$ADMIN_HASH' WHERE username = 'admin';"
 fi
 
-# Run pending migrations
+# Run pending migrations. The runner records what it has applied, so each
+# migration runs once, and PHP migrations run too. Feeding every .sql file to
+# mysql on each start re-applied data changes on every boot.
 if [ -d "/var/www/bbs/migrations" ]; then
     echo "Running migrations..."
-    for migration in /var/www/bbs/migrations/*.sql; do
-        if [ -f "$migration" ]; then
-            mysql -u bbs -p"$DB_PASS" bbs < "$migration" 2>/dev/null || true
-        fi
-    done
+    # --legacy-docker: an install from before the container recorded its
+    # migrations gets a one-time catch-up first, so old migrations are not
+    # replayed over its data (#532). It does nothing once that has happened.
+    su -s /bin/sh -c "cd /var/www/bbs && /usr/local/bin/php migrate.php --legacy-docker" www-data 2>&1 \
+        || echo "Warning: migration runner returned an error (migrations will retry on next start)"
 fi
 
 # --- Hosted-mode platform token bootstrap ---
@@ -651,6 +779,22 @@ if [ "$BORG_COUNT" -eq 0 ]; then
     " 2>/dev/null || echo "Warning: Could not sync borg versions"
 fi
 
+# --- Keep the installed SSH helper in sync with the app code ---
+# The image installs /usr/local/bin/bbs-ssh-helper at build time, but when
+# the code in /var/www/bbs advances past the image (dev sync, mounted code),
+# new PHP ends up calling helper subcommands the installed copy doesn't
+# have ("Usage: bbs-ssh-helper {...}" errors, #342). Refresh on every start.
+if ! cmp -s /var/www/bbs/bin/bbs-ssh-helper /usr/local/bin/bbs-ssh-helper; then
+    echo "Updating bbs-ssh-helper from app code..."
+    cp /var/www/bbs/bin/bbs-ssh-helper /usr/local/bin/bbs-ssh-helper
+    chmod 755 /usr/local/bin/bbs-ssh-helper
+fi
+if ! cmp -s /var/www/bbs/bin/bbs-ssh-gate /usr/local/bin/bbs-ssh-gate; then
+    echo "Updating bbs-ssh-gate from app code..."
+    cp /var/www/bbs/bin/bbs-ssh-gate /usr/local/bin/bbs-ssh-gate
+    chmod 755 /usr/local/bin/bbs-ssh-gate
+fi
+
 # --- Regenerate allowed-storage-paths from database ---
 # This file lives in the container filesystem and is lost on recreation.
 # bbs-ssh-helper uses it to validate repo paths outside /var/bbs/.
@@ -670,15 +814,52 @@ STORAGE_PATH="${STORAGE_PATH:-/var/bbs/home}"
 RESTORED_USERS=0
 
 echo "Recreating SSH users from database..."
+# The catalog channel writes files into <home>/.catalog-logs, which the web
+# user (www-data) then reads to import. That works because the SSH user is a
+# member of the www-data group and the directory is group-owned by www-data
+# (setgid). Both are lost when a container recreate reassigns www-data's GID
+# or rebuilds the SSH user without the group, so www-data can no longer
+# traverse the directory and the catalog silently never imports (#506).
+# Re-apply both on every start, for existing and freshly created users.
+reconcile_catalog_access() {
+    local user="$1" home="$2"
+    usermod -a -G www-data "$user" 2>/dev/null || true
+    local cat_dir="$home/.catalog-logs"
+    mkdir -p "$cat_dir" 2>/dev/null || true
+    chown "$user":www-data "$cat_dir" 2>/dev/null || true
+    chmod 2770 "$cat_dir" 2>/dev/null || true
+}
+
 mysql -u bbs -p"$DB_PASS" bbs -N -e "SELECT ssh_unix_user, id, IFNULL(ssh_home_dir, '') FROM agents WHERE ssh_unix_user IS NOT NULL AND ssh_unix_user != ''" 2>/dev/null | while read SSH_USER AGENT_ID SSH_HOME_DIR; do
     # Use stored ssh_home_dir if available, fall back to STORAGE_PATH/AGENT_ID for pre-migration agents
     USER_HOME="${SSH_HOME_DIR:-$STORAGE_PATH/$AGENT_ID}"
+
+    # An update could leave ssh_home_dir pointing at a folder without this
+    # client's SSH keys (#532), and every connection then fails with
+    # "Permission denied (publickey)". Use the folder that has the keys and
+    # correct the database to match.
+    if [[ "$AGENT_ID" =~ ^[0-9]+$ ]] && [ ! -f "$USER_HOME/.ssh/authorized_keys" ]; then
+        for CANDIDATE in "/var/bbs/home/$AGENT_ID" "$STORAGE_PATH/$AGENT_ID"; do
+            if [ "$CANDIDATE" != "$USER_HOME" ] && [ -f "$CANDIDATE/.ssh/authorized_keys" ]; then
+                echo "Client $AGENT_ID: SSH keys are in $CANDIDATE, not $USER_HOME; using $CANDIDATE"
+                CANDIDATE_SQL=${CANDIDATE//\'/\'\'}
+                mysql -u bbs -p"$DB_PASS" bbs -e "UPDATE agents SET ssh_home_dir = '$CANDIDATE_SQL' WHERE id = $AGENT_ID" 2>/dev/null || true
+                USER_HOME="$CANDIDATE"
+                break
+            fi
+        done
+    fi
     [ -d "$USER_HOME" ] || continue
 
     # If user already exists, just fix ownership (may have been clobbered by old entrypoint)
     if id "$SSH_USER" &>/dev/null; then
         SSH_UID=$(id -u "$SSH_USER")
         SSH_GID=$(id -g "$SSH_USER")
+        # Keep the account's home in step with the database (a restart keeps
+        # accounts from before a fix to ssh_home_dir).
+        if [ "$(getent passwd "$SSH_USER" | cut -d: -f6)" != "$USER_HOME" ]; then
+            usermod -d "$USER_HOME" "$SSH_USER" 2>/dev/null || true
+        fi
         if [ -d "$USER_HOME/.ssh" ]; then
             chown -R "$SSH_UID:$SSH_GID" "$USER_HOME/.ssh"
         fi
@@ -687,6 +868,7 @@ mysql -u bbs -p"$DB_PASS" bbs -N -e "SELECT ssh_unix_user, id, IFNULL(ssh_home_d
         if [ -d "$CACHE_DIR" ]; then
             chown -R "$SSH_UID:$SSH_GID" "$CACHE_DIR"
         fi
+        reconcile_catalog_access "$SSH_USER" "$USER_HOME"
         continue
     fi
 
@@ -741,6 +923,8 @@ mysql -u bbs -p"$DB_PASS" bbs -N -e "SELECT ssh_unix_user, id, IFNULL(ssh_home_d
         chown -R "$STORED_UID:$STORED_UID" "$CACHE_DIR"
     fi
 
+    reconcile_catalog_access "$SSH_USER" "$USER_HOME"
+
     # Save UID for future restarts
     echo "$STORED_UID" > "$USER_HOME/.uid"
 
@@ -748,25 +932,62 @@ mysql -u bbs -p"$DB_PASS" bbs -N -e "SELECT ssh_unix_user, id, IFNULL(ssh_home_d
 done
 
 # --- Legacy SSH compatibility ---
-# OpenSSH 10+ dropped ssh-rsa (SHA-1) from default accepted algorithms.
-# Re-enable it so agents on older OS (CentOS 6/7, Ubuntu 14/16) can connect.
-# This config lives inside the container filesystem and is lost on recreation,
-# so we must re-create it every startup (not just during bbs-update).
+# The base image now ships OpenSSH 10 (Debian 13), which dropped not just
+# ssh-rsa (SHA-1) host keys but also the SHA-1 Diffie-Hellman key-exchange
+# algorithms. Old clients — Windows Server 2016, NAS boxes running Dropbear,
+# CentOS 6/7 — negotiate diffie-hellman-group14-sha1 and were closed at KEX
+# time after the server updated ("connection closed by remote host", #352).
+# Re-enable the legacy host-key AND kex algorithms. Rewritten whenever the
+# desired content changes so existing installs pick up new entries; the file
+# lives in the container FS and is lost on recreation, so re-create it every
+# startup.
 SSHD_LEGACY="/etc/ssh/sshd_config.d/bbs-legacy-compat.conf"
 SSHD_CONF_DIR="/etc/ssh/sshd_config.d"
-if [ -d "$SSHD_CONF_DIR" ] && [ ! -f "$SSHD_LEGACY" ]; then
-    cat > "$SSHD_LEGACY" <<'SSHEOF'
+read -r -d '' SSHD_LEGACY_CONTENT <<'SSHEOF' || true
 # Added by BBS to support agents on older OS with legacy SSH clients
 HostKeyAlgorithms +ssh-rsa
 PubkeyAcceptedAlgorithms +ssh-rsa
+KexAlgorithms +diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1,diffie-hellman-group1-sha1
 SSHEOF
+if [ -d "$SSHD_CONF_DIR" ] && { [ ! -f "$SSHD_LEGACY" ] || [ "$(cat "$SSHD_LEGACY" 2>/dev/null)" != "$SSHD_LEGACY_CONTENT" ]; }; then
+    printf '%s\n' "$SSHD_LEGACY_CONTENT" > "$SSHD_LEGACY"
     chmod 644 "$SSHD_LEGACY"
     echo "  Enabled legacy SSH compatibility"
 fi
 
+# OpenSSH 9.8+ penalises a source address for connections that close
+# before authenticating and for sessions that outlive LoginGraceTime, and
+# refuses that address for up to ten minutes. A backup job opens two
+# sessions from one address (borg and the catalog pipe), and a client's
+# address is shared with everything else on that host, so agents were
+# getting "Connection closed by remote host" on a healthy server and
+# succeeding on retry (#470). This sshd serves only key-authenticated
+# agents, so the penalty buys nothing here. Written only where sshd knows
+# the directive: an older sshd would refuse to start on an unknown one.
+SSHD_AGENTS="/etc/ssh/sshd_config.d/bbs-agents.conf"
+SSHD_AGENTS_CONTENT="# Added by BBS: this sshd serves only backup agents (#470)
+LogLevel INFO"
+if /usr/sbin/sshd -T 2>/dev/null | grep -qi '^persourcepenalties'; then
+    SSHD_AGENTS_CONTENT="$SSHD_AGENTS_CONTENT
+PerSourcePenalties no"
+fi
+if [ -d "$SSHD_CONF_DIR" ] && [ "$(cat "$SSHD_AGENTS" 2>/dev/null)" != "$SSHD_AGENTS_CONTENT" ]; then
+    printf '%s\n' "$SSHD_AGENTS_CONTENT" > "$SSHD_AGENTS"
+    chmod 644 "$SSHD_AGENTS"
+fi
+
 # --- Start SSH server (after users are recreated and config is ready) ---
+# sshd has no syslog to write to in the container, so it logs to a file,
+# and that file is forwarded to the container's output so `docker logs`
+# shows every connection, authentication and disconnect (#470).
 echo "Starting SSH server..."
-/usr/sbin/sshd
+SSHD_LOG="/var/log/sshd.log"
+: > "$SSHD_LOG" && chmod 640 "$SSHD_LOG"
+# -D keeps sshd in the foreground so it is a child of this script and
+# the supervision loop below sees it die (#440).
+/usr/sbin/sshd -D -E "$SSHD_LOG" &
+SSHD_PID=$!
+tail -n 0 -F "$SSHD_LOG" 2>/dev/null | sed -u 's/^/[sshd] /' &
 
 # --- Cron ---
 echo "Setting up scheduler cron..."
@@ -774,6 +995,7 @@ touch /var/log/bbs-scheduler.log
 chown www-data:www-data /var/log/bbs-scheduler.log
 cat > /etc/cron.d/bbs-scheduler << 'CRON'
 TMPDIR=/var/bbs/tmp
+PATH=/usr/local/bin:/usr/bin:/bin
 # Run the scheduler as root cron + `su` to www-data, NOT a `www-data`
 # user-field entry. In some container environments (e.g. Unraid's Docker)
 # /etc/cron.d entries with a non-root user field silently never execute —
@@ -783,11 +1005,15 @@ TMPDIR=/var/bbs/tmp
 # backups kept working via the poll endpoint (#307). Running as root and
 # dropping to www-data via su sidesteps the PAM-session issue and keeps file
 # ownership correct.
-* * * * * root su -s /bin/sh www-data -c 'cd /var/www/bbs && TMPDIR=/var/bbs/tmp /usr/local/bin/php scheduler.php' >> /var/log/bbs-scheduler.log 2>&1
+# flock -n: never run two schedulers at once. A run that hangs (e.g. blocked
+# on an unresponsive NFS storage mount) must not let cron stack another every
+# minute — they pile up holding MySQL connections until the pool is exhausted
+# and the web UI 500s. If a run is still going, the next tick skips.
+* * * * * root flock -n /var/lock/bbs-scheduler.lock su -s /bin/sh www-data -c 'cd /var/www/bbs && TMPDIR=/var/bbs/tmp /usr/local/bin/php scheduler.php' >> /var/log/bbs-scheduler.log 2>&1
 # Save UIDs for any user home dirs that have .ssh/ but no .uid file yet
 */5 * * * * root for d in /var/bbs/home/*/; do [ -d "$d/.ssh" ] && [ ! -f "$d/.uid" ] && stat -c \%u "$d" > "$d/.uid" 2>/dev/null; done
-# Cap ClickHouse stderr/stdout at ~50MB. ClickHouse runs as --daemon and
-# inherits stderr/stdout to these files; a Poco logger rotation glitch can
+# Cap ClickHouse stderr/stdout at ~50MB. ClickHouse may still redirect its
+# stderr/stdout to these files; a Poco logger rotation glitch can
 # cause a tight loop of multi-line stack traces (#79, #252). Truncate
 # rather than rotate — ClickHouse holds the FD open and we don't want to
 # orphan it. We keep the file (so the next write goes to offset 0 cleanly)
@@ -795,7 +1021,8 @@ TMPDIR=/var/bbs/tmp
 */5 * * * * root for f in /var/log/clickhouse-server/stderr.log /var/log/clickhouse-server/stdout.log; do [ -f "$f" ] && [ "$(stat -c\%s "$f" 2>/dev/null || echo 0)" -gt 52428800 ] && : > "$f"; done
 CRON
 chmod 644 /etc/cron.d/bbs-scheduler
-cron
+cron -f &
+CRON_PID=$!
 
 echo "=== BBS Container Ready ==="
 
@@ -815,4 +1042,89 @@ case "$(echo "${HOSTED:-}" | tr '[:upper:]' '[:lower:]')" in
         ;;
 esac
 
-exec apache2-foreground
+# --- Reverse proxy: real client IPs (#451) ---------------------------------
+# With a reverse proxy in front of the container, every request reaches
+# Apache from the proxy's address. TRUSTED_PROXIES (comma/space separated
+# IPs or CIDRs) tells Apache which peers are the proxy: only then is
+# X-Forwarded-For honoured — for the access log and for everything PHP
+# reads from REMOTE_ADDR — so clients can't spoof their address.
+REMOTEIP_CONF=/etc/apache2/conf-available/bbs-remoteip.conf
+if [ -n "${TRUSTED_PROXIES:-}" ]; then
+    a2enmod -q remoteip >/dev/null 2>&1 || true
+    {
+        echo "# Generated from TRUSTED_PROXIES at container start (#451)"
+        echo "RemoteIPHeader X-Forwarded-For"
+        for proxy in $(printf '%s' "$TRUSTED_PROXIES" | tr ',' ' '); do
+            # Only address characters — this lands in Apache config.
+            clean=$(printf '%s' "$proxy" | tr -cd '0-9a-fA-F:./')
+            [ -n "$clean" ] && echo "RemoteIPTrustedProxy $clean"
+        done
+    } > "$REMOTEIP_CONF"
+    a2enconf -q bbs-remoteip >/dev/null 2>&1
+    echo "Reverse proxy: trusting X-Forwarded-For from: $TRUSTED_PROXIES"
+else
+    a2disconf -q bbs-remoteip >/dev/null 2>&1 || true
+    rm -f "$REMOTEIP_CONF"
+fi
+
+# --- Run and supervise (#440) ---------------------------------------------
+# Apache used to be exec'd here and become PID 1, so `docker stop` reached
+# only Apache: MariaDB and ClickHouse were killed by Docker when the grace
+# period ran out, and an sshd or cron that died left a container that
+# looked fine while every backup failed. Now tini is PID 1, Apache is one
+# more child, and this script waits on all of them: a SIGTERM stops each
+# service in order, and a service that exits on its own takes the container
+# down with a non-zero status so the restart policy brings it back whole.
+# setsid: Apache's prefork shutdown sends SIGTERM to its whole process
+# group, which here would be every service at once. Its own group keeps
+# that to Apache, so MariaDB below gets an orderly shutdown instead.
+setsid apache2-foreground &
+APACHE_PID=$!
+
+shutdown_all() {
+    local code="$1"
+    trap '' TERM INT
+    echo "=== BBS Container Stopping ==="
+    kill -TERM "$APACHE_PID" "$SSHD_PID" "$CRON_PID" 2>/dev/null || true
+    # Blocks until mariadbd has flushed and exited; mariadbd-safe then
+    # sees a clean stop and exits too instead of restarting it.
+    if ! pgrep -x mariadbd >/dev/null 2>&1; then
+        echo "  MariaDB is not running"
+    elif err=$(mysqladmin -h localhost shutdown 2>&1); then
+        echo "  MariaDB stopped"
+    else
+        echo "  MariaDB did not answer the shutdown request: ${err}"
+    fi
+    [ -n "${CH_PID:-}" ] && kill -TERM "$CH_PID" 2>/dev/null || true
+    # Only the services: a bare `wait` would also sit on the sshd log
+    # tail, which never ends on its own.
+    wait "$APACHE_PID" "$SSHD_PID" "$CRON_PID" "$MYSQL_PID" ${CH_PID:+"$CH_PID"} 2>/dev/null
+    echo "  Apache, sshd, cron and ClickHouse stopped"
+    # What is left (the log tail) has nothing to flush. This shell ignores
+    # the TERM it sends itself.
+    kill -TERM 0 2>/dev/null
+    echo "=== BBS Container Stopped ==="
+    exit "$code"
+}
+trap 'shutdown_all 0' TERM INT
+
+# A service's exit status is not an error of this script; `wait -n`
+# returns it, and set -e would turn it into an abort before the shutdown.
+# ClickHouse is not in the list: the server runs without it (catalog off)
+# and a host where it can't start (#327) must not restart-loop. Its own
+# watchdog restarts it, as mariadbd-safe does for mariadbd.
+set +e
+SERVICES="APACHE SSHD CRON MYSQL"
+while true; do
+    wait -n "$APACHE_PID" "$SSHD_PID" "$CRON_PID" "$MYSQL_PID" 2>/dev/null
+    rc=$?
+    # >128 is the wait interrupted by a signal the trap has already handled
+    [ "$rc" -gt 128 ] && continue
+    for svc in $SERVICES; do
+        pidvar="${svc}_PID"
+        if ! kill -0 "${!pidvar}" 2>/dev/null; then
+            echo "!! $(echo "$svc" | tr '[:upper:]' '[:lower:]') exited (status $rc); stopping the container so it can be restarted"
+        fi
+    done
+    shutdown_all 1
+done

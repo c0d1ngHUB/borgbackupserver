@@ -37,6 +37,22 @@ class PermissionService
     }
 
     /**
+     * The permission needed to run (or re-run) a job of this type. Retrying a
+     * failed job must need what running it needs: a restore needs restore,
+     * a repair needs maintenance, not just the right to trigger backups.
+     */
+    public static function forTaskType(string $taskType): string
+    {
+        return match (true) {
+            str_starts_with($taskType, 'restore') => self::RESTORE,
+            in_array($taskType, ['repo_check', 'repo_repair', 'compact', 'break_lock',
+                'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'update_borg', 'update_agent'], true) => self::REPO_MAINTENANCE,
+            in_array($taskType, ['archive_delete', 'archive_lock', 's3_sync', 's3_restore'], true) => self::MANAGE_REPOS,
+            default => self::TRIGGER_BACKUP,
+        };
+    }
+
+    /**
      * Check if user can access a specific agent (client).
      */
     public function canAccessAgent(int $userId, int $agentId): bool
@@ -95,6 +111,19 @@ class PermissionService
     }
 
     /**
+     * Can this user add clients? Admins always; other users when an admin
+     * turned it on for them (#481).
+     */
+    public function canCreateClients(int $userId): bool
+    {
+        if ($this->isAdmin($userId)) {
+            return true;
+        }
+        $user = $this->db->fetchOne("SELECT can_create_clients FROM users WHERE id = ?", [$userId]);
+        return !empty($user['can_create_clients']);
+    }
+
+    /**
      * Get all agents a user can access.
      */
     public function getAccessibleAgentIds(int $userId): array
@@ -115,6 +144,39 @@ class PermissionService
             [$userId]
         );
         return array_column($rows, 'agent_id');
+    }
+
+    /**
+     * The inverse of getAccessibleAgentIds(): every user who can see this
+     * agent — admins, users flagged all_clients, and users it is assigned to.
+     *
+     * Used to decide who an agent-scoped alert reaches. Access is the whole
+     * rule: someone who can see the client is someone the alert concerns, and
+     * someone who can't should never learn it exists.
+     *
+     * @return int[] user ids
+     */
+    public function getUsersForAgent(int $agentId): array
+    {
+        $rows = $this->db->fetchAll(
+            "SELECT id FROM users WHERE role = 'admin' OR all_clients = 1
+             UNION
+             SELECT user_id AS id FROM user_agents WHERE agent_id = ?",
+            [$agentId]
+        );
+        return array_map('intval', array_column($rows, 'id'));
+    }
+
+    /**
+     * Users who should receive server-wide alerts — ones with no agent to
+     * scope by. Admins only: there is nothing else to key on.
+     *
+     * @return int[] user ids
+     */
+    public function getAdminUserIds(): array
+    {
+        $rows = $this->db->fetchAll("SELECT id FROM users WHERE role = 'admin'");
+        return array_map('intval', array_column($rows, 'id'));
     }
 
     /**

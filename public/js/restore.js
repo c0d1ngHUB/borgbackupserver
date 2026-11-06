@@ -37,6 +37,9 @@
     const manualPathInfo = document.getElementById('manual-path-info');
     const manualPathPlaceholder = document.getElementById('manual-path-placeholder');
     const manualEntireArchive = document.getElementById('manual-path-entire-archive');
+    // Ticking every top-level entry by hand was the only way to take a whole
+    // archive, and a full system backup has a lot of them (#437).
+    const treeSelectAll = document.getElementById('tree-select-all');
     let entireArchiveSelected = false;
 
     // State
@@ -82,6 +85,11 @@
     }
 
     function togglePath(path, checked) {
+        // Picking a path means the user no longer wants the whole archive.
+        if (checked && entireArchiveSelected) {
+            entireArchiveSelected = false;
+            if (manualEntireArchive) manualEntireArchive.checked = false;
+        }
         if (checked) {
             if (path.endsWith('/')) {
                 for (const sel of selectedPaths) {
@@ -96,6 +104,10 @@
     }
 
     function toggleVersion(path, archiveId, checked) {
+        if (checked && entireArchiveSelected) {
+            entireArchiveSelected = false;
+            if (manualEntireArchive) manualEntireArchive.checked = false;
+        }
         if (checked) {
             selectedVersions.set(path, archiveId);
         } else {
@@ -155,6 +167,7 @@
         const entireBtn = e.target.closest('[data-remove-entire]');
         if (entireBtn) {
             entireArchiveSelected = false;
+            if (manualEntireArchive) manualEntireArchive.checked = false;
             if (manualEntireArchive) manualEntireArchive.checked = false;
             updateSelectionUI();
             return;
@@ -329,6 +342,12 @@
         selectedVersions.clear();
         entireArchiveSelected = false;
         if (manualEntireArchive) manualEntireArchive.checked = false;
+        // Only offered once an archive is chosen — nothing to select before that.
+        if (treeSelectAll) {
+            treeSelectAll.style.display = this.value ? '' : 'none';
+            const lbl = document.getElementById('tree-select-all-label');
+            if (lbl) lbl.textContent = 'Select all';
+        }
         updateSelectionUI();
 
         if (clickhouseAvailable) {
@@ -525,6 +544,28 @@
         });
     }
 
+    // Select all / Clear all over the entries at the top level of the tree.
+    // Each one is added as its own path, so the list on the right stays
+    // editable — take everything, then drop the two directories you don't
+    // want, rather than ticking twenty by hand.
+    const treeSelectAllLabel = document.getElementById('tree-select-all-label');
+    if (treeSelectAll) {
+        treeSelectAll.addEventListener('click', function (e) {
+            e.preventDefault();
+            const boxes = Array.from(treeRoot.querySelectorAll(':scope > .tree-item > input.tree-cb'));
+            if (boxes.length === 0) return;
+
+            const selecting = boxes.some(cb => !cb.checked);
+            boxes.forEach(function (cb) {
+                cb.checked = selecting;
+                togglePath(cb.dataset.path, selecting);
+            });
+            if (treeSelectAllLabel) {
+                treeSelectAllLabel.textContent = selecting ? 'Clear all' : 'Select all';
+            }
+        });
+    }
+
     // Form submission helpers
     function fillFormAndSubmit(formId, archiveFieldId, filesContainerId, destFieldId) {
         const container = document.getElementById(filesContainerId);
@@ -644,11 +685,74 @@
         const dbLoading = document.getElementById('db-loading');
         const dbSelectedCount = document.getElementById('db-selected-count');
         const dbRestoreBtn = document.getElementById('db-restore-btn');
+        const dbDownloadBtn = document.getElementById('db-download-btn');
         const dbAllDbNote = document.getElementById('db-all-databases-note');
         const dbConfigId = document.getElementById('db-config-id');
 
         let dbRestoreMode = 'files';
         let dbPerDatabase = true;
+        let dbGroups = [];      // per-config database groups from the listing (#382)
+        let dbActiveGroup = null;
+        let dbBackedUpAt = '';
+
+        // Render one row per database into the table body.
+        function renderDbRows(databases, mtimes, perDatabase, allowDownload) {
+            dbTableBody.innerHTML = '';
+            (databases || []).forEach(function(dbName) {
+                const tr = document.createElement('tr');
+                const escapedName = esc(dbName);
+                tr.innerHTML =
+                    '<td>' +
+                        '<select class="form-select form-select-sm db-mode-select" name="dbmode_' + escapedName + '" data-db="' + escapedName + '">' +
+                            '<option value="none">None</option>' +
+                            (allowDownload === false ? '' : '<option value="download">Download</option>') +
+                            '<option value="replace">Replace</option>' +
+                            (perDatabase ? '<option value="rename">Copy</option>' : '') +
+                        '</select>' +
+                    '</td>' +
+                    '<td>' +
+                        '<span class="font-monospace">' + escapedName + '</span>' +
+                        '<div class="db-copy-input mt-1" style="display:none;">' +
+                            '<div class="input-group input-group-sm">' +
+                                '<span class="input-group-text"><i class="bi bi-arrow-right"></i></span>' +
+                                '<input type="text" class="form-control form-control-sm font-monospace" data-rename-for="' + escapedName + '" value="' + escapedName + '_copy" placeholder="New database name">' +
+                            '</div>' +
+                        '</div>' +
+                    '</td>' +
+                    '<td class="text-end text-muted small">' + esc((mtimes && mtimes[dbName]) || dbBackedUpAt) + '</td>';
+                dbTableBody.appendChild(tr);
+            });
+        }
+
+        // Show the databases belonging to the currently-selected connection's
+        // group. Two configs of the same engine each restore independently.
+        function refreshDbTableForConnection() {
+            dbActiveGroup = null;
+            if (!dbGroups.length) { dbTable.style.display = 'none'; updateDbSelection(); return; }
+            var sel = parseConfigValue();
+            var group = null;
+            if (dbGroups.length === 1 && (dbGroups[0].config_id === null || dbGroups[0].config_id === undefined)) {
+                group = dbGroups[0]; // legacy single flat group
+            } else if (sel.id) {
+                group = dbGroups.find(function(g) { return String(g.config_id) === String(sel.id); });
+            }
+            if (!group) {
+                dbTable.style.display = 'none';
+                dbAllDbNote.style.display = 'none';
+                dbNoData.style.display = '';
+                var names = dbGroups.map(function(g) { return g.config_name || ('config ' + g.config_id); }).join(', ');
+                dbNoData.innerHTML = '<i class="bi bi-database d-block mb-2" style="font-size:2rem;opacity:0.3;"></i>This archive backed up databases from: ' + esc(names) + '.<br>Pick the matching connection above to restore its databases.';
+                updateDbSelection();
+                return;
+            }
+            dbNoData.style.display = 'none';
+            dbActiveGroup = group;
+            dbPerDatabase = group.per_database !== false;
+            dbAllDbNote.style.display = dbPerDatabase ? 'none' : '';
+            renderDbRows(group.databases || [], group.mtimes || {}, dbPerDatabase, sel.type !== 'mssql');
+            dbTable.style.display = (group.databases && group.databases.length) ? '' : 'none';
+            updateDbSelection();
+        }
 
         // Parse connection picker value: "mysql:123" or "pg:456"
         function parseConfigValue() {
@@ -672,6 +776,8 @@
             if (grantCode) {
                 if (type === 'pg') {
                     grantCode.textContent = 'ALTER ROLE ' + user + ' CREATEDB; GRANT ALL PRIVILEGES ON DATABASE mydb TO ' + user + ';';
+                } else if (type === 'mssql') {
+                    grantCode.textContent = 'ALTER SERVER ROLE [dbcreator] ADD MEMBER [' + user + ']; -- or sysadmin. The login also needs db_backupoperator on the databases to back up.';
                 } else if (type === 'mongo') {
                     if (user) {
                         grantCode.textContent = "use admin; db.createUser({user: '" + user + "', pwd: '<password>', roles: [{role: 'root', db: 'admin'}]});";
@@ -679,7 +785,7 @@
                         grantCode.textContent = 'MongoDB authentication is not configured — no grant required.';
                     }
                 } else {
-                    grantCode.innerHTML = "GRANT SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER, CREATE, INSERT, DROP, ALTER, INDEX, REFERENCES ON *.* TO '" + '<span id="db-restore-grant-user">' + user + '</span>' + "'@'localhost'; FLUSH PRIVILEGES;";
+                    grantCode.innerHTML = "GRANT SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER, CREATE, INSERT, DROP, ALTER, INDEX, REFERENCES ON *.* TO '" + '<span id="db-restore-grant-user">' + esc(String(user || '')) + '</span>' + "'@'localhost'; FLUSH PRIVILEGES;";
                 }
             }
 
@@ -688,15 +794,31 @@
                     form.action = form.dataset.pgAction || form.action;
                 } else if (type === 'mongo') {
                     form.action = form.dataset.mongoAction || form.action;
+                } else if (type === 'mssql') {
+                    form.action = form.dataset.mssqlAction || form.action;
                 } else {
                     form.action = form.dataset.mysqlAction || form.action;
                 }
+            }
+            // Re-show the databases for the newly-selected connection (#382)
+            if (dbArchiveSelect && dbArchiveSelect.value && dbGroups.length) {
+                refreshDbTableForConnection();
             }
         }
         if (dbConfigId) {
             dbConfigId.addEventListener('change', updateConnectionInfo);
             updateConnectionInfo();
         }
+        // Toggle the copy-name input and refresh counts when a mode changes.
+        // Attached once (delegation) so re-rendering rows keeps working.
+        dbTableBody.addEventListener('change', function(e) {
+            if (e.target.classList.contains('db-mode-select')) {
+                const row = e.target.closest('tr');
+                const copyDiv = row.querySelector('.db-copy-input');
+                if (copyDiv) copyDiv.style.display = e.target.value === 'rename' ? '' : 'none';
+                updateDbSelection();
+            }
+        });
 
         // Mode toggle
         if (modeToggle) {
@@ -731,6 +853,8 @@
         if (dbArchiveSelect) {
             dbArchiveSelect.addEventListener('change', function() {
                 const archiveId = this.value;
+                dbGroups = [];
+                dbActiveGroup = null;
                 dbTableBody.innerHTML = '';
                 dbTable.style.display = 'none';
                 dbAllDbNote.style.display = 'none';
@@ -748,59 +872,24 @@
                 fetch('/clients/' + agentId + '/archive/' + archiveId + '/databases', { credentials: 'same-origin' })
                     .then(r => r.json())
                     .then(data => {
+                        if (dbArchiveSelect.value !== archiveId) return;
                         dbLoading.style.display = 'none';
+                        dbGroups = data.groups || [];
+                        dbBackedUpAt = data.backed_up_at || '';
 
-                        if (!data.databases || data.databases.length === 0) {
+                        if (!dbGroups.length && (!data.databases || data.databases.length === 0)) {
                             dbNoData.style.display = '';
                             dbNoData.innerHTML = '<i class="bi bi-database d-block mb-2" style="font-size:2rem;opacity:0.3;"></i>No database backup info for this archive';
                             return;
                         }
-
-                        dbPerDatabase = data.per_database !== false;
-                        if (!dbPerDatabase) {
-                            dbAllDbNote.style.display = '';
+                        // Older server without grouped output: wrap the flat list.
+                        if (!dbGroups.length) {
+                            dbGroups = [{ config_id: null, databases: data.databases, per_database: data.per_database, compress: data.compress, mtimes: data.mtimes || {} }];
                         }
-
-                        dbTable.style.display = '';
-                        var mtimes = data.mtimes || {};
-                        var fallbackDate = data.backed_up_at || '';
-                        data.databases.forEach(function(dbName) {
-                            const tr = document.createElement('tr');
-                            const escapedName = esc(dbName);
-                            tr.innerHTML =
-                                '<td>' +
-                                    '<select class="form-select form-select-sm db-mode-select" name="dbmode_' + escapedName + '" data-db="' + escapedName + '">' +
-                                        '<option value="none">None</option>' +
-                                        '<option value="replace">Replace</option>' +
-                                        (dbPerDatabase ? '<option value="rename">Copy</option>' : '') +
-                                    '</select>' +
-                                '</td>' +
-                                '<td>' +
-                                    '<span class="font-monospace">' + escapedName + '</span>' +
-                                    '<div class="db-copy-input mt-1" style="display:none;">' +
-                                        '<div class="input-group input-group-sm">' +
-                                            '<span class="input-group-text"><i class="bi bi-arrow-right"></i></span>' +
-                                            '<input type="text" class="form-control form-control-sm font-monospace" data-rename-for="' + escapedName + '" value="' + escapedName + '_copy" placeholder="New database name">' +
-                                        '</div>' +
-                                    '</div>' +
-                                '</td>' +
-                                '<td class="text-end text-muted small">' + esc(mtimes[dbName] || fallbackDate) + '</td>';
-                            dbTableBody.appendChild(tr);
-                        });
-
-                        // Show/hide copy name input and update selection when mode changes
-                        dbTableBody.addEventListener('change', function(e) {
-                            if (e.target.classList.contains('db-mode-select')) {
-                                const row = e.target.closest('tr');
-                                const copyDiv = row.querySelector('.db-copy-input');
-                                if (copyDiv) {
-                                    copyDiv.style.display = e.target.value === 'rename' ? '' : 'none';
-                                }
-                                updateDbSelection();
-                            }
-                        });
+                        refreshDbTableForConnection();
                     })
                     .catch(function() {
+                        if (dbArchiveSelect.value !== archiveId) return;
                         dbLoading.style.display = 'none';
                         dbNoData.style.display = '';
                         dbNoData.innerHTML = '<i class="bi bi-exclamation-triangle d-block mb-2" style="font-size:2rem;opacity:0.3;"></i>Failed to load database info';
@@ -808,24 +897,47 @@
             });
         }
 
-        function getSelectedDbs() {
+        function getSelectedDbs(action) {
             var selected = [];
             dbTableBody.querySelectorAll('.db-mode-select').forEach(function(sel) {
+                if (action === 'download' && sel.value !== 'download') return;
+                if (action === 'restore' && sel.value !== 'replace' && sel.value !== 'rename') return;
                 if (sel.value !== 'none') selected.push(sel);
             });
             return selected;
         }
 
         function updateDbSelection() {
-            var selected = getSelectedDbs();
-            dbSelectedCount.textContent = selected.length;
-            dbRestoreBtn.disabled = selected.length === 0 || !window.DB_CONFIG_AVAILABLE;
+            dbSelectedCount.textContent = getSelectedDbs().length;
+            const ready = !!dbArchiveSelect.value && !!dbActiveGroup && !!parseConfigValue().id;
+            dbRestoreBtn.disabled = !ready || !window.DB_CONFIG_AVAILABLE || getSelectedDbs('restore').length === 0;
+            dbDownloadBtn.disabled = !ready || getSelectedDbs('download').length === 0;
         }
+
+        dbDownloadBtn.addEventListener('click', function() {
+            const selected = getSelectedDbs('download');
+            if (dbDownloadBtn.disabled || !selected.length) return;
+            confirmAction('Download ' + selected.length + ' selected database backup(s) as a .tar.gz archive?', function() {
+                const form = document.getElementById('db-download-form');
+                const fields = document.getElementById('db-download-fields');
+                fields.innerHTML = '';
+                document.getElementById('db-download-archive-id').value = dbArchiveSelect.value;
+                document.getElementById('db-download-config-id').value = parseConfigValue().id;
+                selected.forEach(function(sel) {
+                    const input = document.createElement('input');
+                    input.type = 'hidden';
+                    input.name = 'databases[]';
+                    input.value = sel.dataset.db;
+                    fields.appendChild(input);
+                });
+                form.submit();
+            });
+        });
 
         // Submit DB restore
         dbRestoreBtn.addEventListener('click', function() {
-            const selected = getSelectedDbs();
-            if (selected.length === 0) return;
+            const selected = getSelectedDbs('restore');
+            if (dbRestoreBtn.disabled || selected.length === 0) return;
 
             const lines = [];
             selected.forEach(function(sel) {

@@ -9,7 +9,7 @@ class ServerStats
      */
     public static function getCpuLoad(): array
     {
-        $load = sys_getloadavg();
+        $load = self::getLoadAvg();
         if ($load === false) {
             return ['1min' => 0, '5min' => 0, '15min' => 0, 'cores' => 1, 'percent' => 0];
         }
@@ -27,6 +27,29 @@ class ServerStats
     }
 
     /**
+     * Load averages, read from /proc/loadavg where it exists.
+     *
+     * sys_getloadavg() calls glibc getloadavg(), which on Linux reads
+     * sysinfo(2). lxcfs can only rewrite files under /proc, so inside an LXC
+     * container the syscall returns the host's load while /proc/loadavg
+     * returns the container's — an idle container showed the hypervisor at
+     * 100% (#430). Memory already reads /proc/meminfo, so this makes the two
+     * agree about which machine they are describing.
+     *
+     * @return array{0:float,1:float,2:float}|false
+     */
+    private static function getLoadAvg(): array|false
+    {
+        $line = @file_get_contents('/proc/loadavg');
+        if ($line !== false && preg_match('/^([\d.]+)\s+([\d.]+)\s+([\d.]+)/', $line, $m)) {
+            return [(float) $m[1], (float) $m[2], (float) $m[3]];
+        }
+
+        // macOS, and anywhere /proc isn't mounted.
+        return @sys_getloadavg();
+    }
+
+    /**
      * Get number of CPU cores.
      */
     private static function getCpuCores(): int
@@ -40,9 +63,17 @@ class ServerStats
     }
 
     /**
-     * Get memory usage.
+     * Get memory usage, or null when it cannot be measured at all.
+     *
+     * null rather than zeros, for the same reason getNetworkThroughput()
+     * returns null: no machine has 0 bytes of RAM, so zeros could only ever
+     * mean a failed read — but they render as a perfectly plausible empty
+     * gauge and nothing is logged. A hardened apache2.service with
+     * ProcSubset=pid hid /proc/meminfo from the service and produced exactly
+     * that, while CPU kept working through the sys_getloadavg() fallback, so
+     * the card looked merely idle (#485).
      */
-    public static function getMemory(): array
+    public static function getMemory(): ?array
     {
         if (PHP_OS_FAMILY === 'Darwin') {
             return self::getMemoryMac();
@@ -50,11 +81,22 @@ class ServerStats
         return self::getMemoryLinux();
     }
 
-    private static function getMemoryLinux(): array
+    private static function getMemoryLinux(): ?array
     {
         $meminfo = @file_get_contents('/proc/meminfo');
         if ($meminfo === false) {
-            return ['total' => 0, 'used' => 0, 'free' => 0, 'percent' => 0];
+            // Logged rather than silently swallowed: this is the only trace an
+            // operator gets that the gauge is broken rather than the machine
+            // idle. Once per worker, not once per request — Cache::remember()
+            // treats a null result as a miss, so this path runs on every poll
+            // and would otherwise flood the error log.
+            static $warned = false;
+            if (!$warned) {
+                $warned = true;
+                error_log('ServerStats: /proc/meminfo is unreadable — memory metrics unavailable. '
+                    . 'On a hardened apache2.service this is ProcSubset=pid hiding /proc.');
+            }
+            return null;
         }
 
         $values = [];
@@ -64,7 +106,12 @@ class ServerStats
             }
         }
 
+        // A /proc/meminfo that parsed but carries no MemTotal is not a machine
+        // with no RAM either — same reasoning, same null.
         $total = $values['MemTotal'] ?? 0;
+        if ($total <= 0) {
+            return null;
+        }
         $available = $values['MemAvailable'] ?? ($values['MemFree'] ?? 0);
         $used = $total - $available;
 
@@ -72,7 +119,7 @@ class ServerStats
             'total' => $total,
             'used' => $used,
             'free' => $available,
-            'percent' => $total > 0 ? round(($used / $total) * 100, 1) : 0,
+            'percent' => round(($used / $total) * 100, 1),
         ];
     }
 
@@ -458,8 +505,51 @@ class ServerStats
     }
 
     /**
+     * Filesystem types whose df figures describe something other than the
+     * storage you are actually writing to (#415).
+     *
+     * davfs2 answers statfs from its local cache disk, so a 100 GB WebDAV
+     * share reports the server's own free space. Object-store FUSE drivers
+     * invent a figure for the same reason: there is no "size" to report.
+     *
+     * NFS, CIFS and sshfs are deliberately absent — they pass the export's
+     * real statvfs through and have always been accurate. fuseblk is a local
+     * block device (ntfs-3g) and is likewise fine.
+     */
+    private const INDIRECT_FSTYPES = [
+        'davfs', 'fuse.davfs', 'fuse.s3fs', 'fuse.rclone', 'fuse.gcsfuse',
+        'fuse.blobfuse', 'fuse.curlftpfs', 'fuse.ftpfs', 's3ql',
+    ];
+
+    /**
+     * Can df tell the truth about this mount?
+     *
+     * A bare `fuse` type with a URL for a source is how davfs2 appears in
+     * /proc/mounts — that pair is the reliable signal, since the type alone
+     * says only "some FUSE driver".
+     */
+    public static function isIndirectMount(?string $fstype, ?string $source): bool
+    {
+        $fstype = strtolower(trim((string) $fstype));
+        $source = trim((string) $source);
+
+        if ($fstype === 'fuseblk') {
+            return false;
+        }
+        if (preg_match('#^https?://#i', $source)) {
+            return true;
+        }
+        return in_array($fstype, self::INDIRECT_FSTYPES, true);
+    }
+
+    /**
      * Get accurate disk usage for a path using df (excludes reserved blocks).
-     * Returns [total, used, free, percent] in bytes, or null on failure.
+     * Returns [total, used, free, percent, fstype, source, trusted] in bytes,
+     * or null on failure.
+     *
+     * `trusted` is false when the figures describe a local cache rather than
+     * the storage itself; callers should prefer a stated capacity over them
+     * and must not raise low-space alarms from them.
      */
     public static function getDiskUsage(string $path): ?array
     {
@@ -467,7 +557,13 @@ class ServerStats
             return null;
         }
 
-        $output = @shell_exec('df -P -B1 ' . escapeshellarg($path) . ' 2>/dev/null');
+        // -T adds the filesystem type. Older/busybox df may not support it, so
+        // fall back to the plain form rather than losing the figures entirely.
+        $output = @shell_exec('df -P -T -B1 ' . escapeshellarg($path) . ' 2>/dev/null');
+        $hasType = !empty($output);
+        if (!$hasType) {
+            $output = @shell_exec('df -P -B1 ' . escapeshellarg($path) . ' 2>/dev/null');
+        }
         if (empty($output)) {
             return null;
         }
@@ -477,16 +573,20 @@ class ServerStats
             return null;
         }
 
-        // df -P -B1 output: Filesystem 1-blocks Used Available Capacity Mounted
+        // df -P -B1     : Filesystem 1-blocks Used Available Capacity Mounted
+        // df -P -T -B1  : Filesystem Type 1-blocks Used Available Capacity Mounted
         $parts = preg_split('/\s+/', trim($lines[1]));
-        if (count($parts) < 6) {
+        $offset = $hasType ? 1 : 0;
+        if (count($parts) < 6 + $offset) {
             return null;
         }
 
-        $total = (int) $parts[1];
-        $used = (int) $parts[2];
-        $free = (int) $parts[3];
-        $percent = (int) str_replace('%', '', $parts[4]);
+        $source  = $parts[0];
+        $fstype  = $hasType ? $parts[1] : null;
+        $total   = (int) $parts[1 + $offset];
+        $used    = (int) $parts[2 + $offset];
+        $free    = (int) $parts[3 + $offset];
+        $percent = (int) str_replace('%', '', $parts[4 + $offset]);
 
         if ($total <= 0) {
             return null;
@@ -497,7 +597,157 @@ class ServerStats
             'used' => $used,
             'free' => $free,
             'percent' => $percent,
+            'fstype' => $fstype,
+            'source' => $source,
+            'trusted' => !self::isIndirectMount($fstype, $source),
         ];
+    }
+
+    /**
+     * What a storage location's capacity actually is, and how we know.
+     *
+     * The one place that decides, so the storage page, the dashboard, the
+     * health endpoint and the low-space alerts cannot disagree about the same
+     * disk. Returns null when the size is genuinely unknown — better than the
+     * cache disk's figures wearing the share's name (#415).
+     *
+     * `used` under a stated capacity is what BBS itself has written there:
+     * asking a WebDAV share to add up its own contents means reading every
+     * file over the network, and the repository sizes are already known.
+     *
+     * @return array{total:int,used:?int,free:?int,percent:?int,source:string,fstype:?string,trusted:bool}|null
+     */
+    public static function capacityForLocation(array $location): ?array
+    {
+        $path = $location['path'] ?? '';
+        $disk = $path !== '' ? self::getDiskUsage($path) : null;
+        $stated = isset($location['capacity_bytes']) ? (int) $location['capacity_bytes'] : 0;
+
+        if ($stated > 0) {
+            $used = null;
+            if (!empty($location['id'])) {
+                $row = \BBS\Core\Database::getInstance()->fetchOne(
+                    "SELECT COALESCE(SUM(size_bytes), 0) AS used FROM repositories WHERE storage_location_id = ?",
+                    [(int) $location['id']]
+                );
+                $used = (int) ($row['used'] ?? 0);
+            }
+            return [
+                'total'   => $stated,
+                'used'    => $used,
+                'free'    => $used === null ? null : max(0, $stated - $used),
+                'percent' => ($used === null || $stated <= 0) ? null : round(($used / $stated) * 100, 1),
+                'source'  => 'stated',
+                'fstype'  => $disk['fstype'] ?? null,
+                'trusted' => true,
+            ];
+        }
+
+        if ($disk === null) {
+            return null;
+        }
+
+        // A mount that cannot answer honestly and has not been told its size:
+        // say so rather than repeating the cache disk's numbers.
+        if (!$disk['trusted']) {
+            return null;
+        }
+
+        return [
+            'total'   => $disk['total'],
+            'used'    => $disk['used'],
+            'free'    => $disk['free'],
+            'percent' => $disk['percent'],
+            'source'  => 'df',
+            'fstype'  => $disk['fstype'] ?? null,
+            'trusted' => true,
+        ];
+    }
+
+    /**
+     * Usage for every storage endpoint: local locations (or the legacy
+     * storage_path) plus remote SSH hosts with a known size. One list for
+     * the scheduler's low-storage check and for the push notification that
+     * names the location, so both work from the same figures.
+     *
+     * @return array<int, array{label: string, detail: string, total_bytes: int, free_bytes: int, used_percent: float}>
+     */
+    public static function storageUsageStats(\BBS\Core\Database $db): array
+    {
+        $locations = $db->fetchAll("SELECT * FROM storage_locations ORDER BY id");
+        if (empty($locations)) {
+            $storagePathSetting = $db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'storage_path'");
+            if (!empty($storagePathSetting['value'])) {
+                $locations = [['path' => $storagePathSetting['value'], 'label' => 'Default']];
+            }
+        }
+
+        $stats = [];
+        foreach ($locations as $sl) {
+            $slPath = $sl['path'] ?? '';
+            if (empty($slPath) || !is_dir($slPath)) {
+                continue;
+            }
+            // Not disk_free_space(): a WebDAV mount answers it from the local
+            // cache disk, which would mail everyone that a 100 GB share was
+            // full because the server's own disk was (#415). A location whose
+            // capacity we cannot establish is skipped.
+            $capacity = self::capacityForLocation($sl);
+            if ($capacity === null || ($capacity['free'] ?? null) === null) {
+                continue;
+            }
+            $stats[] = [
+                'label'        => $sl['label'] ?? $slPath,
+                'detail'       => $slPath,
+                'total_bytes'  => (int) $capacity['total'],
+                'free_bytes'   => (int) $capacity['free'],
+                'used_percent' => $capacity['percent'],
+            ];
+        }
+
+        $remoteConfigs = $db->fetchAll("SELECT * FROM remote_ssh_configs WHERE disk_total_bytes IS NOT NULL AND disk_total_bytes > 0");
+        foreach ($remoteConfigs as $rc) {
+            $total = (int) $rc['disk_total_bytes'];
+            $free  = (int) $rc['disk_free_bytes'];
+            if ($total <= 0) {
+                continue;
+            }
+            $stats[] = [
+                'label'        => "Remote storage \"{$rc['name']}\"",
+                'detail'       => "{$rc['remote_user']}@{$rc['remote_host']}",
+                'total_bytes'  => $total,
+                'free_bytes'   => $free,
+                'used_percent' => round((($total - $free) / $total) * 100, 1),
+            ];
+        }
+
+        return $stats;
+    }
+
+    /**
+     * Why a location has no capacity figures, for the UI to explain itself.
+     * Null when the figures are fine.
+     */
+    public static function capacityUnknownReason(array $location): ?string
+    {
+        if (!empty($location['capacity_bytes'])) {
+            return null;
+        }
+        $path = $location['path'] ?? '';
+        if ($path === '' || !is_dir($path)) {
+            return 'The path is not accessible.';
+        }
+        $disk = self::getDiskUsage($path);
+        if ($disk === null) {
+            return 'The filesystem did not report a size.';
+        }
+        if (!$disk['trusted']) {
+            return sprintf(
+                'This is a %s mount, which reports the local cache disk rather than the remote share. Set the capacity to show its real size.',
+                $disk['fstype'] ?: 'network'
+            );
+        }
+        return null;
     }
 
     /**

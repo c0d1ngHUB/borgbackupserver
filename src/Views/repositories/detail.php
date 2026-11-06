@@ -23,9 +23,15 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                     <span class="badge text-bg-info ms-2" style="font-size: 0.6em; vertical-align: middle;"><i class="bi bi-hdd-network me-1"></i>Remote SSH</span>
                     <?php else: ?>
                     <span class="badge text-bg-secondary ms-2" style="font-size: 0.6em; vertical-align: middle;"><i class="bi bi-hdd me-1"></i>Local</span>
+                    <?php if (!empty($repo['read_only'])): ?>
+                    <span class="badge text-bg-warning ms-1" style="font-size: 0.6em; vertical-align: middle;"><i class="bi bi-lock me-1"></i>Read-only copy</span>
+                    <?php endif; ?>
                     <button type="button" class="btn btn-sm btn-link text-muted p-0 ms-2" id="renameToggle" title="Rename repository"><i class="bi bi-pencil"></i></button>
                     <?php endif; ?>
                 </h4>
+                <?php if (!empty($repo['read_only'])): ?>
+                <div class="text-muted small mt-1">Restored from an offsite sync. You can browse, restore and download from it; backups, pruning and offsite sync are off.</div>
+                <?php endif; ?>
                 <?php if (($repo['storage_type'] ?? 'local') !== 'remote_ssh'): ?>
                 <form method="POST" action="/repositories/<?= $repo['id'] ?>/rename" class="mt-2 d-none" id="renameForm">
                     <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
@@ -41,7 +47,7 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                 <?php endif; ?>
             </div>
             <?php if ($activeJob): ?>
-            <span class="badge text-bg-info"><i class="bi bi-hourglass-split me-1"></i>Active: <?= $activeJob['task_type'] ?></span>
+            <span class="badge text-bg-info"><i class="bi bi-hourglass-split me-1"></i>Active: <?= htmlspecialchars(\BBS\Core\JobType::label($activeJob['task_type'])) ?></span>
             <?php endif; ?>
         </div>
 
@@ -100,26 +106,35 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
 <div class="row g-4">
     <!-- Repository Info & Recent Jobs (Left) -->
     <div class="col-lg-6">
-        <?php if (($repo['storage_type'] ?? 'local') !== 'remote_ssh' && (!empty($s3SyncConfigs) || !empty($s3PluginConfigs))): ?>
+        <?php if (empty($repo['read_only']) && ($repo['storage_type'] ?? 'local') !== 'remote_ssh' && (!empty($s3SyncConfigs) || !empty($s3PluginConfigs))): ?>
         <div class="card border-0 shadow-sm mb-4">
             <div class="card-header fw-semibold">
-                <i class="bi bi-cloud <?= !empty($s3SyncConfigs) ? 'text-info' : 'text-muted' ?> me-1"></i> S3 Offsite Mirror
+                <i class="bi bi-cloud <?= !empty($s3SyncConfigs) ? 'text-info' : 'text-muted' ?> me-1"></i> Offsite Copies
             </div>
             <div class="card-body">
                 <?php if (!empty($s3SyncConfigs)): ?>
                 <!-- Destination list — a repo can replicate to several S3 destinations -->
                 <?php foreach ($s3SyncConfigs as $dest): ?>
                 <div class="d-flex align-items-start gap-3 p-3 bg-body-secondary rounded mb-2">
+                    <?php $destIcon = ['sftp' => 'bi-hdd-network', 'local' => 'bi-device-hdd'][$dest['type'] ?? 's3'] ?? 'bi-cloud-check'; ?>
                     <div class="text-info" style="font-size: 1.5rem;">
-                        <i class="bi bi-cloud-check"></i>
+                        <i class="bi <?= $destIcon ?>"></i>
                     </div>
                     <div class="flex-grow-1">
                         <h6 class="mb-1"><?= htmlspecialchars($dest['config_name']) ?></h6>
                         <p class="text-muted small mb-0">
+                            <?= htmlspecialchars($dest['label'] ?? '') ?><br>
                             Last sync: <strong><?= $dest['last_s3_sync'] ? \BBS\Core\TimeHelper::ago($dest['last_s3_sync']) : 'Never' ?></strong>
                         </p>
                     </div>
-                    <form method="POST" action="/clients/<?= $agentId ?>/repo/<?= $repo['id'] ?>/s3-config/delete" class="d-inline" data-confirm="Stop syncing to &quot;<?= htmlspecialchars($dest['config_name'], ENT_QUOTES) ?>&quot;?&#10;&#10;The repository will no longer sync to this destination after backups. Data already in S3 will remain.">
+                    <form method="POST" action="/clients/<?= $agentId ?>/repo/<?= $repo['id'] ?>/s3-sync/run" class="d-inline" title="<?= $activeJob ? 'Runs after the job that is on this repository now' : 'Copy the repository to this destination now' ?>">
+                        <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                        <input type="hidden" name="plugin_config_id" value="<?= $dest['plugin_config_id'] ?>">
+                        <button type="submit" class="btn btn-sm btn-outline-info me-1">
+                            <i class="bi bi-arrow-repeat me-1"></i>Sync now
+                        </button>
+                    </form>
+                    <form method="POST" action="/clients/<?= $agentId ?>/repo/<?= $repo['id'] ?>/s3-config/delete" class="d-inline" data-confirm="Stop syncing to &quot;<?= htmlspecialchars($dest['config_name'], ENT_QUOTES) ?>&quot;?&#10;&#10;The repository will no longer sync to this destination after backups. The copy already there stays.">
                         <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                         <input type="hidden" name="plugin_config_id" value="<?= $dest['plugin_config_id'] ?>">
                         <button type="submit" class="btn btn-sm btn-outline-secondary">
@@ -133,9 +148,9 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                 <?php if (empty($s3PluginConfigs) && !empty($s3SyncConfigs)): ?>
                 <div class="form-text mt-2">
                     <i class="bi bi-info-circle me-1"></i>
-                    To replicate to another S3 destination, create another <em>S3 Offsite Sync</em>
+                    To copy to another place, create another <em>Offsite Sync</em>
                     configuration on the <a href="/clients/<?= $agentId ?>?tab=plugins">client's Plugins tab</a>
-                    (e.g. with a second provider's credentials), then attach it here.
+                    (an S3 bucket, an SSH host, or a second disk), then attach it here.
                 </div>
                 <?php endif; ?>
 
@@ -144,11 +159,11 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                 <form method="POST" action="/clients/<?= $agentId ?>/repo/<?= $repo['id'] ?>/s3-config" class="<?= !empty($s3SyncConfigs) ? 'mt-3' : '' ?>">
                     <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                     <?php if (empty($s3SyncConfigs)): ?>
-                    <p class="text-muted small mb-3">Enable S3 sync to automatically replicate this repository to S3 storage after each backup prune. You can add more than one destination.</p>
+                    <p class="text-muted small mb-3">Copy this repository to another place after each backup: an S3 bucket, an SSH host, or a second disk. You can add more than one destination. Saving takes effect at once; there is nothing else to submit on this page.</p>
                     <?php endif; ?>
                     <div class="row g-2 align-items-end">
                         <div class="col-auto">
-                            <label class="form-label small"><?= !empty($s3SyncConfigs) ? 'Add another destination' : 'S3 Configuration' ?></label>
+                            <label class="form-label small"><?= !empty($s3SyncConfigs) ? 'Add another destination' : 'Destination' ?></label>
                             <select name="plugin_config_id" class="form-select form-select-sm" required>
                                 <?php foreach ($s3PluginConfigs as $cfg): ?>
                                 <option value="<?= $cfg['id'] ?>"><?= htmlspecialchars($cfg['name']) ?></option>
@@ -157,7 +172,7 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                         </div>
                         <div class="col-auto">
                             <button type="submit" class="btn btn-sm btn-info">
-                                <i class="bi bi-cloud-plus me-1"></i><?= !empty($s3SyncConfigs) ? 'Add Destination' : 'Enable S3 Sync' ?>
+                                <i class="bi bi-cloud-plus me-1"></i><?= !empty($s3SyncConfigs) ? 'Save destination' : 'Save and enable' ?>
                             </button>
                         </div>
                     </div>
@@ -171,8 +186,8 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                         <i class="bi bi-cloud-download"></i>
                     </div>
                     <div class="flex-grow-1">
-                        <h6 class="mb-1">Restore from S3</h6>
-                        <p class="text-muted small mb-2">Download repository data from S3 back to the server. Use this to recover from local data loss or sync issues.</p>
+                        <h6 class="mb-1">Restore from the offsite copy</h6>
+                        <p class="text-muted small mb-2">Bring the repository back from its copy. Use this to recover from local data loss or sync issues.</p>
                         <?php if (count($s3SyncConfigs) > 1): ?>
                         <div class="mb-2" style="max-width: 280px;">
                             <label class="form-label small mb-1">Restore from destination</label>
@@ -184,7 +199,7 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                         </div>
                         <?php endif; ?>
                         <div class="d-flex gap-2 flex-wrap align-items-end">
-                            <form method="POST" action="/clients/<?= $agentId ?>/repo/<?= $repo['id'] ?>/s3-restore" class="d-inline" data-confirm="Restore (replace) from S3?&#10;&#10;This will download the repository data from S3 and OVERWRITE local files.">
+                            <form method="POST" action="/clients/<?= $agentId ?>/repo/<?= $repo['id'] ?>/s3-restore" class="d-inline" data-confirm="Restore (replace) from the offsite copy?&#10;&#10;This will copy the repository data back and OVERWRITE local files.">
                                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                                 <input type="hidden" name="mode" value="replace">
                                 <input type="hidden" name="plugin_config_id" class="s3-restore-source" value="<?= $s3SyncConfigs[0]['plugin_config_id'] ?>">
@@ -192,7 +207,7 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                                     <i class="bi bi-arrow-repeat me-1"></i>Restore (replace)
                                 </button>
                             </form>
-                            <form method="POST" action="/clients/<?= $agentId ?>/repo/<?= $repo['id'] ?>/s3-restore" class="d-inline" data-confirm="Restore (copy) from S3?&#10;&#10;This will create a NEW repository and download data from S3.">
+                            <form method="POST" action="/clients/<?= $agentId ?>/repo/<?= $repo['id'] ?>/s3-restore" class="d-inline" data-confirm="Restore (copy) from the offsite copy?&#10;&#10;This will create a NEW, READ-ONLY repository and copy the data into it. You can browse, restore and download from it, but not back up to it.">
                                 <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
                                 <input type="hidden" name="mode" value="copy">
                                 <input type="hidden" name="plugin_config_id" class="s3-restore-source" value="<?= $s3SyncConfigs[0]['plugin_config_id'] ?>">
@@ -203,6 +218,7 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                                     </button>
                                 </div>
                             </form>
+                            <div class="text-muted small mt-2"><i class="bi bi-lock me-1"></i>A copy is read-only: browse, restore and download from it, but no backups, pruning or offsite sync.</div>
                         </div>
                     </div>
                 </div>
@@ -304,6 +320,28 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                             <button type="button" class="btn btn-sm btn-link p-0 ms-1" id="copyPassphrase" title="Copy passphrase">
                                 <i class="bi bi-clipboard"></i>
                             </button>
+                            <button type="button" class="btn btn-sm btn-link p-0 ms-1" id="changePassphraseToggle" title="Change passphrase"
+                                    <?= $activeJob ? 'disabled' : '' ?>>
+                                <i class="bi bi-pencil"></i>
+                            </button>
+
+                            <div class="mt-2 d-none" id="changePassphraseBox">
+                                <div class="input-group input-group-sm" style="max-width: 420px;">
+                                    <input type="text" class="form-control font-monospace" id="newPassphrase" placeholder="New passphrase">
+                                    <button class="btn btn-outline-secondary" type="button" id="suggestPassphrase" title="Generate one">
+                                        <i class="bi bi-shuffle"></i>
+                                    </button>
+                                    <button class="btn btn-primary" type="button" id="savePassphrase">Change</button>
+                                    <button class="btn btn-outline-secondary" type="button" id="cancelPassphrase">Cancel</button>
+                                </div>
+                                <div class="form-text">
+                                    borg re-encrypts the repository key in place. Archives are untouched and clients need no change — they are given the passphrase with each job.
+                                    <?php if ($activeJob): ?>
+                                    <br><span class="text-warning"><i class="bi bi-exclamation-triangle me-1"></i>Not while a job is running on this repository.</span>
+                                    <?php endif; ?>
+                                </div>
+                                <div id="passphraseResult" class="mt-2"></div>
+                            </div>
                         </td>
                     </tr>
                     <?php endif; ?>
@@ -346,13 +384,14 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                                 <td class="small" style="white-space: nowrap;">
                                     <?= $job['completed_at'] ? \BBS\Core\TimeHelper::ago($job['completed_at']) : \BBS\Core\TimeHelper::ago($job['queued_at']) ?>
                                 </td>
-                                <td><?= $job['task_type'] ?></td>
+                                <td><?= htmlspecialchars(\BBS\Core\JobType::label($job['task_type'])) ?></td>
                                 <td>
                                     <?php
                                     // Full class tokens with text-color pairings so warning/info
                                     // badges stay readable on light fills (#169).
+                                    $jobWarn = $job['status'] === 'completed' && !empty($job['had_warnings']);
                                     $statusBadge = match($job['status']) {
-                                        'completed' => 'bg-success',
+                                        'completed' => $jobWarn ? 'bg-warning text-dark' : 'bg-success',
                                         'failed'    => 'bg-danger',
                                         'running'   => 'bg-info text-dark',
                                         'sent'      => 'bg-primary',
@@ -360,7 +399,7 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                                         default     => 'bg-secondary',
                                     };
                                     ?>
-                                    <span class="badge <?= $statusBadge ?>"><?= $job['status'] ?></span>
+                                    <span class="badge <?= $statusBadge ?>"<?= $jobWarn ? ' title="' . htmlspecialchars(mb_substr($job['error_log'] ?? '', 0, 500)) . '"' : '' ?>><?= $jobWarn ? 'completed with warnings' : $job['status'] ?></span>
                                 </td>
                                 <td>
                                     <?php
@@ -403,6 +442,7 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                         </div>
                     </div>
 
+                    <?php if (empty($repo['read_only'])): ?>
                     <!-- Compact -->
                     <div class="d-flex align-items-start gap-3 p-3 bg-body-secondary rounded">
                         <div class="text-success" style="font-size: 1.5rem;">
@@ -420,6 +460,7 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                             </form>
                         </div>
                     </div>
+                    <?php endif; ?>
 
                     <!-- Rebuild Catalog -->
                     <div class="d-flex align-items-start gap-3 p-3 bg-body-secondary rounded">
@@ -448,6 +489,7 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
 
                     <hr class="my-1">
 
+                    <?php if (empty($repo['read_only'])): ?>
                     <!-- Repair -->
                     <div class="d-flex align-items-start gap-3 p-3 bg-body-secondary rounded">
                         <div class="text-warning" style="font-size: 1.5rem;">
@@ -465,6 +507,7 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                             </form>
                         </div>
                     </div>
+                    <?php endif; ?>
 
                     <!-- Break Lock -->
                     <div class="d-flex align-items-start gap-3 p-3 bg-body-secondary rounded">
@@ -488,6 +531,36 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
         </div>
     </div>
 </div>
+
+<?php
+// Size over time (#406): one point per archive, oldest first. The line is
+// what each backup saw (original size); the bars are what each backup added
+// to the repository after deduplication, which is where a wrong include or
+// an un-deduplicable source (nightly tarballs) shows up as a spike. Capped
+// at the latest 365 archives so a long-lived hourly plan still draws.
+$sizeSeries = [];
+foreach (array_reverse(array_slice($archives, 0, 365)) as $ar) {
+    $sizeSeries[] = [
+        'label' => \BBS\Core\TimeHelper::format($ar['created_at'], 'M j'),
+        'full'  => \BBS\Core\TimeHelper::format($ar['created_at'], 'M j, Y g:i A'),
+        'name'  => $ar['archive_name'],
+        'plan'  => $ar['plan_name'] ?? '',
+        'original' => (int) $ar['original_size'],
+        'added' => (int) $ar['deduplicated_size'],
+    ];
+}
+?>
+<?php if (count($sizeSeries) >= 2): ?>
+<div class="card border-0 shadow-sm mt-4" id="size-chart-section">
+    <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-graph-up me-1"></i> Size over time</span>
+        <span class="text-muted small fw-normal">Line: what each backup saw. Bars: what it added to the repository after deduplication.</span>
+    </div>
+    <div class="card-body" style="height: 240px;">
+        <canvas id="sizeChart"></canvas>
+    </div>
+</div>
+<?php endif; ?>
 
 <!-- Archives -->
 <div class="card border-0 shadow-sm mt-4" id="archives-section">
@@ -528,16 +601,41 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                             <?php if (!empty($ar['databases_backed_up'])): ?>
                             <i class="bi bi-database text-info ms-1" title="Contains database backup"></i>
                             <?php endif; ?>
+                            <?php if (!empty($ar['locked'])): ?>
+                            <span class="badge text-bg-warning ms-1" title="Locked — excluded from pruning and deletion"><i class="bi bi-lock-fill"></i> Locked</span>
+                            <?php endif; ?>
                         </td>
                         <td class="text-nowrap"><?= \BBS\Core\TimeHelper::format($ar['created_at'], 'M j, Y g:i A') ?></td>
                         <td><?= number_format($ar['file_count']) ?></td>
                         <td><?= $origLabel ?></td>
                         <td><?= $dedupLabel ?></td>
-                        <td class="text-end" onclick="event.stopPropagation()">
+                        <td class="text-end text-nowrap" onclick="event.stopPropagation()">
+                            <?php if (!empty($repo['read_only'])): ?>
+                            <span class="text-muted small" title="Read-only copy">&mdash;</span>
+                            <?php elseif (!empty($ar['locked'])): ?>
+                            <form method="POST" action="/clients/<?= $agentId ?>/repo/<?= $repo['id'] ?>/archive/<?= $ar['id'] ?>/lock" class="d-inline"
+                                  data-confirm="Unlock this archive?&#10;&#10;Normal retention rules will apply again — it can be pruned on the next cycle.">
+                                <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                                <button type="submit" class="btn btn-sm btn-warning" title="Unlock — allow pruning again">
+                                    <i class="bi bi-unlock"></i>
+                                </button>
+                            </form>
+                            <button type="button" class="btn btn-sm btn-outline-danger" disabled title="Locked — unlock first to delete">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                            <?php else: ?>
+                            <form method="POST" action="/clients/<?= $agentId ?>/repo/<?= $repo['id'] ?>/archive/<?= $ar['id'] ?>/lock" class="d-inline"
+                                  data-confirm="Lock this archive?&#10;&#10;It will be excluded from pruning and cannot be deleted until unlocked (e.g. for a legal hold).">
+                                <input type="hidden" name="csrf_token" value="<?= $this->csrfToken() ?>">
+                                <button type="submit" class="btn btn-sm btn-outline-secondary" title="Lock — never prune or delete">
+                                    <i class="bi bi-lock"></i>
+                                </button>
+                            </form>
                             <button type="button" class="btn btn-sm btn-outline-danger"
                                     data-bs-toggle="modal" data-bs-target="#deleteArchiveModal<?= $ar['id'] ?>">
                                 <i class="bi bi-trash"></i>
                             </button>
+                            <?php endif; ?>
                         </td>
                     </tr>
                     <?php endforeach; ?>
@@ -592,10 +690,13 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                 <p class="text-muted small mb-0">Permanently delete this repository and all its data. This cannot be undone.</p>
             </div>
             <?php
-            $deleteBlocked = count($plans) > 0 || $activeJob;
-            $blockReason = count($plans) > 0
-                ? "Delete the " . count($plans) . " backup plan(s) using this repo first"
-                : "Wait for active jobs to finish first";
+            $hasLockedArchives = !empty(array_filter($archives, fn($a) => !empty($a['locked'])));
+            $deleteBlocked = count($plans) > 0 || $activeJob || $hasLockedArchives;
+            $blockReason = $hasLockedArchives
+                ? 'Repository contains locked archives — unlock them first'
+                : (count($plans) > 0
+                    ? "Delete the " . count($plans) . " backup plan(s) using this repo first"
+                    : "Wait for active jobs to finish first");
             ?>
             <?php if ($deleteBlocked): ?>
             <button class="btn btn-outline-danger" disabled title="<?= htmlspecialchars($blockReason) ?>">
@@ -608,7 +709,7 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                 <div class="form-check mb-2">
                     <input class="form-check-input" type="checkbox" name="delete_from_s3" id="deleteFromS3" value="1">
                     <label class="form-check-label small" for="deleteFromS3">
-                        <i class="bi bi-cloud text-info me-1"></i>Also delete from S3 offsite storage<?= count($s3SyncConfigs) > 1 ? ' (all ' . count($s3SyncConfigs) . ' destinations)' : '' ?>
+                        <i class="bi bi-cloud text-info me-1"></i>Also delete the offsite copy<?= count($s3SyncConfigs) > 1 ? ' (all ' . count($s3SyncConfigs) . ' destinations)' : '' ?>
                     </label>
                 </div>
                 <?php endif; ?>
@@ -621,7 +722,7 @@ $sizeLabel = $totalSize > 0 ? \BBS\Services\ServerStats::formatBytes((int) $tota
                 var deleteS3 = document.getElementById('deleteFromS3');
                 var msg = 'PERMANENTLY delete repository "<?= htmlspecialchars($repo['name'], ENT_QUOTES) ?>", all its archives, and the data on disk?';
                 if (deleteS3 && deleteS3.checked) {
-                    msg += '\n\nThis will ALSO delete the offsite copy from S3!';
+                    msg += '\n\nThis will ALSO delete the offsite copy!';
                 }
                 msg += '\n\nThis action is NOT reversible.';
                 if (!confirm(msg)) {
@@ -678,5 +779,146 @@ if (renameToggle && renameForm) {
         });
     }
 }
+</script>
+<?php endif; ?>
+
+<script>
+(function () {
+    const toggle = document.getElementById('changePassphraseToggle');
+    if (!toggle) return;
+    const box     = document.getElementById('changePassphraseBox');
+    const input   = document.getElementById('newPassphrase');
+    const result  = document.getElementById('passphraseResult');
+    const repoId  = <?= (int) $repo['id'] ?>;
+    const csrf    = '<?= $this->csrfToken() ?>';
+
+    function randomPassphrase() {
+        const b = new Uint8Array(16);
+        crypto.getRandomValues(b);
+        return Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
+    }
+
+    toggle.addEventListener('click', function () {
+        box.classList.toggle('d-none');
+        if (!box.classList.contains('d-none') && !input.value) {
+            input.value = randomPassphrase();
+            input.focus();
+            input.select();
+        }
+    });
+    document.getElementById('cancelPassphrase').addEventListener('click', function () {
+        box.classList.add('d-none');
+        result.innerHTML = '';
+    });
+    document.getElementById('suggestPassphrase').addEventListener('click', function () {
+        input.value = randomPassphrase();
+        input.focus();
+        input.select();
+    });
+
+    document.getElementById('savePassphrase').addEventListener('click', async function () {
+        const value = input.value.trim();
+        if (!value) { input.focus(); return; }
+        if (!confirm('Change the passphrase for this repository?\n\nThe current passphrase stops working. Make sure you have a copy of the new one before continuing.')) return;
+
+        const btn = this;
+        btn.disabled = true;
+        const label = btn.textContent;
+        btn.textContent = 'Changing…';
+        result.innerHTML = '<div class="text-muted small"><span class="spinner-border spinner-border-sm me-1"></span>borg is re-encrypting the repository key…</div>';
+        try {
+            const body = new URLSearchParams({ csrf_token: csrf, passphrase: value });
+            const r = await fetch('/repositories/' + repoId + '/passphrase', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-CSRF-Token': csrf },
+                credentials: 'same-origin',
+                body,
+            });
+            const d = await r.json();
+            if (d.status === 'ok') {
+                // Update the row in place so the copy button hands out the
+                // new one rather than the passphrase that no longer opens it.
+                const code = document.getElementById('repoPassphrase');
+                if (code) {
+                    code.dataset.passphrase = value;
+                    if (code.textContent !== '*****') code.textContent = value;
+                }
+                result.innerHTML = '<div class="alert alert-success py-2 px-3 mb-0 small">' + bbsEsc(d.message) + '</div>';
+                input.value = '';
+                setTimeout(() => box.classList.add('d-none'), 2500);
+            } else if (d.orphaned) {
+                // borg took it, we could not store it. Do not auto-dismiss.
+                result.innerHTML = '<div class="alert alert-danger py-2 px-3 mb-0 small"><strong>Write this down now.</strong><br>' + bbsEsc(d.message) + '</div>';
+            } else {
+                result.innerHTML = '<div class="alert alert-warning py-2 px-3 mb-0 small">' + bbsEsc(d.message || d.error || 'Failed') +
+                    (d.output ? '<pre class="mt-2 mb-0 small" style="white-space:pre-wrap;">' + d.output.replace(/</g, '&lt;') + '</pre>' : '') + '</div>';
+            }
+        } catch (e) {
+            result.innerHTML = '<div class="alert alert-danger py-2 px-3 mb-0 small">Request failed: ' + e.message + '</div>';
+        } finally {
+            btn.disabled = false;
+            btn.textContent = label;
+        }
+    });
+})();
+</script>
+
+<?php if (count($sizeSeries) >= 2): ?>
+<script src="/assets/chartjs/chart.umd.min.js"></script>
+<script>
+(function () {
+    const el = document.getElementById('sizeChart');
+    if (!el || !window.Chart) return;
+    const pts = <?= json_encode($sizeSeries) ?>;
+    const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    const tc = isDark ? '#8b929a' : '#6c757d';
+    const gc = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)';
+    const fmtB = b => { b = Number(b); const s = '\u00A0'; if (b >= 1099511627776) return (b/1099511627776).toFixed(2)+s+'TB'; if (b >= 1073741824) return (b/1073741824).toFixed(2)+s+'GB'; if (b >= 1048576) return (b/1048576).toFixed(1)+s+'MB'; if (b >= 1024) return (b/1024).toFixed(0)+s+'KB'; return b+s+'B'; };
+    // Label every Nth point so the axis stays readable on long runs.
+    const step = Math.max(1, Math.ceil(pts.length / 12));
+    new Chart(el.getContext('2d'), {
+        data: {
+            labels: pts.map(p => p.label),
+            datasets: [
+                { type: 'line', label: 'Archive size', yAxisID: 'y', data: pts.map(p => p.original),
+                  borderColor: 'rgba(54, 162, 235, 0.9)', backgroundColor: 'rgba(54, 162, 235, 0.15)', fill: true, tension: 0.2,
+                  pointRadius: pts.length > 120 ? 0 : 2, borderWidth: 1.5, order: 2 },
+                { type: 'bar', label: 'Added after dedup', yAxisID: 'y2', data: pts.map(p => p.added),
+                  backgroundColor: 'rgba(75, 192, 192, 0.7)', borderRadius: 2, order: 1 },
+            ]
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: {
+                    position: 'bottom', labels: { boxWidth: 10, font: { size: 10 }, padding: 10, color: tc },
+                    // Clicking a series shows only that series; clicking it again
+                    // shows both. Chart.js's default hides the clicked one, which
+                    // reads backwards (#500).
+                    onClick: (e, item, legend) => {
+                        const chart = legend.chart;
+                        const n = chart.data.datasets.length;
+                        const onlyThis = [...Array(n).keys()].every(i => i === item.datasetIndex ? chart.isDatasetVisible(i) : !chart.isDatasetVisible(i));
+                        for (let i = 0; i < n; i++) chart.setDatasetVisibility(i, onlyThis ? true : i === item.datasetIndex);
+                        chart.update();
+                    },
+                },
+                tooltip: {
+                    callbacks: {
+                        title: items => { const p = pts[items[0].dataIndex]; return p.full + (p.plan ? ' \u00B7 ' + p.plan : ''); },
+                        label: item => ' ' + item.dataset.label + ': ' + fmtB(item.raw),
+                        afterBody: items => [pts[items[0].dataIndex].name],
+                    }
+                }
+            },
+            scales: {
+                x: { ticks: { color: tc, font: { size: 9 }, maxRotation: 0, autoSkip: false, callback: function (v, i) { return i % step === 0 ? this.getLabelForValue(v) : ''; } }, grid: { display: false } },
+                y: { position: 'left', beginAtZero: true, ticks: { color: tc, font: { size: 10 }, callback: v => fmtB(v) }, grid: { color: gc }, title: { display: true, text: 'Archive size', color: tc, font: { size: 10 } } },
+                y2: { position: 'right', beginAtZero: true, ticks: { color: tc, font: { size: 10 }, callback: v => fmtB(v) }, grid: { drawOnChartArea: false }, title: { display: true, text: 'Added', color: tc, font: { size: 10 } } },
+            }
+        }
+    });
+})();
 </script>
 <?php endif; ?>

@@ -31,6 +31,114 @@ class UpdateService
         return file_exists('/.dockerenv') || file_exists('/run/.containerenv');
     }
 
+    /**
+     * The AGENT_VERSION constant bundled with this server.
+     *
+     * Read out of agent/bbs-agent.py, which is the source of truth for what
+     * agents should be running. Lives here because three callers needed it —
+     * the topbar badge, the settings JSON and the bulk upgrade — and the
+     * layout was re-reading the file with fgets() on every page render.
+     */
+    public function getBundledAgentVersion(): ?string
+    {
+        $agentFile = $this->projectRoot . '/agent/bbs-agent.py';
+        if (!file_exists($agentFile)) {
+            return null;
+        }
+        $fh = fopen($agentFile, 'r');
+        if (!$fh) {
+            return null;
+        }
+        // The constant sits below the imports, which grow. A 50-line cap
+        // stopped finding it once it reached line 51 (2.94.1), which hid the
+        // agents card on the Updates page and, worse, stopped the scheduler
+        // from queueing agent updates after a server update. Read the whole
+        // header; stop at the first def/class, where the constants end.
+        $version = null;
+        for ($i = 0; $i < 500 && ($line = fgets($fh)) !== false; $i++) {
+            if (preg_match('/^AGENT_VERSION\s*=\s*["\']([^"\']+)["\']/m', $line, $m)) {
+                $version = $m[1];
+                break;
+            }
+            if (preg_match('/^(def|class) /', $line)) {
+                break;
+            }
+        }
+        fclose($fh);
+        return $version;
+    }
+
+    /**
+     * Is this agent behind the version bundled with the server?
+     *
+     * Strictly older, compared as a version rather than as a string. An agent
+     * that is NEWER than the server's bundle is not outdated and must never be
+     * offered an "upgrade" — doing so pushed a 2.72.0 agent back down to the
+     * 2.71.0 the server happened to carry (#387). That is easy to hit: a Docker
+     * agent image can be newer than the server image.
+     */
+    public function isAgentOutdated(?string $agentVersion, ?string $bundled = null): bool
+    {
+        $bundled = $bundled ?? $this->getBundledAgentVersion();
+        if (!$bundled || !$agentVersion) {
+            return false;
+        }
+        return version_compare($agentVersion, $bundled, '<');
+    }
+
+    /**
+     * Agents running a version older than the bundled one.
+     *
+     * Empty when the bundled version can't be determined — better to show
+     * nothing than to claim every agent is out of date. Agents that manage
+     * their own updates (containers, where the image carries the agent) are
+     * excluded: updating them in place is undone by the next restart.
+     */
+    /**
+     * Agents behind the bundled version that accept server-driven updates:
+     * the set "Update All" and the scheduler may queue an update for.
+     * Agents that manage their own version (containers, #387) are left
+     * out; getAgentsBehind() has them.
+     */
+    public function getOutdatedAgents(bool $onlineOnly = false): array
+    {
+        return array_values(array_filter(
+            $this->getAgentsBehind($onlineOnly),
+            fn($a) => !empty($a['auto_update_enabled'])
+        ));
+    }
+
+    /**
+     * Every agent behind the bundled version, whether or not the server
+     * may update it, with auto_update_enabled so a page can say which is
+     * which. The Updates tab used to show only the updatable ones and
+     * then claimed every client ran the bundled version (#566).
+     */
+    public function getAgentsBehind(bool $onlineOnly = false): array
+    {
+        $bundled = $this->getBundledAgentVersion();
+        if (!$bundled) {
+            return [];
+        }
+
+        $sql = "SELECT id, name, agent_version, status, auto_update_enabled FROM agents
+                WHERE agent_version IS NOT NULL";
+        if ($onlineOnly) {
+            $sql .= " AND status = 'online'";
+        }
+        $sql .= " ORDER BY name";
+
+        return array_values(array_filter(
+            $this->db->fetchAll($sql),
+            fn($a) => $this->isAgentOutdated($a['agent_version'], $bundled)
+        ));
+    }
+
+    public function countOutdatedAgents(): int
+    {
+        return count($this->getOutdatedAgents());
+    }
+
     public function getIncludePrereleases(): bool
     {
         return $this->getSetting('include_prereleases', '0') === '1';
@@ -156,6 +264,46 @@ class UpdateService
      *
      * @param string|null $branchOrTag  Pass 'main' for dev sync, null for latest release tag
      */
+    /**
+     * Work that must finish before the application can be replaced.
+     *
+     * Server-side task types are excluded here because they are counted
+     * separately below — they run on this machine and are interrupted by the
+     * restart, whereas an agent backup is writing to a repository.
+     */
+    public function countRunningWork(): int
+    {
+        $agentJobs = (int) ($this->db->fetchOne(
+            "SELECT COUNT(*) as cnt FROM backup_jobs
+             WHERE status IN ('sent', 'running')
+               AND task_type NOT IN ('update_borg', 'update_agent',
+                   'prune', 'compact', 's3_sync', 's3_restore',
+                   'repo_check', 'repo_repair', 'break_lock',
+                   'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full',
+                   'archive_delete', 'archive_lock')
+               AND (agent_id IS NULL
+                    OR agent_id IN (SELECT id FROM agents WHERE status = 'online'))"
+        )['cnt'] ?? 0);
+
+        $serverJobs = 0;
+        try {
+            $serverJobs = (int) ($this->db->fetchOne(
+                "SELECT COUNT(*) as cnt FROM server_jobs WHERE status IN ('queued', 'running')"
+            )['cnt'] ?? 0);
+        } catch (\Exception $e) { /* server_jobs table may not exist */ }
+
+        return $agentJobs + $serverJobs;
+    }
+
+    /** Stop waiting, and put maintenance back as it was. */
+    public function cancelPendingUpgrade(): void
+    {
+        if ($this->getSetting('upgrade_pending_restore_maintenance') !== '1') {
+            $this->setSetting('maintenance_mode', '0');
+        }
+        $this->setSetting('upgrade_pending', '0');
+    }
+
     public function startBackgroundUpgrade(?string $branchOrTag = null): array
     {
         // Already upgrading?
@@ -179,36 +327,30 @@ class UpdateService
         // offline agent (they'll stay stuck indefinitely and should never
         // block a server upgrade), and ignore management tasks like
         // update_borg/update_agent that aren't real backups (#184).
-        $activeJobs = $this->db->fetchOne(
-            "SELECT COUNT(*) as cnt FROM backup_jobs
-             WHERE status IN ('sent', 'running')
-               AND task_type NOT IN ('update_borg', 'update_agent',
-                   'prune', 'compact', 's3_sync', 's3_restore',
-                   'repo_check', 'repo_repair', 'break_lock',
-                   'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full',
-                   'archive_delete')
-               AND (agent_id IS NULL
-                    OR agent_id IN (SELECT id FROM agents WHERE status = 'online'))"
-        );
-        if ((int) $activeJobs['cnt'] > 0) {
-            return ['success' => false, 'error' => "{$activeJobs['cnt']} backup job(s) still running. Wait for them to complete or cancel them before upgrading."];
-        }
-
-        // Check for active server jobs (prune, compact, etc.)
-        try {
-            $activeServerJobs = $this->db->fetchOne(
-                "SELECT COUNT(*) as cnt FROM server_jobs WHERE status IN ('queued', 'running')"
-            );
-            if ((int) ($activeServerJobs['cnt'] ?? 0) > 0) {
-                return ['success' => false, 'error' => "{$activeServerJobs['cnt']} server job(s) still running. Wait for them to complete before upgrading."];
-            }
-        } catch (\Exception $e) { /* server_jobs table may not exist */ }
-
-        // Enable maintenance mode to suspend the queue
+        // Maintenance mode first, then count. The other way round leaves a gap:
+        // between counting and suspending the queue the scheduler can promote a
+        // queued job to 'sent', and the upgrade then runs while a backup is
+        // starting. Suspending first means anything counted after this is
+        // work already under way, and nothing new can join it.
+        $maintenanceWasOn = $this->getSetting('maintenance_mode') === '1';
         $this->setSetting('maintenance_mode', '1');
 
-        // Set up log file
-        $logFile = '/tmp/bbs-upgrade-' . getmypid() . '.log';
+        $running = $this->countRunningWork();
+        if ($running > 0) {
+            // Leave maintenance on and wait rather than refusing. The caller is
+            // told to come back; the scheduler starts the upgrade once the last
+            // job finishes, re-checking under maintenance before it does.
+            $this->setSetting('upgrade_pending', '1');
+            $this->setSetting('upgrade_pending_restore_maintenance', $maintenanceWasOn ? '1' : '0');
+            return [
+                'success' => false,
+                'waiting' => true,
+                'running' => $running,
+                'error' => "Waiting for {$running} running job(s) to finish. The queue is suspended and the upgrade will start on its own once they are done.",
+            ];
+        }
+
+        $logFile = $this->upgradeLogPath();
         $this->setSetting('upgrade_in_progress', '1');
         $this->setSetting('upgrade_started_at', date('Y-m-d H:i:s'));
         $this->setSetting('upgrade_log_file', $logFile);
@@ -230,6 +372,32 @@ class UpdateService
         $this->setSetting('upgrade_pid', $pid);
 
         return ['success' => true, 'pid' => $pid];
+    }
+
+    /**
+     * Where the upgrade writes its log.
+     *
+     * Not /tmp. Apache runs with PrivateTmp=yes on Ubuntu, so a log the
+     * scheduler (cron) writes to /tmp is invisible to the web request that
+     * polls it. A deferred upgrade started from the scheduler then finished
+     * with nobody able to see it finish, and the upgrade page never let go.
+     */
+    private function upgradeLogPath(): string
+    {
+        $dir = $this->projectRoot . '/storage/logs';
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0755, true);
+        }
+        if (!is_dir($dir) || !is_writable($dir)) {
+            $dir = sys_get_temp_dir();
+        }
+        // /tmp used to clear these on reboot; here they'd pile up.
+        foreach (glob($dir . '/bbs-upgrade-*.log') ?: [] as $old) {
+            if (filemtime($old) < time() - 30 * 86400) {
+                @unlink($old);
+            }
+        }
+        return $dir . '/bbs-upgrade-' . getmypid() . '.log';
     }
 
     /**
@@ -284,6 +452,12 @@ class UpdateService
         $processRunning = false;
         if (!empty($pid) && is_numeric($pid)) {
             $processRunning = file_exists("/proc/{$pid}");
+            // After a reboot the PID can belong to something else. Only count
+            // it if it's still the updater (when its command line is readable).
+            $cmdline = $processRunning ? @file_get_contents("/proc/{$pid}/cmdline") : false;
+            if ($cmdline !== false && $cmdline !== '' && !str_contains($cmdline, 'bbs-update')) {
+                $processRunning = false;
+            }
         }
 
         // Check for completion marker
@@ -308,7 +482,17 @@ class UpdateService
             }
         }
 
-        $failed = !$processRunning && !$completed && !$fallbackSuccess && !empty($log);
+        // The process is gone and left no log we can read. Don't wait forever:
+        // judge by whether the code on disk is now the version we asked for,
+        // or a newer one (someone ran bbs-update by hand to get unstuck).
+        if (!$processRunning && $log === '') {
+            $wanted = ltrim($target, 'v');
+            if ($wanted !== '' && version_compare($this->getCurrentVersion(), $wanted, '>=')) {
+                $fallbackSuccess = true;
+            }
+        }
+
+        $failed = !$processRunning && !$completed && !$fallbackSuccess;
 
         if ($completed || $fallbackSuccess || $failed) {
             $resultStr = ($completed || $fallbackSuccess) ? 'success' : 'failed';
@@ -377,6 +561,14 @@ class UpdateService
 
     /**
      * Send anonymous telemetry ping (version + OS) once per version.
+     *
+     * The request has to be completed, not just written. The previous
+     * fire-and-forget socket — write the request, close, never read the
+     * reply — stopped landing at the endpoint in late July: the connection
+     * was closed before the request was forwarded, so the ping was dropped,
+     * and because the version was marked as reported before sending, it was
+     * never retried. Now the version is recorded only once the endpoint has
+     * answered 200; a failure is retried, at most every six hours.
      */
     private function sendTelemetryPing(): void
     {
@@ -389,6 +581,11 @@ class UpdateService
             if ($this->getSetting('telemetry_last_version') === $currentVersion) {
                 return;
             }
+            $lastAttempt = $this->getSetting('telemetry_last_attempt');
+            if ($lastAttempt !== '' && strtotime($lastAttempt) > time() - 6 * 3600) {
+                return;
+            }
+            $this->setSetting('telemetry_last_attempt', date('Y-m-d H:i:s'));
 
             $os = php_uname('s') . ' ' . php_uname('r');
             if (file_exists('/etc/os-release')) {
@@ -398,27 +595,68 @@ class UpdateService
                 }
             }
 
+            // Fleet size and how much data is protected, as totals only:
+            // the number of clients, the original size of each repository's
+            // newest archive summed (what a full restore would bring back),
+            // and the deduplicated size on disk. No names, paths or hosts.
+            $clients = (int) ($this->db->fetchOne("SELECT COUNT(*) AS c FROM agents")['c'] ?? 0);
+            $protected = (int) ($this->db->fetchOne("
+                SELECT COALESCE(SUM(a.original_size), 0) AS b
+                FROM archives a
+                JOIN (SELECT repository_id, MAX(created_at) AS newest FROM archives GROUP BY repository_id) n
+                  ON n.repository_id = a.repository_id AND n.newest = a.created_at
+            ")['b'] ?? 0);
+            $repoBytes = (int) ($this->db->fetchOne("SELECT COALESCE(SUM(size_bytes), 0) AS b FROM repositories")['b'] ?? 0);
+
             $payload = json_encode([
                 'version' => $currentVersion,
                 'os' => $os,
+                'clients' => $clients,
+                'protected_bytes' => $protected,
+                'repo_bytes' => $repoBytes,
             ]);
+            $url = 'https://www.borgbackupserver.com/api/telemetry.php';
 
-            // Set optimistically so we don't retry if endpoint is down
-            $this->setSetting('telemetry_last_version', $currentVersion);
+            $status = 0;
+            if (function_exists('curl_init')) {
+                $ch = curl_init($url);
+                curl_setopt_array($ch, [
+                    CURLOPT_POST => true,
+                    CURLOPT_POSTFIELDS => $payload,
+                    CURLOPT_HTTPHEADER => [
+                        'Content-Type: application/json',
+                        'User-Agent: BorgBackupServer/' . $currentVersion,
+                    ],
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_CONNECTTIMEOUT => 3,
+                    CURLOPT_TIMEOUT => 6,
+                ]);
+                curl_exec($ch);
+                $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+                curl_close($ch);
+            } else {
+                $host = 'www.borgbackupserver.com';
+                $fp = @fsockopen('ssl://' . $host, 443, $errno, $errstr, 3);
+                if ($fp) {
+                    stream_set_timeout($fp, 6);
+                    $header = "POST /api/telemetry.php HTTP/1.1\r\n";
+                    $header .= "Host: {$host}\r\n";
+                    $header .= "Content-Type: application/json\r\n";
+                    $header .= "User-Agent: BorgBackupServer/{$currentVersion}\r\n";
+                    $header .= "Content-Length: " . strlen($payload) . "\r\n";
+                    $header .= "Connection: close\r\n\r\n";
+                    fwrite($fp, $header . $payload);
+                    $first = (string) fgets($fp, 256);
+                    while (!feof($fp)) { fgets($fp, 1024); }
+                    fclose($fp);
+                    if (preg_match('#^HTTP/\S+\s+(\d{3})#', $first, $m)) {
+                        $status = (int) $m[1];
+                    }
+                }
+            }
 
-            // Fire-and-forget via non-blocking socket (won't hang if server is down)
-            $host = 'www.borgbackupserver.com';
-            $path = '/api/telemetry.php';
-            $fp = @fsockopen('ssl://' . $host, 443, $errno, $errstr, 2);
-            if ($fp) {
-                $header = "POST {$path} HTTP/1.1\r\n";
-                $header .= "Host: {$host}\r\n";
-                $header .= "Content-Type: application/json\r\n";
-                $header .= "User-Agent: BorgBackupServer/{$currentVersion}\r\n";
-                $header .= "Content-Length: " . strlen($payload) . "\r\n";
-                $header .= "Connection: close\r\n\r\n";
-                fwrite($fp, $header . $payload);
-                fclose($fp);
+            if ($status === 200) {
+                $this->setSetting('telemetry_last_version', $currentVersion);
             }
         } catch (\Exception $e) {
             // Silently ignore telemetry failures

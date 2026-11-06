@@ -3,18 +3,95 @@
 namespace BBS\Services;
 
 use BBS\Core\Database;
+use BBS\Core\JobType;
 
 class QueueManager
 {
+    /** Task types that write to a repository; refused on read-only copies (#523). */
+    public const WRITE_TASKS = ['backup', 'prune', 'compact', 'repo_repair', 'archive_delete', 'archive_lock', 's3_sync'];
+
+    /**
+     * Task types that need the agent online to run. Server-side tasks
+     * (prune, compact, catalog, offsite sync) run on the scheduler and don't
+     * care about the agent's connection state.
+     */
+    public const AGENT_BOUND_TASKS = [
+        'backup', 'backup_dry_run', 'restore', 'restore_mysql', 'restore_pg', 'restore_mongo', 'restore_mssql',
+        'update_borg', 'update_agent', 'plugin_test', 'plugin_post', 'list_dir',
+    ];
+
+    /** Task types that never touch the repository's storage. */
+    private const STORAGE_FREE_TASKS = ['update_borg', 'update_agent', 'plugin_test', 'plugin_post', 'list_dir', 'break_lock'];
+
+    /** Task types the scheduler runs on the server; agents never run or report them. */
+    /**
+     * Why a job may not be queued on a repository, or null. A read-only
+     * copy restored from an offsite sync (#523) takes no writes. The queue
+     * refuses these again when it picks the job up; this answers the
+     * request straight away.
+     */
+    public static function readOnlyRefusal(array $repo, string $taskType): ?string
+    {
+        if (empty($repo['read_only']) || !in_array($taskType, self::WRITE_TASKS, true)) {
+            return null;
+        }
+        return 'This repository is a read-only copy restored from an offsite sync. '
+            . \BBS\Core\JobType::label($taskType) . ' is not available on it.';
+    }
+
+    public const SERVER_SIDE_TYPES = ['prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete', 'archive_lock'];
+
     private Database $db;
     private int $maxQueue;
     private ?int $sshPort = null;
+    private ?int $defaultLocationId = null;
+    /** Offsite sync destinations (plugin config id => decoded config). */
+    private ?array $offsiteTargets = null;
 
     public function __construct()
     {
         $this->db = Database::getInstance();
-        $setting = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'max_queue'");
-        $this->maxQueue = (int) ($setting['value'] ?? 4);
+        $this->maxQueue = self::maxQueueSetting();
+    }
+
+    /** The global Max Concurrent Jobs setting. */
+    public static function maxQueueSetting(): int
+    {
+        $setting = Database::getInstance()->fetchOne("SELECT `value` FROM settings WHERE `key` = 'max_queue'");
+        return max(1, (int) ($setting['value'] ?? 4));
+    }
+
+    /**
+     * A per-storage job limit as posted from a form (#154): null for blank
+     * or 0 (no limit of its own), else the number. A storage can never run
+     * more than the server, so a value above max_queue is refused with a
+     * message in $error rather than clamped: raise the global limit first.
+     */
+    public static function parseStorageCap(?string $raw, ?string &$error = null): ?int
+    {
+        $error = null;
+        $value = (int) trim((string) $raw);
+        if ($value <= 0) {
+            return null;
+        }
+        $max = self::maxQueueSetting();
+        if ($value > $max) {
+            $error = "Max concurrent jobs can't be more than the global Max Concurrent Jobs setting ({$max}). Raise that in Settings first.";
+            return null;
+        }
+        return $value;
+    }
+
+    /**
+     * Whether clients should walk the tree to estimate a file count before a
+     * backup. Only used for a plan's first run now that the previous archive's
+     * count is sent instead, but a plan whose first run is a very large tree
+     * can still turn it off.
+     */
+    private function precountEnabled(): bool
+    {
+        $row = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'precount_files'");
+        return ($row['value'] ?? '1') === '1';
     }
 
     /**
@@ -48,9 +125,33 @@ class QueueManager
      */
     public function processQueue(): array
     {
-        // Check maintenance mode — still process server-side jobs (catalog, prune, etc.)
+        // Single-flight (#458): this runs on every agent poll, so a large
+        // fleet used to run the whole promotion scan dozens of times
+        // concurrently — the same job promoted hundreds of times, and the
+        // database saturated under the duplicate work. One caller holds the
+        // advisory lock and promotes; everyone else returns immediately and
+        // picks up their tasks from what that caller promoted.
+        $gate = $this->db->fetchOne("SELECT GET_LOCK('bbs_process_queue', 0) AS got");
+        if ((int) ($gate['got'] ?? 0) !== 1) {
+            return [];
+        }
+        try {
+            return $this->promoteQueuedJobs();
+        } finally {
+            $this->db->query("SELECT RELEASE_LOCK('bbs_process_queue')");
+        }
+    }
+
+    private function promoteQueuedJobs(): array
+    {
+        // Maintenance mode pauses the whole queue. Nothing is promoted, server-side
+        // jobs included: an offsite sync or a prune started during a server
+        // restore or an upgrade is as unwelcome as a backup. Jobs already
+        // sent or running are left to finish, and queued ones wait.
         $maintenance = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'maintenance_mode'");
-        $maintenanceMode = (($maintenance['value'] ?? '0') === '1');
+        if (($maintenance['value'] ?? '0') === '1') {
+            return [];
+        }
 
         // Count currently active backup/restore jobs (sent + running) for ONLINE agents.
         // Excludes: server-side tasks (run by scheduler), management tasks (update_borg,
@@ -58,7 +159,7 @@ class QueueManager
         // jobs shouldn't block the entire queue).
         $activeCount = $this->db->count('backup_jobs',
             "status IN ('sent', 'running')
-             AND task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete', 'update_borg', 'update_agent')
+             AND task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete', 'archive_lock', 'update_borg', 'update_agent')
              AND agent_id IN (SELECT id FROM agents WHERE status = 'online')"
         );
 
@@ -88,11 +189,11 @@ class QueueManager
         // Get queued jobs ordered by queued_at (FIFO)
         // No LIMIT — we may skip busy-repo jobs and need to see more candidates
         $queuedJobs = $this->db->fetchAll("
-            SELECT bj.*, bj.plugin_config_id, bp.name as plan_name, bp.directories, bp.excludes, bp.advanced_options,
+            SELECT bj.*, bj.plugin_config_id, bp.name as plan_name, bp.directories, bp.excludes, bp.advanced_options, bp.snapshot, bp.stream_db_dumps, bp.priority,
                    bp.prune_minutes, bp.prune_hours, bp.prune_days,
                    bp.prune_weeks, bp.prune_months, bp.prune_years,
                    r.path as repo_path, r.encryption, r.passphrase_encrypted, r.name as repo_name,
-                   r.agent_id as repo_agent_id, r.storage_type, r.remote_ssh_config_id,
+                   r.agent_id as repo_agent_id, r.storage_type, r.storage_location_id, r.remote_ssh_config_id, r.read_only as repo_read_only,
                    rsc.remote_host, rsc.remote_port, rsc.remote_user, rsc.remote_base_path,
                    rsc.ssh_private_key_encrypted as remote_ssh_key_encrypted,
                    rsc.borg_remote_path,
@@ -104,35 +205,73 @@ class QueueManager
             LEFT JOIN remote_ssh_configs rsc ON rsc.id = r.remote_ssh_config_id
             LEFT JOIN agents a ON a.id = bj.agent_id
             WHERE bj.status = 'queued'
+              -- Retries are held back to give whatever knocked the client
+              -- over time to pass (#404). Everything else has no not_before.
+              AND (bj.not_before IS NULL OR bj.not_before <= NOW())
             ORDER BY
                 CASE WHEN bj.task_type IN ('catalog_rebuild', 'catalog_rebuild_full') THEN 1 ELSE 0 END,
                 bj.queued_at ASC
         ");
 
-        // Task types that require the agent to be online to run. Server-side
-        // tasks (prune/compact/catalog/etc.) run by the scheduler itself —
-        // they don't care about the agent's connection state.
-        $agentBoundTypes = [
-            'backup', 'restore', 'restore_mysql', 'restore_pg', 'restore_mongo',
-            'update_borg', 'update_agent', 'plugin_test', 'list_dir',
-        ];
+        $agentBoundTypes = self::AGENT_BOUND_TASKS;
 
         $promoted = [];
         $promotedCount = 0;
 
-        $serverSideTypes = ['prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete'];
         $managementTypes = ['update_borg', 'update_agent'];
+
+        // Offsite syncs are capped on their own, independently of max_queue.
+        //
+        // They are server-side, so they never counted as active — max_queue
+        // limits how many are PROMOTED in one pass, not how many run. Nothing
+        // stopped them accumulating: two hundred repositories finishing their
+        // prune within the same few minutes produced sixty-seven concurrent
+        // rclone processes, a load average of 790 on sixteen cores, and a
+        // combined throughput lower than a single transfer achieved alone.
+        //
+        // 0 means no limit, which is what every install did before this.
+        $s3Setting = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 's3_max_concurrent'");
+        $s3Cap = max(0, (int) ($s3Setting['value'] ?? 0));
+        $s3Types = ['s3_sync', 's3_restore'];
+        $s3Active = $s3Cap > 0 ? (int) $this->db->count('backup_jobs',
+            "status IN ('sent', 'running') AND task_type IN ('s3_sync', 's3_restore')") : 0;
 
         // Get agents that currently have a backup/restore running (for management task gating)
         $busyAgents = $this->db->fetchAll(
             "SELECT DISTINCT agent_id FROM backup_jobs
              WHERE status IN ('sent', 'running')
-               AND task_type IN ('backup', 'restore', 'restore_mysql', 'restore_pg', 'restore_mongo')"
+               AND task_type IN ('backup', 'restore', 'restore_mysql', 'restore_pg', 'restore_mongo', 'restore_mssql')"
         );
         $busyAgentIds = array_column($busyAgents, 'agent_id');
 
+        // Per-storage limits (#154): a disk, SSH host or offsite destination
+        // can cap how many jobs touch it at once, so a spinning disk runs its
+        // backups one after another while an SSD beside it runs four. Most
+        // installs set none, and then this costs three small queries.
+        $storageCaps = $this->storageCaps();
+        $storageActive = $storageCaps ? $this->storageActiveCounts() : [];
+
         foreach ($queuedJobs as $job) {
+            // A read-only copy (#523) shares its key with the original it was
+            // cloned from, so nothing may write to it. The UI and API don't
+            // offer these; this catches anything queued another way.
+            if (!empty($job['repo_read_only']) && in_array($job['task_type'], self::WRITE_TASKS, true)) {
+                $this->db->update('backup_jobs', [
+                    'status' => 'failed',
+                    'completed_at' => date('Y-m-d H:i:s'),
+                    'error_log' => "Repository \"{$job['repo_name']}\" is a read-only copy restored from an offsite sync; "
+                        . JobType::label($job['task_type']) . ' jobs cannot run on it.',
+                ], 'id = ? AND status = ?', [$job['id'], 'queued']);
+                continue;
+            }
+
             $isManagement = in_array($job['task_type'], $managementTypes);
+
+            // `continue`, not `break`: a queue full of syncs must not stop a
+            // backup or a prune behind them from being promoted.
+            if ($s3Cap > 0 && $s3Active >= $s3Cap && in_array($job['task_type'], $s3Types, true)) {
+                continue;
+            }
 
             // Management tasks (update_borg, update_agent) bypass queue slots
             // but wait if the agent has an active backup
@@ -143,11 +282,6 @@ class QueueManager
                 // Otherwise fall through to promote immediately
             } elseif ($promotedCount >= $slotsAvailable) {
                 break;
-            }
-
-            // In maintenance mode, only promote server-side jobs (not backups/restores)
-            if ($maintenanceMode && !in_array($job['task_type'], $serverSideTypes) && !$isManagement) {
-                continue;
             }
 
             // Don't promote agent-bound jobs (backup, restore, plugin_test, etc.)
@@ -164,11 +298,16 @@ class QueueManager
             // Skip duplicate backup for the same plan (no point running the same backup twice)
             if ($job['task_type'] === 'backup' && $job['backup_plan_id']
                 && in_array($job['backup_plan_id'], $busyPlanIds)) {
-                $this->db->update('backup_jobs', [
+                // Compare-and-set so a concurrent caller can't double-fail
+                // and double-log the same job (#458).
+                $skipped = $this->db->update('backup_jobs', [
                     'status' => 'failed',
                     'completed_at' => date('Y-m-d H:i:s'),
                     'error_log' => 'Skipped — a backup for this plan is already queued or running',
-                ], 'id = ?', [$job['id']]);
+                ], "id = ? AND status = 'queued'", [$job['id']]);
+                if ($skipped === 0) {
+                    continue;
+                }
                 $this->db->insert('server_log', [
                     'agent_id' => $job['agent_id'],
                     'backup_job_id' => $job['id'],
@@ -183,6 +322,32 @@ class QueueManager
             if ($job['repository_id'] && in_array($job['repository_id'], $busyRepoIds)) {
                 continue;
             }
+            // Hold if any storage it would touch is at its own limit (#154).
+            // `continue`, not `break`: a full disk must not stop a job for
+            // another disk behind it in the queue.
+            $jobStorage = $storageCaps ? $this->storageKeys($job) : [];
+            foreach ($jobStorage as $key) {
+                if (isset($storageCaps[$key]) && ($storageActive[$key] ?? 0) >= $storageCaps[$key]) {
+                    continue 2;
+                }
+            }
+            // Atomic claim before any payload work (#458): between the
+            // queued-jobs SELECT above and here, another caller may have
+            // taken this job. First writer wins; a loser sees zero rows and
+            // moves on without decrypting keys or assembling plugins for a
+            // job it doesn't own. The advisory lock above already serializes
+            // callers on one database; this is defense in depth, and the
+            // guard that matters if the lock is ever bypassed.
+            $claimed = $this->db->update(
+                'backup_jobs',
+                ['status' => 'sent'],
+                "id = ? AND status = 'queued'",
+                [$job['id']]
+            );
+            if ($claimed === 0) {
+                continue;
+            }
+
             // Build the task payload
             $repo = [
                 'path' => $job['repo_path'],
@@ -206,23 +371,52 @@ class QueueManager
 
             $taskPayload = null;
 
-            if ($job['task_type'] === 'backup') {
+            if ($job['task_type'] === 'backup' || $job['task_type'] === 'backup_dry_run') {
+                $isDryRun = $job['task_type'] === 'backup_dry_run';
                 $prefix = $job['backup_plan_id'] ? 'plan' . $job['backup_plan_id'] : ($job['repo_name'] ?? 'backup');
-                $archiveName = BorgCommandBuilder::generateArchiveName($prefix);
+                $archiveName = BorgCommandBuilder::generateArchiveName($isDryRun ? 'dry-run' : $prefix);
 
-                // Build plugin payload and auto-include plugin directories (e.g. mysql dump_dir)
-                $pluginManager = new PluginManager();
-                $plugins = $pluginManager->buildPluginPayload($job['backup_plan_id'], $job['agent_id']);
-                foreach ($plugins as $p) {
-                    if (!empty($p['config']['dump_dir'])) {
-                        $dumpDir = rtrim($p['config']['dump_dir'], '/');
-                        if (strpos($plan['directories'], $dumpDir) === false) {
-                            $plan['directories'] .= "\n" . $dumpDir;
+                // Build plugin payload and auto-include plugin directories (e.g. mysql dump_dir).
+                // Dry runs never execute plugins — no database dumps, no hooks (#257).
+                $plugins = [];
+                if (!$isDryRun) {
+                    $pluginManager = new PluginManager();
+                    $plugins = $pluginManager->buildPluginPayload($job['backup_plan_id'], $job['agent_id']);
+                    foreach ($plugins as $p) {
+                        if (!empty($p['config']['dump_dir'])) {
+                            $dumpDir = rtrim($p['config']['dump_dir'], '/');
+                            if (strpos($plan['directories'], $dumpDir) === false) {
+                                $plan['directories'] .= "\n" . $dumpDir;
+                            }
                         }
                     }
                 }
 
+                // Freeze what this job is actually told to back up, so its
+                // detail page keeps showing these directories after the plan
+                // is edited (#452). First send wins; NULL check keeps a
+                // re-poll from rewriting history.
+                $this->db->query(
+                    "UPDATE backup_jobs SET directories = ? WHERE id = ? AND directories IS NULL",
+                    [$plan['directories'], $job['id']]
+                );
+
+                // An option that the allowlist now refuses is dropped by the
+                // builder; say so in the log so the plan's owner can see why
+                // it isn't in effect rather than wondering silently.
+                $optCheck = BorgCommandBuilder::validateAdvancedOptions($plan['advanced_options'] ?? '');
+                if (!$optCheck['ok']) {
+                    $this->db->insert('server_log', [
+                        'agent_id' => $job['agent_id'],
+                        'backup_job_id' => $job['id'],
+                        'level' => 'warning',
+                        'message' => "Plan \"{$job['plan_name']}\": {$optCheck['error']} The option was not passed to borg.",
+                    ]);
+                }
                 $cmd = BorgCommandBuilder::buildCreateCommand($plan, $repo, $archiveName);
+                if ($isDryRun) {
+                    $cmd = BorgCommandBuilder::makeDryRun($cmd);
+                }
 
                 // For remote SSH repos, add --remote-path and include SSH key in payload
                 $remoteSshConfig = null;
@@ -236,10 +430,30 @@ class QueueManager
 
                 $env = BorgCommandBuilder::buildEnv($repo, true, $this->getSshPortForAgent($job['agent_id']), $remoteSshConfig);
 
+                // What the last successful backup of this plan actually stored.
+                // The agent uses it as the progress denominator instead of
+                // walking the tree, which is both slow and wrong: the walk
+                // cannot see the plan's exclude patterns, so on a plan that
+                // excludes a large tree it counts files borg will never touch
+                // (#407). The previous archive's count is the real number and
+                // needs no work to obtain.
+                $expectedFiles = 0;
+                if (!empty($job['backup_plan_id'])) {
+                    $expectedFiles = (int) ($this->db->fetchOne("
+                        SELECT ar.file_count
+                        FROM archives ar
+                        JOIN backup_jobs bj ON bj.id = ar.backup_job_id
+                        WHERE bj.backup_plan_id = ? AND ar.file_count > 0
+                        ORDER BY ar.id DESC LIMIT 1
+                    ", [$job['backup_plan_id']])['file_count'] ?? 0);
+                }
+
                 $extra = [
                     'job_id' => $job['id'],
                     'archive_name' => $archiveName,
                     'directories' => $plan['directories'],
+                    'expected_files' => $expectedFiles,
+                    'precount_files' => $this->precountEnabled(),
                     // Context exposed to shell_hook plugin scripts (#250).
                     // The agent injects these as BBS_* env vars when running
                     // pre/post hooks so scripts can target the right repo and
@@ -249,8 +463,22 @@ class QueueManager
                     'client_name' => $job['agent_name'] ?? '',
                 ];
                 if (!empty($plugins)) {
-                    $extra['plugins'] = $plugins;
+                    // An empty config must reach the agent as {}, not [] (#535)
+                    $extra['plugins'] = array_map(
+                        fn($p) => $p['config'] === [] ? array_merge($p, ['config' => new \stdClass()]) : $p,
+                        $plugins
+                    );
                 }
+                // The agent snapshots the volumes and backs up from them. It
+                // mounts them at a per-plan path so borg's files cache keeps
+                // matching between runs (#557).
+                $extra['snapshot'] = !empty($job['snapshot']);
+                $extra['backup_plan_id'] = !empty($job['backup_plan_id']) ? (int) $job['backup_plan_id'] : null;
+                // MySQL/PostgreSQL dumps go to borg through pipes (#540).
+                // Older agents ignore it and dump to disk as before.
+                $extra['stream_db_dumps'] = !empty($job['stream_db_dumps']);
+                // CPU/IO priority for borg on the client (#403).
+                $extra['priority'] = $job['priority'] ?? 'normal';
 
                 // Include decrypted SSH key for remote repos
                 if ($remoteSshConfig && !empty($job['remote_ssh_key_encrypted'])) {
@@ -261,7 +489,7 @@ class QueueManager
                     }
                 }
 
-                $taskPayload = BorgCommandBuilder::toTaskPayload('backup', $cmd, $env, $extra);
+                $taskPayload = BorgCommandBuilder::toTaskPayload($isDryRun ? 'backup_dry_run' : 'backup', $cmd, $env, $extra);
 
                 // Log the borg command being sent to the agent
                 $cmdStr = implode(' ', array_map('escapeshellarg', $cmd));
@@ -282,7 +510,7 @@ class QueueManager
                         'message' => "Plugins: " . implode(', ', $pluginSlugs),
                     ]);
                 }
-            } elseif (in_array($job['task_type'], ['prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete'])) {
+            } elseif (in_array($job['task_type'], ['prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete', 'archive_lock'])) {
                 // Server-side jobs — mark as sent, scheduler will execute them
                 $taskPayload = ['task' => $job['task_type'], 'server_side' => true, 'job_id' => $job['id']];
             } elseif ($job['task_type'] === 'restore') {
@@ -293,6 +521,8 @@ class QueueManager
                 $taskPayload = $this->buildRestorePgPayload($job);
             } elseif ($job['task_type'] === 'restore_mongo') {
                 $taskPayload = $this->buildRestoreMongoPayload($job);
+            } elseif ($job['task_type'] === 'restore_mssql') {
+                $taskPayload = $this->buildRestoreMssqlPayload($job);
             } elseif ($job['task_type'] === 'update_borg') {
                 $taskPayload = $this->buildBorgUpdatePayload($job);
             } elseif ($job['task_type'] === 'update_agent') {
@@ -305,6 +535,8 @@ class QueueManager
                     'job_id' => $job['id'],
                     'plugin' => $testPayload,
                 ];
+            } elseif ($job['task_type'] === 'plugin_post') {
+                $taskPayload = $this->buildPluginPostPayload($job);
             } elseif ($job['task_type'] === 'list_dir') {
                 // Browse-filesystem requests from the plan-create modal.
                 // Params (path / depth / show_hidden / show_all / follow_symlinks)
@@ -323,17 +555,13 @@ class QueueManager
             }
 
             if ($taskPayload) {
-                // Store the payload so the agent API can serve it
-                $this->db->update('backup_jobs', [
-                    'status' => 'sent',
-                ], 'id = ?', [$job['id']]);
-
+                // Already claimed as 'sent' above; just record and count it.
                 $destination = ($taskPayload['server_side'] ?? false) ? 'server' : 'agent';
                 $this->db->insert('server_log', [
                     'agent_id' => $job['agent_id'],
                     'backup_job_id' => $job['id'],
                     'level' => 'info',
-                    'message' => "Job #{$job['id']} ({$job['task_type']}) sent to {$destination} queue",
+                    'message' => "Job #{$job['id']} (" . \BBS\Core\JobType::label($job['task_type']) . ") sent to {$destination} queue",
                 ]);
 
                 $promoted[] = $job;
@@ -347,6 +575,12 @@ class QueueManager
                 if (!$isManagement) {
                     $promotedCount++;
                 }
+                // Counted where it is actually promoted, not where it is
+                // considered: a job that fails its claim or cannot build a
+                // payload must not eat a slot it never used.
+                if (in_array($job['task_type'], $s3Types, true)) {
+                    $s3Active++;
+                }
 
                 // Mark this repo and plan as busy for remaining iterations
                 if ($job['repository_id']) {
@@ -355,10 +589,139 @@ class QueueManager
                 if ($job['backup_plan_id'] && $job['task_type'] === 'backup') {
                     $busyPlanIds[] = $job['backup_plan_id'];
                 }
+                foreach ($jobStorage as $key) {
+                    $storageActive[$key] = ($storageActive[$key] ?? 0) + 1;
+                }
+            } else {
+                // Claimed but no payload could be built — release the job so
+                // it isn't stuck in 'sent' with nothing behind it.
+                $this->db->update(
+                    'backup_jobs',
+                    ['status' => 'queued'],
+                    "id = ? AND status = 'sent'",
+                    [$job['id']]
+                );
             }
         }
 
         return $promoted;
+    }
+
+    /**
+     * Per-storage job limits (#154), keyed like storageKeys(): loc:ID for a
+     * local storage location, ssh:ID for a remote SSH host, s3:ID for an
+     * offsite sync destination. A storage without one is absent. Each is
+     * clamped to max_queue, in case that was lowered after the limit was set.
+     */
+    private function storageCaps(): array
+    {
+        $caps = [];
+        foreach ($this->db->fetchAll("SELECT id, max_concurrent FROM storage_locations WHERE max_concurrent > 0") as $row) {
+            $caps['loc:' . $row['id']] = min((int) $row['max_concurrent'], $this->maxQueue);
+        }
+        foreach ($this->db->fetchAll("SELECT id, max_concurrent FROM remote_ssh_configs WHERE max_concurrent > 0") as $row) {
+            $caps['ssh:' . $row['id']] = min((int) $row['max_concurrent'], $this->maxQueue);
+        }
+        // SFTP and local-disk destinations are covered by the host's or the
+        // location's own limit; only an S3 destination has one of its own.
+        foreach ($this->offsiteTargets() as $id => $cfg) {
+            if (($cfg['target_type'] ?? S3SyncService::TYPE_S3) === S3SyncService::TYPE_S3
+                && (int) ($cfg['max_concurrent'] ?? 0) > 0) {
+                $caps['s3:' . $id] = min((int) $cfg['max_concurrent'], $this->maxQueue);
+            }
+        }
+        return $caps;
+    }
+
+    /**
+     * Jobs now touching each storage, keyed like storageKeys(). A job for an
+     * offline agent is not using the storage, it is waiting for the offline
+     * sweep, so it is left out, as the global count leaves it out.
+     */
+    private function storageActiveCounts(): array
+    {
+        $rows = $this->db->fetchAll("
+            SELECT bj.task_type, bj.repository_id, bj.plugin_config_id,
+                   r.storage_type, r.storage_location_id, r.remote_ssh_config_id,
+                   a.status AS agent_status
+            FROM backup_jobs bj
+            JOIN repositories r ON r.id = bj.repository_id
+            LEFT JOIN agents a ON a.id = bj.agent_id
+            WHERE bj.status IN ('sent', 'running')
+        ");
+        $counts = [];
+        foreach ($rows as $row) {
+            if (in_array($row['task_type'], self::AGENT_BOUND_TASKS, true) && ($row['agent_status'] ?? 'online') !== 'online') {
+                continue;
+            }
+            foreach ($this->storageKeys($row) as $key) {
+                $counts[$key] = ($counts[$key] ?? 0) + 1;
+            }
+        }
+        return $counts;
+    }
+
+    /**
+     * The storage a job touches: where its repository lives, plus, for an
+     * offsite sync or restore, the destination it copies to or from. Needs
+     * the job row joined to the repository's storage_type,
+     * storage_location_id and remote_ssh_config_id.
+     */
+    private function storageKeys(array $job): array
+    {
+        if (empty($job['repository_id']) || in_array($job['task_type'], self::STORAGE_FREE_TASKS, true)) {
+            return [];
+        }
+        $keys = [];
+        if (($job['storage_type'] ?? 'local') === 'remote_ssh') {
+            if (!empty($job['remote_ssh_config_id'])) {
+                $keys[] = 'ssh:' . (int) $job['remote_ssh_config_id'];
+            }
+        } else {
+            // Repositories from before storage locations existed have none
+            // set; they live on the default one.
+            $locId = (int) ($job['storage_location_id'] ?? 0) ?: $this->defaultLocationId();
+            if ($locId) {
+                $keys[] = 'loc:' . $locId;
+            }
+        }
+        if (in_array($job['task_type'], ['s3_sync', 's3_restore'], true) && !empty($job['plugin_config_id'])) {
+            $cfg = $this->offsiteTargets()[(int) $job['plugin_config_id']] ?? null;
+            if ($cfg !== null) {
+                $type = $cfg['target_type'] ?? S3SyncService::TYPE_S3;
+                if ($type === S3SyncService::TYPE_LOCAL && !empty($cfg['storage_location_id'])) {
+                    $keys[] = 'loc:' . (int) $cfg['storage_location_id'];
+                } elseif ($type === S3SyncService::TYPE_SFTP && !empty($cfg['remote_ssh_config_id'])) {
+                    $keys[] = 'ssh:' . (int) $cfg['remote_ssh_config_id'];
+                } else {
+                    $keys[] = 's3:' . (int) $job['plugin_config_id'];
+                }
+            }
+        }
+        return array_values(array_unique($keys));
+    }
+
+    private function offsiteTargets(): array
+    {
+        if ($this->offsiteTargets === null) {
+            $this->offsiteTargets = [];
+            $rows = $this->db->fetchAll(
+                "SELECT pc.id, pc.config FROM plugin_configs pc JOIN plugins p ON p.id = pc.plugin_id WHERE p.slug = 's3_sync'"
+            );
+            foreach ($rows as $row) {
+                $this->offsiteTargets[(int) $row['id']] = json_decode($row['config'] ?? '{}', true) ?: [];
+            }
+        }
+        return $this->offsiteTargets;
+    }
+
+    private function defaultLocationId(): int
+    {
+        if ($this->defaultLocationId === null) {
+            $row = $this->db->fetchOne("SELECT id FROM storage_locations WHERE is_default = 1");
+            $this->defaultLocationId = (int) ($row['id'] ?? 0);
+        }
+        return $this->defaultLocationId;
     }
 
     /**
@@ -369,7 +732,7 @@ class QueueManager
     public function getTasksForAgent(int $agentId): array
     {
         $jobs = $this->db->fetchAll("
-            SELECT bj.*, bj.plugin_config_id, bp.name as plan_name, bp.directories, bp.excludes, bp.advanced_options,
+            SELECT bj.*, bj.plugin_config_id, bp.name as plan_name, bp.directories, bp.excludes, bp.advanced_options, bp.snapshot, bp.stream_db_dumps, bp.priority,
                    bp.prune_minutes, bp.prune_hours, bp.prune_days,
                    bp.prune_weeks, bp.prune_months, bp.prune_years,
                    r.path as repo_path, r.encryption, r.passphrase_encrypted, r.name as repo_name,
@@ -408,23 +771,52 @@ class QueueManager
                 'prune_years' => $job['prune_years'] ?? 0,
             ];
 
-            if ($job['task_type'] === 'backup') {
+            if ($job['task_type'] === 'backup' || $job['task_type'] === 'backup_dry_run') {
+                $isDryRun = $job['task_type'] === 'backup_dry_run';
                 $prefix = $job['backup_plan_id'] ? 'plan' . $job['backup_plan_id'] : ($job['repo_name'] ?? 'backup');
-                $archiveName = BorgCommandBuilder::generateArchiveName($prefix);
+                $archiveName = BorgCommandBuilder::generateArchiveName($isDryRun ? 'dry-run' : $prefix);
 
-                // Build plugin payload and auto-include plugin directories (e.g. mysql dump_dir)
-                $pluginManager = new PluginManager();
-                $plugins = $pluginManager->buildPluginPayload($job['backup_plan_id'], $job['agent_id']);
-                foreach ($plugins as $p) {
-                    if (!empty($p['config']['dump_dir'])) {
-                        $dumpDir = rtrim($p['config']['dump_dir'], '/');
-                        if (strpos($plan['directories'], $dumpDir) === false) {
-                            $plan['directories'] .= "\n" . $dumpDir;
+                // Build plugin payload and auto-include plugin directories (e.g. mysql dump_dir).
+                // Dry runs never execute plugins — no database dumps, no hooks (#257).
+                $plugins = [];
+                if (!$isDryRun) {
+                    $pluginManager = new PluginManager();
+                    $plugins = $pluginManager->buildPluginPayload($job['backup_plan_id'], $job['agent_id']);
+                    foreach ($plugins as $p) {
+                        if (!empty($p['config']['dump_dir'])) {
+                            $dumpDir = rtrim($p['config']['dump_dir'], '/');
+                            if (strpos($plan['directories'], $dumpDir) === false) {
+                                $plan['directories'] .= "\n" . $dumpDir;
+                            }
                         }
                     }
                 }
 
+                // Freeze what this job is actually told to back up, so its
+                // detail page keeps showing these directories after the plan
+                // is edited (#452). First send wins; NULL check keeps a
+                // re-poll from rewriting history.
+                $this->db->query(
+                    "UPDATE backup_jobs SET directories = ? WHERE id = ? AND directories IS NULL",
+                    [$plan['directories'], $job['id']]
+                );
+
+                // An option that the allowlist now refuses is dropped by the
+                // builder; say so in the log so the plan's owner can see why
+                // it isn't in effect rather than wondering silently.
+                $optCheck = BorgCommandBuilder::validateAdvancedOptions($plan['advanced_options'] ?? '');
+                if (!$optCheck['ok']) {
+                    $this->db->insert('server_log', [
+                        'agent_id' => $job['agent_id'],
+                        'backup_job_id' => $job['id'],
+                        'level' => 'warning',
+                        'message' => "Plan \"{$job['plan_name']}\": {$optCheck['error']} The option was not passed to borg.",
+                    ]);
+                }
                 $cmd = BorgCommandBuilder::buildCreateCommand($plan, $repo, $archiveName);
+                if ($isDryRun) {
+                    $cmd = BorgCommandBuilder::makeDryRun($cmd);
+                }
 
                 // For remote SSH repos, add --remote-path and include SSH key
                 $remoteSshConfig = null;
@@ -437,10 +829,30 @@ class QueueManager
                 }
 
                 $env = BorgCommandBuilder::buildEnv($repo, true, $this->getSshPortForAgent($job['agent_id']), $remoteSshConfig);
+                // What the last successful backup of this plan actually stored.
+                // The agent uses it as the progress denominator instead of
+                // walking the tree, which is both slow and wrong: the walk
+                // cannot see the plan's exclude patterns, so on a plan that
+                // excludes a large tree it counts files borg will never touch
+                // (#407). The previous archive's count is the real number and
+                // needs no work to obtain.
+                $expectedFiles = 0;
+                if (!empty($job['backup_plan_id'])) {
+                    $expectedFiles = (int) ($this->db->fetchOne("
+                        SELECT ar.file_count
+                        FROM archives ar
+                        JOIN backup_jobs bj ON bj.id = ar.backup_job_id
+                        WHERE bj.backup_plan_id = ? AND ar.file_count > 0
+                        ORDER BY ar.id DESC LIMIT 1
+                    ", [$job['backup_plan_id']])['file_count'] ?? 0);
+                }
+
                 $extra = [
                     'job_id' => $job['id'],
                     'archive_name' => $archiveName,
                     'directories' => $plan['directories'],
+                    'expected_files' => $expectedFiles,
+                    'precount_files' => $this->precountEnabled(),
                     // Context exposed to shell_hook plugin scripts (#250).
                     // The agent injects these as BBS_* env vars when running
                     // pre/post hooks so scripts can target the right repo and
@@ -450,8 +862,22 @@ class QueueManager
                     'client_name' => $job['agent_name'] ?? '',
                 ];
                 if (!empty($plugins)) {
-                    $extra['plugins'] = $plugins;
+                    // An empty config must reach the agent as {}, not [] (#535)
+                    $extra['plugins'] = array_map(
+                        fn($p) => $p['config'] === [] ? array_merge($p, ['config' => new \stdClass()]) : $p,
+                        $plugins
+                    );
                 }
+                // The agent snapshots the volumes and backs up from them. It
+                // mounts them at a per-plan path so borg's files cache keeps
+                // matching between runs (#557).
+                $extra['snapshot'] = !empty($job['snapshot']);
+                $extra['backup_plan_id'] = !empty($job['backup_plan_id']) ? (int) $job['backup_plan_id'] : null;
+                // MySQL/PostgreSQL dumps go to borg through pipes (#540).
+                // Older agents ignore it and dump to disk as before.
+                $extra['stream_db_dumps'] = !empty($job['stream_db_dumps']);
+                // CPU/IO priority for borg on the client (#403).
+                $extra['priority'] = $job['priority'] ?? 'normal';
                 if ($remoteSshConfig && !empty($job['remote_ssh_key_encrypted'])) {
                     try {
                         $extra['remote_ssh_key'] = Encryption::decrypt($job['remote_ssh_key_encrypted']);
@@ -459,7 +885,7 @@ class QueueManager
                         $extra['remote_ssh_key'] = $job['remote_ssh_key_encrypted'];
                     }
                 }
-                $tasks[] = BorgCommandBuilder::toTaskPayload('backup', $cmd, $env, $extra);
+                $tasks[] = BorgCommandBuilder::toTaskPayload($isDryRun ? 'backup_dry_run' : 'backup', $cmd, $env, $extra);
             } elseif ($job['task_type'] === 'restore') {
                 $payload = $this->buildRestorePayload($job);
                 if ($payload) {
@@ -480,6 +906,11 @@ class QueueManager
                 if ($payload) {
                     $tasks[] = $payload;
                 }
+            } elseif ($job['task_type'] === 'restore_mssql') {
+                $payload = $this->buildRestoreMssqlPayload($job);
+                if ($payload) {
+                    $tasks[] = $payload;
+                }
             } elseif ($job['task_type'] === 'update_borg') {
                 $tasks[] = $this->buildBorgUpdatePayload($job);
             } elseif ($job['task_type'] === 'update_agent') {
@@ -492,6 +923,8 @@ class QueueManager
                     'job_id' => $job['id'],
                     'plugin' => $testPayload,
                 ];
+            } elseif ($job['task_type'] === 'plugin_post') {
+                $tasks[] = $this->buildPluginPostPayload($job);
             } elseif ($job['task_type'] === 'list_dir') {
                 // Browse-filesystem request from the plan-create modal.
                 // Params (path / depth / show_hidden / show_all) were
@@ -520,7 +953,7 @@ class QueueManager
     public function getServerSideJobs(): array
     {
         return $this->db->fetchAll("
-            SELECT bj.*, bp.directories, bp.excludes, bp.advanced_options,
+            SELECT bj.*, bp.directories, bp.excludes, bp.advanced_options, bp.snapshot, bp.stream_db_dumps, bp.priority,
                    bp.prune_minutes, bp.prune_hours, bp.prune_days,
                    bp.prune_weeks, bp.prune_months, bp.prune_years,
                    r.path as repo_path, r.encryption, r.passphrase_encrypted,
@@ -537,7 +970,7 @@ class QueueManager
             LEFT JOIN agents a ON a.id = bj.agent_id
             LEFT JOIN remote_ssh_configs rsc ON rsc.id = r.remote_ssh_config_id
             WHERE bj.status = 'sent'
-              AND bj.task_type IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete')
+              AND bj.task_type IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete', 'archive_lock')
             ORDER BY bj.queued_at ASC
         ");
     }
@@ -675,6 +1108,11 @@ class QueueManager
 
         if (!$mysqlConfig) return null;
 
+        // Trust the selected config for how its dump was written — a v2 archive
+        // (multiple DB configs) has no single top-level compress/per_database (#382).
+        if (isset($mysqlConfig['compress']))     $compress = (bool) $mysqlConfig['compress'];
+        if (isset($mysqlConfig['per_database'])) $perDatabase = (bool) $mysqlConfig['per_database'];
+
         $dumpDir = $mysqlConfig['dump_dir'] ?? '/home/bbs/mysql';
 
         // Build borg extract command: extract only the specific dump file(s) needed
@@ -790,13 +1228,15 @@ class QueueManager
 
         if (!$pgConfig) return null;
 
+        if (isset($pgConfig['compress'])) $compress = (bool) $pgConfig['compress'];
+
         $dumpDir = $pgConfig['dump_dir'] ?? '/home/bbs/pgdump';
 
         // Build borg extract command targeting only the specific dump file(s) needed
         $repo = ['path' => $archive['repo_path'], 'passphrase_encrypted' => $archive['passphrase_encrypted']];
         $extractPaths = [];
         $basePath = ltrim($dumpDir, '/');
-        $perDatabase = $dbInfo['per_database'] ?? true;
+        $perDatabase = $pgConfig['per_database'] ?? ($dbInfo['per_database'] ?? true);
         if ($perDatabase && !empty($databases)) {
             foreach ($databases as $db) {
                 $dbName = $db['database'] ?? '';
@@ -904,6 +1344,8 @@ class QueueManager
 
         if (!$mongoConfig) return null;
 
+        if (isset($mongoConfig['compress'])) $compress = (bool) $mongoConfig['compress'];
+
         $dumpDir = $mongoConfig['dump_dir'] ?? '/home/bbs/mongodump';
 
         // Build borg extract command targeting only the specific database directories needed
@@ -966,9 +1408,202 @@ class QueueManager
     }
 
     /**
+     * Build a restore_mssql task payload from a job record.
+     *
+     * The .bak files are extracted back to the Dump Directory they were
+     * written to, then the agent runs RESTORE DATABASE from there. For a
+     * Windows dump directory (C:\\ProgramData\\...) the archive holds the
+     * path as "C/ProgramData/...", so the drive letter is stripped and the
+     * extract runs with cwd C:\\ (same scheme as the file restore, #167).
+     */
+    private function buildRestoreMssqlPayload(array $job): ?array
+    {
+        $archiveId = $job['restore_archive_id'] ?? null;
+        if (!$archiveId) return null;
+
+        $archive = $this->db->fetchOne("
+            SELECT ar.archive_name, ar.databases_backed_up,
+                   r.path as repo_path, r.passphrase_encrypted,
+                   r.storage_type, r.remote_ssh_config_id,
+                   rsc.remote_port, rsc.ssh_private_key_encrypted as remote_ssh_key_encrypted,
+                   rsc.borg_remote_path
+            FROM archives ar
+            JOIN repositories r ON r.id = ar.repository_id
+            LEFT JOIN remote_ssh_configs rsc ON rsc.id = r.remote_ssh_config_id
+            WHERE ar.id = ?
+        ", [$archiveId]);
+
+        if (!$archive) return null;
+
+        $databases = json_decode($job['restore_databases'] ?? '[]', true) ?: [];
+
+        // Find mssql_dump plugin config: use specified config ID, or fall back to first available
+        $pluginManager = new PluginManager();
+        $mssqlConfig = null;
+
+        if (!empty($job['plugin_config_id'])) {
+            $payload = $pluginManager->buildTestPayload((int) $job['plugin_config_id']);
+            if ($payload && $payload['slug'] === 'mssql_dump') {
+                $mssqlConfig = $payload['config'];
+            }
+        }
+
+        if (!$mssqlConfig) {
+            foreach ($pluginManager->getPluginConfigs($job['agent_id']) as $c) {
+                if ($c['slug'] === 'mssql_dump') {
+                    $payload = $pluginManager->buildTestPayload((int) $c['id']);
+                    $mssqlConfig = $payload['config'] ?? null;
+                    break;
+                }
+            }
+        }
+
+        if (!$mssqlConfig) return null;
+
+        $dumpDir = $mssqlConfig['dump_dir'] ?? 'C:\\ProgramData\\BBS\\mssql';
+
+        // Work out the borg-side path of the dump directory.
+        $stripComponents = 0;
+        $cwd = '/';
+        if (preg_match('#^([A-Za-z]):[\\\\/]*(.*)$#', $dumpDir, $m)) {
+            $stripComponents = 1;
+            $cwd = strtoupper($m[1]) . ':\\';
+            $basePath = strtoupper($m[1]) . '/' . trim(str_replace('\\', '/', $m[2]), '/');
+        } else {
+            $basePath = ltrim($dumpDir, '/');
+        }
+        $basePath = rtrim($basePath, '/');
+
+        $extractPaths = [];
+        foreach ($databases as $db) {
+            $dbName = $db['database'] ?? '';
+            if ($dbName === '') continue;
+            $extractPaths[] = $basePath . '/' . PluginManager::mssqlDumpFileName($dbName);
+        }
+        if (empty($extractPaths)) {
+            $extractPaths[] = $basePath;
+        }
+
+        $repo = ['path' => $archive['repo_path'], 'passphrase_encrypted' => $archive['passphrase_encrypted']];
+        $cmd = BorgCommandBuilder::buildExtractCommand($repo, $archive['archive_name'], $extractPaths, $stripComponents);
+
+        // Handle remote SSH repos
+        $remoteSshConfig = null;
+        if (($archive['storage_type'] ?? 'local') === 'remote_ssh' && !empty($archive['remote_ssh_key_encrypted'])) {
+            $remoteSshConfig = [
+                'remote_port' => $archive['remote_port'] ?? 22,
+                'borg_remote_path' => $archive['borg_remote_path'] ?? null,
+            ];
+            $cmd = BorgCommandBuilder::appendRemotePath($cmd, $archive['borg_remote_path'] ?? null);
+        }
+
+        $env = BorgCommandBuilder::buildEnv($repo, true, $this->getSshPortForAgent($job['agent_id']), $remoteSshConfig);
+
+        $payload = [
+            'task' => 'restore_mssql',
+            'job_id' => $job['id'],
+            'command' => $cmd,
+            'env' => $env,
+            'cwd' => $cwd,
+            'databases' => $databases,
+            'mssql_config' => [
+                'host' => $mssqlConfig['host'] ?? 'localhost',
+                'port' => $mssqlConfig['port'] ?? 1433,
+                'user' => $mssqlConfig['user'] ?? '',
+                'password' => $mssqlConfig['password'] ?? '',
+                'trust_cert' => $mssqlConfig['trust_cert'] ?? true,
+                'dump_dir' => $dumpDir,
+                'compress' => $mssqlConfig['compress'] ?? false,
+                'cleanup_after' => $mssqlConfig['cleanup_after'] ?? true,
+                'safety_backup' => $mssqlConfig['safety_backup'] ?? true,
+                'safety_keep_days' => $mssqlConfig['safety_keep_days'] ?? 7,
+            ],
+        ];
+
+        // Include remote SSH key for agent
+        if ($remoteSshConfig && !empty($archive['remote_ssh_key_encrypted'])) {
+            try {
+                $payload['remote_ssh_key'] = Encryption::decrypt($archive['remote_ssh_key_encrypted']);
+            } catch (\Exception $e) {
+                $payload['remote_ssh_key'] = $archive['remote_ssh_key_encrypted'];
+            }
+        }
+
+        return $payload;
+    }
+
+    /**
      * Build an update_borg task payload with download URL and version info.
      * Uses the new two-mode system: 'official' or 'server'.
      */
+    /**
+     * Deferred shell-hook post-script: the same config the backup ran, sent
+     * back once the repository's own work is finished (#402).
+     *
+     * The context has to be carried explicitly. This job has no repository_id
+     * — deliberately, so the repo doesn't look busy and hold up other work —
+     * and no archive of its own, so the fields the agent turns into BBS_*
+     * variables have to come from the backup that triggered it. Without them
+     * every script saw BBS_REPO_PATH, BBS_ARCHIVE_NAME, BBS_CLIENT_NAME and
+     * BBS_BACKUP_PLAN as empty strings (#422).
+     */
+    private function buildPluginPostPayload(array $job): array
+    {
+        $pluginManager = new PluginManager();
+
+        $payload = [
+            'task' => 'plugin_post',
+            'job_id' => $job['id'],
+            'plugin' => $pluginManager->buildTestPayload((int) $job['plugin_config_id']),
+            // These two come off the job's own joins and are already correct.
+            'plan_name' => $job['plan_name'] ?? '',
+            'client_name' => $job['agent_name'] ?? '',
+            'directories' => $job['directories'] ?? '',
+            'archive_name' => '',
+            'repo_path' => '',
+        ];
+
+        $parentId = (int) ($job['parent_job_id'] ?? 0);
+        if ($parentId <= 0) {
+            return $payload;
+        }
+
+        $parent = $this->db->fetchOne("
+            SELECT bj.repository_id, r.path AS repo_path, r.passphrase_encrypted
+            FROM backup_jobs bj
+            LEFT JOIN repositories r ON r.id = bj.repository_id
+            WHERE bj.id = ?
+        ", [$parentId]);
+        if (!$parent) {
+            return $payload;
+        }
+
+        $payload['repo_path'] = $parent['repo_path'] ?? '';
+
+        // The archive the parent backup wrote, which is what a post-script
+        // syncing or verifying "the backup that just ran" needs to name.
+        $archive = $this->db->fetchOne(
+            "SELECT archive_name FROM archives WHERE backup_job_id = ? ORDER BY id DESC LIMIT 1",
+            [$parentId]
+        );
+        $payload['archive_name'] = $archive['archive_name'] ?? '';
+
+        // Only when the config asks for it: the agent writes the passphrase to
+        // a mode-0600 file and points BORG_PASSCOMMAND at it, so a hook can run
+        // borg against the repository it just filled.
+        $cfg = $payload['plugin']['config'] ?? [];
+        if (!empty($cfg['expose_passphrase']) && !empty($parent['passphrase_encrypted'])) {
+            try {
+                $payload['env'] = ['BORG_PASSPHRASE' => Encryption::decrypt($parent['passphrase_encrypted'])];
+            } catch (\Exception $e) {
+                // A repo whose passphrase won't decrypt is a bigger problem
+                // than this hook; let the script run without it.
+            }
+        }
+
+        return $payload;
+    }
+
     private function buildBorgUpdatePayload(array $job): array
     {
         $borgService = new BorgVersionService();

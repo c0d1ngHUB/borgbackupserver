@@ -42,11 +42,32 @@ class OidcService
     }
 
     /**
+     * This server's address for SSO redirects: Server Host from settings,
+     * else APP_URL. Never the request's Host header, which the client
+     * controls: a forged one would have the identity provider send the
+     * login code to another site. Null when neither is set.
+     */
+    public static function serverBaseUrl(bool $honourForwardedProto): ?string
+    {
+        $serverHost = trim((string) (\BBS\Core\Database::getInstance()->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'")['value'] ?? ''));
+        if ($serverHost !== '' && \BBS\Core\Config::isValidHost($serverHost)) {
+            $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+                || ($honourForwardedProto && ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+            return ($https ? 'https' : 'http') . '://' . $serverHost;
+        }
+        $appUrl = rtrim((string) ($_ENV['APP_URL'] ?? ''), '/');
+        return preg_match('#^https?://[^/\s]+$#', $appUrl) ? $appUrl : null;
+    }
+
+    /**
      * Build an OIDC client instance.
      */
     private function buildClient(string $redirectUri): OpenIDConnectClient
     {
         $providerUrl = rtrim($this->settings['oidc_provider_url'] ?? '', '/');
+        if (\BBS\Core\UrlGuard::blockedWhenHosted($providerUrl)) {
+            throw new \RuntimeException('The SSO provider URL must be a public address.');
+        }
         $clientId = $this->settings['oidc_client_id'] ?? '';
         $clientSecret = $this->settings['oidc_client_secret'] ?? '';
 
@@ -297,7 +318,7 @@ class OidcService
         }
 
         $providerUrl = rtrim($this->settings['oidc_provider_url'] ?? '', '/');
-        if (empty($providerUrl)) return null;
+        if (empty($providerUrl) || \BBS\Core\UrlGuard::blockedWhenHosted($providerUrl)) return null;
 
         // Fetch discovery document
         $discoveryUrl = $providerUrl . '/.well-known/openid-configuration';

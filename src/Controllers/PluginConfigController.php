@@ -33,13 +33,7 @@ class PluginConfigController extends Controller
     {
         if (!\BBS\Core\Config::isHosted()) return $config;
         $row = $this->db->fetchOne("SELECT slug FROM plugins WHERE id = ?", [$pluginId]);
-        if (!$row || ($row['slug'] ?? '') !== 's3_sync') return $config;
-
-        $config['credential_source'] = 'global';
-        foreach (['endpoint', 'region', 'bucket', 'access_key', 'secret_key'] as $field) {
-            unset($config[$field]);
-        }
-        return $config;
+        return PluginManager::hostedConfig((string) ($row['slug'] ?? ''), $config);
     }
 
     private function sanitizeHostedConfigByConfigId(int $configId, array $config): array
@@ -78,6 +72,12 @@ class PluginConfigController extends Controller
 
         $config = $this->sanitizeHostedConfig($pluginId, $config);
 
+        $slugRow = $this->db->fetchOne("SELECT slug FROM plugins WHERE id = ?", [$pluginId]);
+        if (($hookProblem = PluginManager::configProblem((string) ($slugRow['slug'] ?? ''), $config, $this->isAdmin())) !== null) {
+            $this->flash('danger', $hookProblem);
+            $this->redirect("/clients/{$id}?tab=plugins");
+        }
+
         // Duplicate names hit the unique_agent_config_name key — catch it
         // up front instead of surfacing a raw PDOException
         $duplicate = $this->db->fetchOne(
@@ -94,7 +94,7 @@ class PluginConfigController extends Controller
 
         // Warn if S3 config uses global credentials but globals are empty
         $plugin = $this->db->fetchOne("SELECT slug FROM plugins WHERE id = ?", [$pluginId]);
-        if ($plugin && $plugin['slug'] === 's3_sync' && ($config['credential_source'] ?? 'global') === 'global') {
+        if ($plugin && $plugin['slug'] === 's3_sync' && ($config['target_type'] ?? 's3') === 's3' && ($config['credential_source'] ?? 'global') === 'global') {
             $bucket = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 's3_bucket'");
             if (empty($bucket['value'])) {
                 $this->flash('warning', "S3 config saved, but Global S3 Settings are not configured yet. Go to <a href='/settings#s3'>Settings &rarr; S3</a> to set them up.");
@@ -110,6 +110,22 @@ class PluginConfigController extends Controller
      * Update a named plugin config.
      * POST /clients/{id}/plugin-configs/{configId}/edit
      */
+    /**
+     * Resolve a plugin config that belongs to this agent.
+     *
+     * Access to the agent is NOT access to an arbitrary config id — the id
+     * comes straight off the URL, so every config-scoped action has to check
+     * both or a user can reach another tenant's configs (the class of bug in
+     * GHSA-vm4w-wwpg-v3rc).
+     */
+    private function configForAgent(int $agentId, int $configId): ?array
+    {
+        return $this->db->fetchOne(
+            "SELECT * FROM plugin_configs WHERE id = ? AND agent_id = ?",
+            [$configId, $agentId]
+        ) ?: null;
+    }
+
     public function update(int $id, int $configId): void
     {
         $this->requireAuth();
@@ -118,6 +134,11 @@ class PluginConfigController extends Controller
         if (!$this->getAgent($id)) {
             $this->flash('danger', 'Access denied.');
             $this->redirect('/clients');
+        }
+
+        if (!$this->configForAgent($id, $configId)) {
+            $this->flash('danger', 'Plugin configuration not found for this client.');
+            $this->redirect("/clients/{$id}?tab=plugins");
         }
 
         $name = trim($_POST['name'] ?? '');
@@ -129,6 +150,12 @@ class PluginConfigController extends Controller
         }
 
         $config = $this->sanitizeHostedConfigByConfigId($configId, $config);
+
+        $slugRow = $this->db->fetchOne("SELECT p.slug FROM plugin_configs pc JOIN plugins p ON p.id = pc.plugin_id WHERE pc.id = ?", [$configId]);
+        if (($hookProblem = PluginManager::configProblem((string) ($slugRow['slug'] ?? ''), $config, $this->isAdmin())) !== null) {
+            $this->flash('danger', $hookProblem);
+            $this->redirect("/clients/{$id}?tab=plugins");
+        }
 
         // Renaming to another config's name would hit the same unique key
         $duplicate = $this->db->fetchOne(
@@ -164,6 +191,11 @@ class PluginConfigController extends Controller
             $this->redirect('/clients');
         }
 
+        if (!$this->configForAgent($id, $configId)) {
+            $this->flash('danger', 'Plugin configuration not found for this client.');
+            $this->redirect("/clients/{$id}?tab=plugins");
+        }
+
         // Check if this S3 config is in use by any repository
         $inUse = $this->db->fetchOne("
             SELECT r.name FROM repository_s3_configs rsc
@@ -173,7 +205,7 @@ class PluginConfigController extends Controller
         ", [$configId]);
 
         if ($inUse) {
-            $this->flash('danger', "Cannot delete — this S3 config is in use by repository \"{$inUse['name']}\". Disable S3 sync on the repository first.");
+            $this->flash('danger', "Cannot delete — this offsite sync destination is used by repository \"{$inUse['name']}\". Turn off offsite sync for that repository first.");
             $this->redirect("/clients/{$id}?tab=plugins");
         }
 
@@ -199,23 +231,29 @@ class PluginConfigController extends Controller
             $this->json(['error' => 'Access denied'], 403);
         }
 
-        // Check if this is an S3 plugin config — test runs server-side (rclone is on the server)
+        // The config must belong to THIS agent. Access to the agent is not
+        // access to an arbitrary config id: unscoped, a user could test
+        // another tenant's S3 config, using their credentials and reading
+        // their bucket name back out of the success message (same class as
+        // GHSA-vm4w-wwpg-v3rc).
         $pluginSlug = $this->db->fetchOne("
-            SELECT p.slug FROM plugin_configs pc
+            SELECT p.slug, pc.config FROM plugin_configs pc
             JOIN plugins p ON p.id = pc.plugin_id
-            WHERE pc.id = ?
-        ", [$configId]);
+            WHERE pc.id = ? AND pc.agent_id = ?
+        ", [$configId, $id]);
 
-        if ($pluginSlug && $pluginSlug['slug'] === 's3_sync') {
-            $config = $this->db->fetchOne("SELECT config FROM plugin_configs WHERE id = ?", [$configId]);
-            $configData = json_decode($config['config'] ?? '{}', true) ?: [];
+        if (!$pluginSlug) {
+            $this->json(['error' => 'Plugin configuration not found for this client'], 404);
+        }
+
+        if ($pluginSlug['slug'] === 's3_sync') {
+            $configData = json_decode($pluginSlug['config'] ?? '{}', true) ?: [];
 
             $s3Service = new S3SyncService();
-            $creds = $s3Service->resolveCredentials($configData);
-            $result = $s3Service->testConnection($creds);
+            $result = $s3Service->testConnection($s3Service->resolveDestination($configData));
 
             if ($result['success']) {
-                $this->json(['status' => 'completed', 'message' => "S3 connection successful. Bucket: {$creds['bucket']}"]);
+                $this->json(['status' => 'completed', 'message' => 'Connected to ' . ($result['label'] ?: 'the destination')]);
             } else {
                 $this->json(['status' => 'failed', 'error' => $result['error']]);
             }
@@ -253,7 +291,7 @@ class PluginConfigController extends Controller
 
         // Get the latest plugin_test job for this config
         $job = $this->db->fetchOne("
-            SELECT id, status, error_log, completed_at
+            SELECT id, status, error_log, completed_at, task_result
             FROM backup_jobs
             WHERE agent_id = ? AND task_type = 'plugin_test' AND plugin_config_id = ?
             ORDER BY queued_at DESC LIMIT 1
@@ -277,6 +315,11 @@ class PluginConfigController extends Controller
             $response['message'] = $log
                 ? str_replace('Plugin test output: ', '', $log['message'])
                 : 'Test completed successfully.';
+            // Structured result of the test (SQL Server: databases found)
+            $structured = json_decode((string) ($job['task_result'] ?? ''), true);
+            if (is_array($structured) && isset($structured['databases']) && is_array($structured['databases'])) {
+                $response['databases'] = array_values(array_map('strval', $structured['databases']));
+            }
         }
 
         $this->json($response);

@@ -124,6 +124,59 @@ class QueueController extends Controller
         ] + $stats);
     }
 
+    /** A dry run job and its client (for the full list), or [null, null]. */
+    private function dryRunJob(int $id): array
+    {
+        $job = $this->db->fetchOne(
+            "SELECT id, agent_id, task_type FROM backup_jobs WHERE id = ? AND task_type = 'backup_dry_run'",
+            [$id]
+        );
+        $agent = $job ? $this->db->fetchOne("SELECT id, ssh_home_dir FROM agents WHERE id = ?", [$job['agent_id']]) : null;
+        return [$job ?: null, $agent ?: null];
+    }
+
+    /** GET /queue/{id}/dry-run-log: the dry run's full file list (#414). */
+    public function dryRunLog(int $id): void
+    {
+        $this->requireAuth();
+        [$job, $agent] = $this->dryRunJob($id);
+        if (!$job || !$this->canAccessAgent((int) $job['agent_id'])) {
+            $this->flash('danger', 'Job not found.');
+            $this->redirect('/queue');
+        }
+        $fh = \BBS\Services\DryRunLogService::open($job, $agent);
+        if (!$fh) {
+            $this->flash('warning', 'The full list for this dry run is no longer available. Lists are kept for one day.');
+            $this->redirect("/queue/{$id}");
+        }
+        \BBS\Services\DryRunLogService::send($fh, $id);
+    }
+
+    /** POST /queue/{id}/dry-run-log/delete: delete that list, and only that. */
+    public function deleteDryRunLog(int $id): void
+    {
+        $this->requireAuth();
+        $this->verifyCsrf();
+        [$job, $agent] = $this->dryRunJob($id);
+        if (!$job || !$this->canAccessAgent((int) $job['agent_id'])) {
+            $this->flash('danger', 'Job not found.');
+            $this->redirect('/queue');
+        }
+        $this->requirePermission(PermissionService::TRIGGER_BACKUP, (int) $job['agent_id']);
+        if (\BBS\Services\DryRunLogService::delete($job, $agent)) {
+            $this->db->insert('server_log', [
+                'agent_id' => $job['agent_id'],
+                'backup_job_id' => $id,
+                'level' => 'info',
+                'message' => "Dry run file list deleted by " . ($_SESSION['username'] ?? 'a user'),
+            ]);
+            $this->flash('success', 'Dry run file list deleted.');
+        } else {
+            $this->flash('warning', 'There was no file list to delete.');
+        }
+        $this->redirect("/queue/{$id}");
+    }
+
     public function detail(int $id): void
     {
         $this->requireAuth();
@@ -132,7 +185,8 @@ class QueueController extends Controller
             SELECT bj.*, a.name as agent_name, a.id as agent_id,
                    a.status as agent_status, a.last_heartbeat,
                    r.name as repo_name, bp.name as plan_name,
-                   bp.directories, bp.excludes, bp.advanced_options
+                   bp.excludes, bp.advanced_options,
+                   COALESCE(bj.directories, bp.directories) AS directories
             FROM backup_jobs bj
             JOIN agents a ON a.id = bj.agent_id
             LEFT JOIN repositories r ON r.id = bj.repository_id
@@ -145,12 +199,36 @@ class QueueController extends Controller
             $this->redirect('/queue');
         }
 
+        // The back arrow returns to the page that linked here (a client's
+        // repository tab, a repository page, the dashboard), not always to
+        // the queue (#469). Same-origin referrers only, and never another
+        // job page, which is where a retry or cancel lands.
+        $backUrl = '/queue';
+        $ref = parse_url($_SERVER['HTTP_REFERER'] ?? '');
+        $host = strtolower(explode(':', $_SERVER['HTTP_HOST'] ?? '')[0]);
+        if (!empty($ref['path']) && $ref['path'][0] === '/'
+            && (empty($ref['host']) || strtolower($ref['host']) === $host)
+            && !preg_match('#^/queue/\d+#', $ref['path'])
+            && !preg_match('#^/(login|logout)#', $ref['path'])) {
+            $backUrl = $ref['path'] . (isset($ref['query']) ? '?' . $ref['query'] : '');
+        }
+
         // Get log entries for this job
         $logs = $this->db->fetchAll("
             SELECT * FROM server_log
             WHERE backup_job_id = ?
             ORDER BY created_at ASC
         ", [$id]);
+
+        // The archive this backup wrote — its deduplicated size is the cost
+        // of the backup on disk, which the frozen byte counters can't say.
+        $jobArchive = null;
+        if (($job['task_type'] ?? '') === 'backup') {
+            $jobArchive = $this->db->fetchOne(
+                "SELECT archive_name, original_size, deduplicated_size FROM archives
+                 WHERE backup_job_id = ? ORDER BY id DESC LIMIT 1", [$id]
+            );
+        }
 
         // Queue context: active count, max queue, position
         $activeCount = $this->db->count('backup_jobs', "status IN ('sent', 'running')");
@@ -165,18 +243,29 @@ class QueueController extends Controller
         // For prune jobs, parse the log entries for keep rules and per-rule counts
         $pruneStats = null;
         if ($job['task_type'] === 'prune') {
-            $pruneStats = $this->parsePruneStats($logs);
+            $pruneStats = self::parsePruneStats($logs);
+        }
+
+        // A dry run's full file list, while it is kept (#414)
+        $dryRunLog = null;
+        if ($job['task_type'] === 'backup_dry_run') {
+            [$dryJob, $dryAgent] = $this->dryRunJob($id);
+            $dryRunLog = $dryJob ? \BBS\Services\DryRunLogService::info($dryJob, $dryAgent) : null;
         }
 
         $this->view('queue/detail', [
             'pageTitle' => 'Job #' . $id,
+            'dryRunLog' => $dryRunLog,
+            'canDeleteDryRunLog' => $dryRunLog !== null && $this->hasPermission(PermissionService::TRIGGER_BACKUP, (int) $job['agent_id']),
             'job' => $job,
+            'jobArchive' => $jobArchive,
             'logs' => $logs,
             'activeCount' => $activeCount,
             'maxQueue' => $maxQueue,
             'queuePosition' => $queuePosition,
             'pollInterval' => $pollInterval,
             'pruneStats' => $pruneStats,
+            'backUrl' => $backUrl,
         ]);
     }
 
@@ -188,7 +277,8 @@ class QueueController extends Controller
             SELECT bj.*, a.name as agent_name, a.id as agent_id,
                    a.status as agent_status, a.last_heartbeat,
                    r.name as repo_name, bp.name as plan_name,
-                   bp.directories, bp.excludes, bp.advanced_options
+                   bp.excludes, bp.advanced_options,
+                   COALESCE(bj.directories, bp.directories) AS directories
             FROM backup_jobs bj
             JOIN agents a ON a.id = bj.agent_id
             LEFT JOIN repositories r ON r.id = bj.repository_id
@@ -217,6 +307,14 @@ class QueueController extends Controller
             $queuePosition = (int) $pos['cnt'];
         }
 
+        $jobArchive = null;
+        if (($job['task_type'] ?? '') === 'backup') {
+            $jobArchive = $this->db->fetchOne(
+                "SELECT archive_name, original_size, deduplicated_size FROM archives
+                 WHERE backup_job_id = ? ORDER BY id DESC LIMIT 1", [$id]
+            );
+        }
+
         // For running backup jobs, tail the catalog log file to get the current file being backed up
         $currentFile = null;
         if ($job['status'] === 'running' && $job['task_type'] === 'backup') {
@@ -225,13 +323,7 @@ class QueueController extends Controller
                 $catalogPath = $jobAgent['ssh_home_dir']
                              . '/.catalog-logs/catalog-' . $id . '.jsonl';
                 if (file_exists($catalogPath)) {
-                    $lastLine = trim(shell_exec('tail -n 1 ' . escapeshellarg($catalogPath)) ?? '');
-                    if ($lastLine) {
-                        $entry = json_decode($lastLine, true);
-                        if ($entry && !empty($entry['path'])) {
-                            $currentFile = rtrim($entry['path'], '/');
-                        }
-                    }
+                    $currentFile = $this->currentCatalogFile($catalogPath);
                 }
             }
         }
@@ -244,14 +336,16 @@ class QueueController extends Controller
             'maxQueue' => $maxQueue,
             'queuePosition' => $queuePosition,
             'currentFile' => $currentFile,
+            'archive' => $jobArchive,
         ]);
     }
 
     /**
      * Parse prune-specific stats from server_log entries for a job.
      * Returns keep rules (from command), kept/deleted counts, and per-rule counts where available.
+     * Public static so the token API's job-detail endpoint can reuse it.
      */
-    private function parsePruneStats(array $logs): array
+    public static function parsePruneStats(array $logs): array
     {
         $stats = [
             'keep_rules' => [],       // ['hourly' => 6, 'daily' => 14, ...]
@@ -346,7 +440,7 @@ class QueueController extends Controller
         ]);
 
         // Auto-queue a break-lock to clean up any stale borg lock
-        if ($job['repository_id'] && in_array($job['task_type'], ['backup', 'restore', 'restore_mysql', 'restore_pg', 'restore_mongo'])) {
+        if ($job['repository_id'] && in_array($job['task_type'], ['backup', 'restore', 'restore_mysql', 'restore_pg', 'restore_mongo', 'restore_mssql'])) {
             $this->db->insert('backup_jobs', [
                 'agent_id' => $job['agent_id'],
                 'repository_id' => $job['repository_id'],
@@ -377,7 +471,8 @@ class QueueController extends Controller
         }
 
         // Require trigger_backup permission to retry jobs
-        $this->requirePermission(PermissionService::TRIGGER_BACKUP, $job['agent_id']);
+        // Re-running a job needs the permission the job itself needs
+        $this->requirePermission(PermissionService::forTaskType((string) $job['task_type']), $job['agent_id']);
 
         // Create a new queued job based on the failed one
         $newJobId = $this->db->insert('backup_jobs', [

@@ -11,14 +11,14 @@ class DashboardController extends Controller
     /** Category → task_type list, for filtering the Recently Completed panel. */
     private const RECENT_JOB_CATEGORIES = [
         'backup'  => ['backup'],
-        'restore' => ['restore', 'restore_mysql', 'restore_pg', 'restore_mongo', 's3_restore'],
+        'restore' => ['restore', 'restore_mysql', 'restore_pg', 'restore_mongo', 'restore_mssql', 's3_restore'],
         'prune'   => ['prune'],
         'compact' => ['compact'],
         's3'      => ['s3_sync'],
         'other'   => [
             'check', 'repo_check', 'repo_repair', 'break_lock',
             'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full',
-            'archive_delete', 'update_borg', 'update_agent', 'plugin_test',
+            'archive_delete', 'archive_lock', 'update_borg', 'update_agent', 'plugin_test', 'plugin_post',
         ],
     ];
 
@@ -60,7 +60,7 @@ class DashboardController extends Controller
     {
         // --- Storage locations: per-location df + repo/archive counts ---
         $locations = $this->db->fetchAll("
-            SELECT sl.id, sl.label, sl.path, sl.is_default,
+            SELECT sl.id, sl.label, sl.path, sl.is_default, sl.capacity_bytes,
                    (SELECT COUNT(*) FROM repositories r
                      WHERE (r.storage_location_id = sl.id)
                         OR (sl.is_default = 1 AND r.storage_location_id IS NULL
@@ -74,7 +74,11 @@ class DashboardController extends Controller
         ");
         $storageLocations = [];
         foreach ($locations as $loc) {
-            $disk = ServerStats::getDiskUsage($loc['path']);
+            // Capacity-aware: a stated capacity (WebDAV and other mounts df
+            // can't see, #415) wins over df, and an untrusted mount with no
+            // stated size shows nothing rather than the cache disk's numbers
+            // (#454 — the storage page already did this; the dashboard didn't).
+            $disk = ServerStats::capacityForLocation($loc);
             $storageLocations[] = [
                 'kind' => 'local',
                 'id' => (int) $loc['id'],
@@ -90,12 +94,44 @@ class DashboardController extends Controller
             ];
         }
 
-        // --- Remote SSH storage ---
+        // --- BorgBase accounts: one entry per account, not per repo ---
+        $bbAccounts = $this->db->fetchAll("
+            SELECT ba.id, ba.name, ba.plan_name, ba.plan_max_size_gb, ba.usage_bytes, ba.remote_repo_count, ba.checked_at,
+                   (SELECT COUNT(*) FROM repositories r JOIN remote_ssh_configs rsc ON rsc.id = r.remote_ssh_config_id WHERE rsc.borgbase_account_id = ba.id) AS repo_count,
+                   (SELECT COALESCE(SUM(r.size_bytes), 0) FROM repositories r JOIN remote_ssh_configs rsc ON rsc.id = r.remote_ssh_config_id WHERE rsc.borgbase_account_id = ba.id) AS repo_bytes
+            FROM borgbase_accounts ba
+            ORDER BY ba.name
+        ");
+        foreach ($bbAccounts as $ba) {
+            $total = $ba['plan_max_size_gb'] !== null ? (int) $ba['plan_max_size_gb'] * 1000 * 1000 * 1000 : null;
+            $used = $ba['usage_bytes'] !== null ? (int) $ba['usage_bytes'] : null;
+            $free = ($total !== null && $used !== null) ? max(0, $total - $used) : null;
+            $pct = ($total && $used !== null) ? round(($used / $total) * 100, 1) : null;
+            $storageLocations[] = [
+                'kind' => 'remote',
+                'provider' => 'borgbase',
+                'borgbase_account_id' => (int) $ba['id'],
+                'id' => (int) $ba['id'],
+                'label' => $ba['name'],
+                'path' => ($ba['plan_name'] ? $ba['plan_name'] . ' · ' : '') . (int) ($ba['remote_repo_count'] ?? 0) . ' repos on BorgBase',
+                'is_default' => false,
+                'repo_count' => (int) $ba['repo_count'],
+                'repo_bytes' => (int) $ba['repo_bytes'],
+                'disk_total' => $total,
+                'disk_used' => $used,
+                'disk_free' => $free,
+                'disk_percent' => $pct,
+                'borgbase_usage_source' => 'borgbase_api',
+            ];
+        }
+
+        // --- Remote SSH storage (locations not grouped under an account) ---
         $remotes = $this->db->fetchAll("
             SELECT id, name, provider, remote_host, remote_user, disk_total_bytes, disk_used_bytes, disk_free_bytes, disk_checked_at, borgbase_usage_source,
                    (SELECT COUNT(*) FROM repositories r WHERE r.remote_ssh_config_id = remote_ssh_configs.id) AS repo_count,
                    (SELECT COALESCE(SUM(size_bytes), 0) FROM repositories r WHERE r.remote_ssh_config_id = remote_ssh_configs.id) AS repo_bytes
             FROM remote_ssh_configs
+            WHERE borgbase_account_id IS NULL
             ORDER BY name
         ");
         foreach ($remotes as $rc) {
@@ -266,12 +302,12 @@ class DashboardController extends Controller
                 '1min' => $cpu['1min'] ?? 0,
                 'cores' => $cpu['cores'] ?? 1,
             ],
-            'memory' => [
-                'percent' => $mem['percent'] ?? 0,
-                'used_label' => ServerStats::formatBytes($mem['used'] ?? 0),
-                'total_label' => ServerStats::formatBytes($mem['total'] ?? 0),
-                'pair_label' => ServerStats::formatBytesPair((int) ($mem['used'] ?? 0), (int) ($mem['total'] ?? 0)),
-            ],
+            'memory' => $mem ? [
+                'percent' => $mem['percent'],
+                'used_label' => ServerStats::formatBytes($mem['used']),
+                'total_label' => ServerStats::formatBytes($mem['total']),
+                'pair_label' => ServerStats::formatBytesPair((int) $mem['used'], (int) $mem['total']),
+            ] : null,
             'net' => $net ? [
                 'rx_bps' => $net['rx_bps'],
                 'tx_bps' => $net['tx_bps'],
@@ -320,12 +356,17 @@ class DashboardController extends Controller
 
         $activeJobs = $this->db->fetchAll("
             SELECT bj.id, bj.task_type, bj.status, bj.files_total, bj.files_processed,
+                   bj.bytes_total, bj.bytes_processed,
                    a.name as agent_name, r.name as repo_name
             FROM backup_jobs bj
             JOIN agents a ON a.id = bj.agent_id
             LEFT JOIN repositories r ON r.id = bj.repository_id
             WHERE bj.status IN ('queued', 'running', 'sent') {$jobScope}
-            ORDER BY bj.queued_at ASC
+            -- id is the tiebreaker: several jobs queued in the same second
+            -- (a plan queues backup, prune and sync together) otherwise come
+            -- back in an order MySQL is free to vary between polls, so the
+            -- widget reshuffled every 10s (#503).
+            ORDER BY bj.queued_at ASC, bj.id ASC
         ", $agentParams);
 
         $runningJobs = 0;
@@ -337,7 +378,7 @@ class DashboardController extends Controller
 
         // Tile links to /log?level=error&hours=24, so count only what that
         // page renders. See getDashboardData() for the rationale (#235).
-        $errorCountQuery = "SELECT COUNT(*) as cnt FROM server_log sl LEFT JOIN agents a ON a.id = sl.agent_id WHERE sl.level = 'error' AND sl.created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)";
+        $errorCountQuery = "SELECT COUNT(*) as cnt FROM server_log sl LEFT JOIN agents a ON a.id = sl.agent_id WHERE sl.level = 'error' AND sl.resolved_at IS NULL AND sl.created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)";
         if ($agentWhere !== '1=1') {
             $errorCountQuery .= " AND ({$agentWhere} OR sl.agent_id IS NULL)";
         }
@@ -350,9 +391,15 @@ class DashboardController extends Controller
             'queuedJobs'  => $queuedJobs,
             'errorCount'  => $errorCount,
             'activeJobs'  => array_map(static function ($j) {
-                $pct = ((int) ($j['files_total'] ?? 0)) > 0
-                    ? (int) round(((int) $j['files_processed'] / (int) $j['files_total']) * 100)
-                    : null;
+                // File counts when the total is known (backups pre-count;
+                // restores get it from the catalog at queue time), else byte
+                // totals from borg extract's progress stream. Clamped at 100.
+                $pct = null;
+                if (((int) ($j['files_total'] ?? 0)) > 0) {
+                    $pct = min(100, (int) round(((int) $j['files_processed'] / (int) $j['files_total']) * 100));
+                } elseif (((int) ($j['bytes_total'] ?? 0)) > 0 && ((int) ($j['bytes_processed'] ?? 0)) > 0) {
+                    $pct = min(100, (int) round(((int) $j['bytes_processed'] / (int) $j['bytes_total']) * 100));
+                }
                 return [
                     'id'          => (int) $j['id'],
                     'agent_name'  => $j['agent_name'],
@@ -393,7 +440,7 @@ class DashboardController extends Controller
             SELECT sl.message, a.name as agent_name
             FROM server_log sl
             LEFT JOIN agents a ON a.id = sl.agent_id
-            WHERE sl.level = 'error' AND sl.created_at > ?
+            WHERE sl.level = 'error' AND sl.resolved_at IS NULL AND sl.created_at > ?
         ";
         $errParams = [$since];
         if ($agentWhere !== '1=1') {
@@ -405,18 +452,7 @@ class DashboardController extends Controller
 
         $toasts = [];
         foreach ($jobs as $job) {
-            $label = match($job['task_type']) {
-                'backup' => 'Backup',
-                'restore', 'restore_mysql', 'restore_pg', 'restore_mongo' => 'Restore',
-                'update_agent' => 'Agent Update',
-                'update_borg' => 'Borg Update',
-                'plugin_test' => 'Plugin Test',
-                'prune' => 'Prune',
-                'compact' => 'Compact',
-                'catalog_rebuild' => 'Catalog Rebuild',
-                'catalog_rebuild_full' => 'Catalog Rebuild (Full)',
-                default => ucfirst($job['task_type']),
-            };
+            $label = \BBS\Core\JobType::label($job['task_type']);
             if ($job['status'] === 'running') {
                 $toasts[] = ['message' => "{$job['agent_name']}: {$label} started", 'type' => 'info'];
             } elseif ($job['status'] === 'completed') {
@@ -469,7 +505,7 @@ class DashboardController extends Controller
         // endpoint and the scheduler's stale/zombie sweepers, so they're
         // captured here without a separate count. Operational alerts
         // (agent_offline, missed_schedule) live in /notifications.
-        $errorCountQuery = "SELECT COUNT(*) as cnt FROM server_log sl LEFT JOIN agents a ON a.id = sl.agent_id WHERE sl.level = 'error' AND sl.created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)";
+        $errorCountQuery = "SELECT COUNT(*) as cnt FROM server_log sl LEFT JOIN agents a ON a.id = sl.agent_id WHERE sl.level = 'error' AND sl.resolved_at IS NULL AND sl.created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)";
         if ($agentWhere !== '1=1') {
             $errorCountQuery .= " AND ({$agentWhere} OR sl.agent_id IS NULL)";
         }
@@ -555,7 +591,7 @@ class DashboardController extends Controller
         $logErrorsChartQuery = "SELECT DATE_FORMAT(sl.created_at, '%Y-%m-%d %H:00') as hour, COUNT(*) as count
                                   FROM server_log sl
                                   LEFT JOIN agents a ON a.id = sl.agent_id
-                                 WHERE sl.level = 'error'
+                                 WHERE sl.level = 'error' AND sl.resolved_at IS NULL
                                    AND sl.created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)";
         if ($agentWhere !== '1=1') {
             $logErrorsChartQuery .= " AND ({$agentWhere} OR sl.agent_id IS NULL)";
@@ -566,7 +602,7 @@ class DashboardController extends Controller
         // Group task types into 3 categories
         $categoryMap = [
             'backup' => 'backups',
-            'restore' => 'restores', 'restore_mysql' => 'restores', 'restore_pg' => 'restores', 'restore_mongo' => 'restores',
+            'restore' => 'restores', 'restore_mysql' => 'restores', 'restore_pg' => 'restores', 'restore_mongo' => 'restores', 'restore_mssql' => 'restores',
             's3_sync' => 's3_sync',
         ];
         // Index by hour+category
@@ -684,13 +720,14 @@ class DashboardController extends Controller
             }
 
             // Remote SSH storage
-            $remoteConfigs = $db->fetchAll("SELECT id, name, provider, remote_host, remote_user, disk_total_bytes, disk_used_bytes, disk_free_bytes, disk_checked_at FROM remote_ssh_configs ORDER BY name");
+            $remoteConfigs = $db->fetchAll("SELECT id, name, provider, remote_host, remote_user, disk_total_bytes, disk_used_bytes, disk_free_bytes, disk_checked_at, borgbase_account_id FROM remote_ssh_configs ORDER BY name");
             $remoteStorage = [];
             foreach ($remoteConfigs as $rc) {
                 $entry = [
                     'id' => (int) $rc['id'],
                     'name' => $rc['name'],
                     'provider' => $rc['provider'],
+                    'borgbase_account_id' => $rc['borgbase_account_id'] !== null ? (int) $rc['borgbase_account_id'] : null,
                     'host' => $rc['remote_user'] . '@' . $rc['remote_host'],
                     'disk_total' => $rc['disk_total_bytes'] !== null ? (int) $rc['disk_total_bytes'] : null,
                     'disk_used' => $rc['disk_used_bytes'] !== null ? (int) $rc['disk_used_bytes'] : null,

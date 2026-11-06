@@ -29,17 +29,28 @@ class SettingsController extends Controller
             $settings[$row['key']] = $row['value'];
         }
 
+        // Only for the SSL page — the status shells out to certbot and
+        // openssl, which no other page needs to pay for.
+        $certificate = null;
+        if ($activeTab === 'ssl') {
+            $certificate = (new \BBS\Services\CertificateService())->status();
+        }
+
         $templates = $this->db->fetchAll("SELECT * FROM backup_templates ORDER BY name");
+        $clientProfiles = (new \BBS\Services\ClientProfileService())->all();
 
         $oidcUsers = $this->db->fetchAll("SELECT id, username, email, role FROM users ORDER BY username");
 
         // Exclude platform-kind tokens — those belong to the hosted platform,
         // not the customer, and must not appear on the user-facing list.
+        // Device tokens minted by password/SSO sign-in ARE shown so an admin
+        // can see and revoke them from here.
         $apiTokens = $this->db->fetchAll("
-            SELECT t.id, t.name, t.created_at, t.last_used_at, t.can_read_secrets, u.username
+            SELECT t.id, t.name, t.kind, t.device_name, t.last_seen_ip,
+                   t.created_at, t.last_used_at, t.can_read_secrets, u.username
             FROM api_tokens t
             JOIN users u ON u.id = t.user_id
-            WHERE t.kind = 'user'
+            WHERE t.kind IN ('user', 'mobile', 'metrics')
             ORDER BY t.created_at
         ");
 
@@ -60,10 +71,123 @@ class SettingsController extends Controller
             'pageTitle' => 'Settings',
             'settings' => $settings,
             'templates' => $templates,
+            'clientProfiles' => $clientProfiles,
             'apiTokens' => $apiTokens,
             'oidcUsers' => $oidcUsers,
             'smtpWarning' => $smtpWarning,
+            'certificate' => $certificate,
         ]);
+    }
+
+    /**
+     * POST /settings/ssl/renew — the Renew button.
+     *
+     * certbot's own output comes back verbatim. It explains a refusal ("not
+     * due for renewal") and a failure better than a summary would, and the
+     * page shows it.
+     */
+    /**
+     * POST /settings/upgrade/cancel — stop waiting for the queue to drain.
+     *
+     * Only meaningful while an upgrade is queued behind running jobs. Once it
+     * has actually started there is nothing to cancel.
+     */
+    public function cancelUpgrade(): void
+    {
+        $this->requireAdmin();
+        $this->verifyCsrf();
+
+        $svc = new \BBS\Services\UpdateService();
+        $svc->cancelPendingUpgrade();
+
+        $this->db->insert('server_log', [
+            'level' => 'info',
+            'message' => 'Waiting upgrade cancelled',
+        ]);
+
+        $this->flash('success', 'Upgrade cancelled. The queue is running again.');
+        $this->redirect('/settings?tab=updates');
+    }
+
+    public function sslRenew(): void
+    {
+        $this->requireAdmin();
+        $this->verifyCsrf();
+
+        $force = !empty($_POST['force']);
+        $result = (new \BBS\Services\CertificateService())->renew(null, $force);
+
+        $this->db->insert('server_log', [
+            'level' => $result['success'] ? 'info' : 'warning',
+            'message' => 'Certificate renewal requested from Settings — '
+                . ($result['success'] ? 'completed' : 'failed'),
+        ]);
+
+        $this->json([
+            'status' => $result['success'] ? 'ok' : 'error',
+            'output' => $result['output'],
+        ]);
+    }
+
+    /** POST /settings/ssl/email — the Let's Encrypt contact address. */
+    public function sslEmail(): void
+    {
+        $this->requireAdmin();
+        $this->verifyCsrf();
+
+        $email = trim($_POST['ssl_email'] ?? '');
+        if ($email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $this->flash('danger', 'That is not a valid email address.');
+            $this->redirect('/settings?tab=ssl');
+        }
+
+        $result = (new \BBS\Services\CertificateService())->setContactEmail($email);
+        if ($result['success']) {
+            // Remembered so the field shows what is set. certbot holds the
+            // authoritative copy on the ACME account; this is for display.
+            $this->db->query(
+                "INSERT INTO settings (`key`, `value`) VALUES ('ssl_contact_email', ?)
+                 ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)",
+                [$email]
+            );
+            $this->flash('success', $email === ''
+                ? 'Contact address cleared. Let\'s Encrypt will not send expiry warnings.'
+                : "Expiry warnings will be sent to {$email}.");
+        } else {
+            $this->flash('danger', 'Could not update the contact address: ' . $result['output']);
+        }
+        $this->redirect('/settings?tab=ssl');
+    }
+
+    /**
+     * The certificate on this server is not the one clients see: TLS is
+     * terminated on a proxy in front, and the local certificate only covers
+     * the proxy-to-Apache hop, or nothing at all. With this on, the daily
+     * expiry check is skipped and any warning it raised is cleared.
+     */
+    public function sslExternal(): void
+    {
+        $this->requireAdmin();
+        $this->verifyCsrf();
+
+        $external = !empty($_POST['certificate_external']) ? '1' : '0';
+        $this->db->query(
+            "INSERT INTO settings (`key`, `value`) VALUES ('certificate_external', ?)
+             ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)",
+            [$external]
+        );
+        if ($external === '1') {
+            $notifications = new \BBS\Services\NotificationService();
+            foreach ([0, 1, 2, 3, 7, 14, 29] as $threshold) {
+                $notifications->resolve('certificate_expiring', null, $threshold);
+            }
+        }
+        // Check again on the next scheduler pass rather than tomorrow.
+        $this->db->query("DELETE FROM settings WHERE `key` = 'certificate_checked_on'");
+        $this->flash('success', $external === '1'
+            ? 'Expiry warnings for this server\'s certificate are off.'
+            : 'Expiry warnings for this server\'s certificate are on.');
+        $this->redirect('/settings?tab=ssl');
     }
 
     public function dockerSetup(): void
@@ -77,6 +201,11 @@ class SettingsController extends Controller
 
         if (empty($hostname)) {
             $this->flash('danger', 'Server hostname or IP is required.');
+            $this->redirect('/');
+            return;
+        }
+        if (!\BBS\Core\Config::isValidHost($hostname, false)) {
+            $this->flash('danger', 'Enter a hostname or IP address, without http:// or a path.');
             $this->redirect('/');
             return;
         }
@@ -120,7 +249,25 @@ class SettingsController extends Controller
         $this->requireAdmin();
         $this->verifyCsrf();
 
-        $allowed = ['max_queue', 'server_host', 'ssh_port', 'agent_poll_interval', 'stall_timeout_minutes', 'session_timeout_hours', 'default_theme', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_secure', 'smtp_from', 'notification_retention_days', 'storage_alert_threshold', 'apprise_urls', 'self_backup_retention', 'auto_retry_max_attempts', 'agent_offline_notify_minutes', 'auto_compact_day', 'auto_compact_hour'];
+        $allowed = ['max_queue', 's3_max_concurrent', 'server_host', 'ssh_port', 'agent_poll_interval', 'stall_timeout_minutes', 'session_timeout_hours', 'default_theme', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_secure', 'smtp_from', 'notification_retention_days', 'storage_alert_threshold', 'apprise_urls', 'self_backup_retention', 'auto_retry_max_attempts', 'job_offline_grace_minutes', 'auto_retry_backoff_minutes', 'agent_offline_notify_minutes', 'auto_compact_day', 'auto_compact_hour', 'auto_compact_timezone', 'backup_overdue_hours'];
+
+        // The compact schedule is read in this zone (#556); anything that is
+        // not a known zone falls back to the saving admin's profile zone.
+        if (isset($_POST['auto_compact_timezone'])
+            && !in_array($_POST['auto_compact_timezone'], timezone_identifiers_list(), true)) {
+            $_POST['auto_compact_timezone'] = $_SESSION['timezone'] ?? 'UTC';
+        }
+
+        $oldServerHost = null;
+        if (isset($_POST['server_host'])) {
+            $_POST['server_host'] = trim((string) $_POST['server_host']);
+            if (!\BBS\Core\Config::isValidHost($_POST['server_host'])) {
+                $this->flash('danger', 'Server host must be a hostname or IP address, optionally with :port, and no http:// or path.');
+                $this->redirect('/settings?tab=' . urlencode($_POST['_tab'] ?? 'general'));
+            }
+            $row = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
+            $oldServerHost = $row['value'] ?? null;
+        }
 
         foreach ($allowed as $key) {
             if (isset($_POST[$key])) {
@@ -139,15 +286,53 @@ class SettingsController extends Controller
             $this->saveSetting('smtp_pass', \BBS\Services\Encryption::encrypt($_POST['smtp_pass']));
         }
 
-        // Checkbox toggles: unchecked = not posted, so explicitly save '0'
-        $checkboxKeys = ['maintenance_mode', 'email_on_backup_failed', 'email_on_backup_warning', 'email_on_agent_offline', 'email_on_storage_low', 'email_on_missed_schedule', 'apprise_on_backup_failed', 'apprise_on_backup_warning', 'apprise_on_agent_offline', 'apprise_on_storage_low', 'apprise_on_missed_schedule', 'force_2fa', 'debug_mode', 'self_backup_enabled', 'self_backup_catalogs', 'telemetry_opt_out', 'inapp_notify_success_events', 'auto_retry_failed_backups', 'auto_update_agents'];
-        foreach ($checkboxKeys as $key) {
+        // Checkbox toggles: unchecked = not posted, so an explicit '0' has to be
+        // written. The catch is which ones — this handler serves several forms,
+        // and resetting every known toggle on every save turns off everything
+        // that happened to be on another page. That is not hypothetical: none
+        // of these forms carries the email_on_* or apprise_on_* boxes any more,
+        // so each save was quietly clearing them, and email_on_* still gates
+        // whether notification email is sent at all.
+        //
+        // So each form declares what it owns in _checkboxes, and only those are
+        // reset. A form that predates this (a page left open across an update)
+        // sends nothing, and then only the boxes actually ticked are written —
+        // it can still turn something on, never silently off.
+        $checkboxKeys = ['maintenance_mode', 'email_on_backup_failed', 'email_on_backup_warning', 'email_on_agent_offline', 'email_on_storage_low', 'email_on_missed_schedule', 'apprise_on_backup_failed', 'apprise_on_backup_warning', 'apprise_on_agent_offline', 'apprise_on_storage_low', 'apprise_on_missed_schedule', 'force_2fa', 'debug_mode', 'self_backup_enabled', 'self_backup_catalogs', 'telemetry_opt_out', 'inapp_notify_success_events', 'auto_retry_failed_backups', 'auto_update_agents', 'precount_files'];
+
+        if (array_key_exists('_checkboxes', $_POST)) {
+            $declared = array_filter(array_map('trim', explode(',', (string) $_POST['_checkboxes'])));
+            $toWrite = array_values(array_intersect($checkboxKeys, $declared));
+        } else {
+            $toWrite = array_values(array_filter($checkboxKeys, fn($k) => isset($_POST[$k])));
+        }
+
+        foreach ($toWrite as $key) {
             $value = isset($_POST[$key]) ? '1' : '0';
             $existing = $this->db->fetchOne("SELECT `key` FROM settings WHERE `key` = ?", [$key]);
             if ($existing) {
                 $this->db->update('settings', ['value' => $value], "`key` = ?", [$key]);
             } else {
                 $this->db->insert('settings', ['key' => $key, 'value' => $value]);
+            }
+        }
+
+        // Repo paths bake the server host in at creation time — when the
+        // global host changes, rewrite the local repo paths of every client
+        // that doesn't have a per-client override (#367)
+        if (isset($_POST['server_host']) && trim($_POST['server_host']) !== ($oldServerHost ?? '')) {
+            $agents = $this->db->fetchAll(
+                "SELECT id FROM agents WHERE server_host_override IS NULL OR server_host_override = ''"
+            );
+            $updated = 0;
+            foreach ($agents as $a) {
+                $updated += \BBS\Services\SshKeyManager::rewriteAgentRepoHosts($this->db, (int) $a['id'], trim($_POST['server_host']));
+            }
+            if ($updated > 0) {
+                $this->db->insert('server_log', [
+                    'level' => 'info',
+                    'message' => "Server host changed — updated {$updated} repository path(s)",
+                ]);
             }
         }
 
@@ -184,6 +369,10 @@ class SettingsController extends Controller
             $this->flash('danger', 'Template name and directories are required.');
             $this->redirect('/settings?tab=templates');
         }
+        if (($fieldError = \BBS\Services\BorgCommandBuilder::validatePlanFields($advancedOptions, $directories)) !== null) {
+            $this->flash('danger', $fieldError);
+            $this->redirect('/settings?tab=templates');
+        }
 
         $this->db->insert('backup_templates', [
             'name' => $name,
@@ -195,6 +384,41 @@ class SettingsController extends Controller
 
         $this->flash('success', "Template \"{$name}\" created.");
         $this->redirect('/settings?tab=templates');
+    }
+
+    /** Copy a template so a variant can start from it (#543). */
+    public function duplicateTemplate(int $id): void
+    {
+        $this->requireAdmin();
+        $this->verifyCsrf();
+
+        $tpl = $this->db->fetchOne("SELECT * FROM backup_templates WHERE id = ?", [$id]);
+        if (!$tpl) {
+            $this->flash('danger', 'Template not found.');
+            $this->redirect('/settings?tab=templates');
+        }
+
+        // "Web Server (copy)", then "(copy 2)" and so on if that is taken.
+        // The column is VARCHAR(100), so trim the base rather than the suffix.
+        $names = array_column($this->db->fetchAll("SELECT name FROM backup_templates"), 'name');
+        for ($n = 1; ; $n++) {
+            $suffix = $n === 1 ? ' (copy)' : " (copy {$n})";
+            $name = mb_substr($tpl['name'], 0, 100 - mb_strlen($suffix)) . $suffix;
+            if (!in_array($name, $names, true)) {
+                break;
+            }
+        }
+
+        $newId = $this->db->insert('backup_templates', [
+            'name' => $name,
+            'description' => $tpl['description'],
+            'directories' => $tpl['directories'],
+            'excludes' => $tpl['excludes'],
+            'advanced_options' => $tpl['advanced_options'],
+        ]);
+
+        $this->flash('success', "Template duplicated as \"{$name}\".");
+        $this->redirect('/settings?tab=templates&edit=' . (int) $newId);
     }
 
     public function editTemplate(int $id): void
@@ -210,6 +434,10 @@ class SettingsController extends Controller
 
         if (empty($name) || empty($directories)) {
             $this->flash('danger', 'Template name and directories are required.');
+            $this->redirect('/settings?tab=templates');
+        }
+        if (($fieldError = \BBS\Services\BorgCommandBuilder::validatePlanFields($advancedOptions, $directories)) !== null) {
+            $this->flash('danger', $fieldError);
             $this->redirect('/settings?tab=templates');
         }
 
@@ -341,17 +569,110 @@ class SettingsController extends Controller
 
         $token = 'bbs_tok_' . bin2hex(random_bytes(24));
         $hash = hash('sha256', $token);
-        $canReadSecrets = !empty($_POST['can_read_secrets']) ? 1 : 0;
+
+        // A monitoring token reads the monitoring endpoints and nothing else,
+        // so the secrets toggle is not merely unchecked — it cannot apply.
+        $kind = ($_POST['kind'] ?? 'user') === 'metrics' ? 'metrics' : 'user';
+        $canReadSecrets = ($kind === 'user' && !empty($_POST['can_read_secrets'])) ? 1 : 0;
 
         $this->db->insert('api_tokens', [
             'name' => $name,
             'token_hash' => $hash,
+            'kind' => $kind,
             'user_id' => $_SESSION['user_id'],
             'can_read_secrets' => $canReadSecrets,
         ]);
 
         $_SESSION['new_api_token'] = $token;
         $this->flash('success', 'API token created. Copy it now — it will not be shown again.');
+        $this->redirect('/settings?tab=api');
+    }
+
+    /**
+     * POST /settings/monitoring — who may read the monitoring endpoints.
+     *
+     * Its own handler rather than the general settings form: the allowed
+     * ranges are a list of rows, each validated on its own so the page can
+     * point at the line that is wrong instead of rejecting the lot.
+     */
+    public function saveMonitoring(): void
+    {
+        $this->requireAdmin();
+        $this->verifyCsrf();
+
+        $enabled = !empty($_POST['metrics_enabled']) ? '1' : '0';
+
+        $cidrs = (array) ($_POST['acl_cidr'] ?? []);
+        $tokens = (array) ($_POST['acl_token'] ?? []);
+        $notes = (array) ($_POST['acl_note'] ?? []);
+
+        $acl = [];
+        $normalised = [];
+        foreach ($cidrs as $i => $raw) {
+            $raw = trim((string) $raw);
+            if ($raw === '') {
+                continue;
+            }
+            $cidr = \BBS\Services\MetricsAccess::normaliseCidr($raw);
+            if ($cidr === null) {
+                $this->flash('danger', "\"{$raw}\" is not an address or range. Use 10.0.0.0/27, 192.168.1.10 or 2001:db8::/64.");
+                $this->redirect('/settings?tab=api');
+            }
+            if (isset($acl[$cidr])) {
+                continue; // same range twice: keep the first row
+            }
+            if ($cidr !== $raw) {
+                $normalised[] = "{$raw} → {$cidr}";
+            }
+            $acl[$cidr] = [
+                'cidr' => $cidr,
+                // An unchecked box posts nothing, so the value carries the
+                // row index: absent means "no token for this range".
+                'token' => in_array((string) $i, array_map('strval', $tokens), true),
+                'note' => mb_substr(trim((string) ($notes[$i] ?? '')), 0, 120),
+            ];
+        }
+        $acl = array_values($acl);
+
+        if ($enabled === '1' && $acl === []) {
+            $this->flash('danger', 'Monitoring is on but no range is allowed, which would refuse every scraper. Add a range, or turn monitoring off.');
+            $this->redirect('/settings?tab=api');
+        }
+        if (\BBS\Services\MetricsAccess::isWorldOpenWithoutToken($acl)) {
+            $this->flash('danger', 'A range open to every address must require a token. Narrow the range, or tick "token required" on it.');
+            $this->redirect('/settings?tab=api');
+        }
+
+        $proxies = [];
+        foreach ((array) ($_POST['proxy_cidr'] ?? []) as $raw) {
+            $raw = trim((string) $raw);
+            if ($raw === '') {
+                continue;
+            }
+            $cidr = \BBS\Services\MetricsAccess::normaliseCidr($raw);
+            if ($cidr === null) {
+                $this->flash('danger', "\"{$raw}\" is not a valid proxy address or range.");
+                $this->redirect('/settings?tab=api');
+            }
+            $proxies[$cidr] = $cidr;
+        }
+
+        $rate = max(1, min(600, (int) ($_POST['metrics_rate_per_minute'] ?? 12)));
+        $cache = max(0, min(3600, (int) ($_POST['metrics_cache_seconds'] ?? 30)));
+
+        $this->saveSetting('metrics_enabled', $enabled);
+        $this->saveSetting('metrics_acl', json_encode($acl));
+        $this->saveSetting('metrics_trusted_proxies', json_encode(array_values($proxies)));
+        $this->saveSetting('metrics_rate_per_minute', (string) $rate);
+        $this->saveSetting('metrics_cache_seconds', (string) $cache);
+
+        $message = 'Monitoring access saved.';
+        if ($normalised !== []) {
+            // Host bits are cleared on save. Saying so here is the only moment
+            // the operator can still tell us they meant a single address.
+            $message .= ' Ranges normalised to their network address: ' . implode(', ', $normalised) . '.';
+        }
+        $this->flash('success', $message);
         $this->redirect('/settings?tab=api');
     }
 
@@ -390,20 +711,7 @@ class SettingsController extends Controller
     {
         $this->requireAdmin();
 
-        $bundledAgentVersion = null;
-        $agentFile = dirname(__DIR__, 2) . '/agent/bbs-agent.py';
-        if (file_exists($agentFile)) {
-            $fh = fopen($agentFile, 'r');
-            if ($fh) {
-                for ($i = 0; $i < 50 && ($line = fgets($fh)) !== false; $i++) {
-                    if (preg_match('/^AGENT_VERSION\s*=\s*["\']([^"\']+)["\']/m', $line, $mv)) {
-                        $bundledAgentVersion = $mv[1];
-                        break;
-                    }
-                }
-                fclose($fh);
-            }
-        }
+        $bundledAgentVersion = (new \BBS\Services\UpdateService())->getBundledAgentVersion();
 
         if (!$bundledAgentVersion) {
             $this->json(['bundled_version' => null, 'total' => 0, 'outdated' => []]);
@@ -411,13 +719,59 @@ class SettingsController extends Controller
         }
 
         $allAgents = $this->db->fetchAll("SELECT id, name, agent_version FROM agents WHERE agent_version IS NOT NULL");
-        $outdated = array_values(array_filter($allAgents, fn($a) => $a['agent_version'] !== $bundledAgentVersion));
+        $svc = new \BBS\Services\UpdateService();
+        // `behind` is everyone on an older agent; `outdated` is the subset
+        // "Update All" can act on (#566).
+        $behind = $svc->getAgentsBehind();
 
         $this->json([
             'bundled_version' => $bundledAgentVersion,
             'total' => count($allAgents),
-            'outdated' => $outdated
+            'behind' => $behind,
+            'outdated' => array_values(array_filter($behind, fn($a) => !empty($a['auto_update_enabled']))),
         ]);
+    }
+
+    /**
+     * POST /settings/push — opt in or out of the push notification service.
+     *
+     * Deliberately an explicit action rather than something that happens on
+     * its own. Delivery is brokered by an external service, so the first
+     * contact with it — and everything that leaves this server as a result —
+     * happens only when an administrator asks for it.
+     */
+    public function savePush(): void
+    {
+        $this->requireAdmin();
+        $this->verifyCsrf();
+
+        $push = new \BBS\Services\PushService();
+        $wantEnabled = !empty($_POST['push_enabled']);
+
+        if (!$wantEnabled) {
+            $push->disable();
+            $this->flash('success', 'Push notifications disabled. Nothing further is sent to the push notification service.');
+            $this->redirect('/settings?tab=push');
+            return;
+        }
+
+        // Turn it on first: registration checks the flag before contacting
+        // anything, so a failure leaves it on and retryable rather than
+        // silently reverting.
+        $this->saveSetting('push_enabled', '1');
+        if (!empty($_POST['push_relay_url'])) {
+            $relayUrl = rtrim(trim($_POST['push_relay_url']), '/');
+            if (!filter_var($relayUrl, FILTER_VALIDATE_URL) || !str_starts_with($relayUrl, 'https://')
+                || \BBS\Core\UrlGuard::blockedWhenHosted($relayUrl)) {
+                $this->flash('danger', 'The push relay URL must be a public https URL.');
+                $this->redirect('/settings?tab=push');
+            }
+            $this->saveSetting('push_relay_url', $relayUrl);
+        }
+
+        [$ok, $message] = $push->registerInstall();
+        $this->flash($ok ? 'success' : 'danger', $message);
+        $this->redirect('/settings?tab=push');
     }
 
     public function testSmtp(): void
@@ -450,6 +804,10 @@ class SettingsController extends Controller
 
         if (empty($host)) {
             $this->json(['success' => false, 'error' => 'SMTP host is not configured.']);
+            return;
+        }
+        if (\BBS\Core\Config::isHosted() && \BBS\Core\UrlGuard::reachesInternal($host)) {
+            $this->json(['success' => false, 'error' => 'SMTP host must be a public address.']);
             return;
         }
 
@@ -643,32 +1001,17 @@ class SettingsController extends Controller
         $this->requireAdmin();
         $this->verifyCsrf();
 
-        // Read bundled agent version
-        $serverAgentVersion = null;
-        $agentFile = dirname(__DIR__, 2) . '/agent/bbs-agent.py';
-        if (file_exists($agentFile)) {
-            $handle = fopen($agentFile, 'r');
-            if ($handle) {
-                for ($i = 0; $i < 50 && ($line = fgets($handle)) !== false; $i++) {
-                    if (preg_match('/^AGENT_VERSION\s*=\s*["\']([^"\']+)["\']/m', $line, $m)) {
-                        $serverAgentVersion = $m[1];
-                        break;
-                    }
-                }
-                fclose($handle);
-            }
-        }
+        $serverAgentVersion = (new \BBS\Services\UpdateService())->getBundledAgentVersion();
 
         if (!$serverAgentVersion) {
             $this->flash('danger', 'Could not determine bundled agent version.');
             $this->redirect('/settings?tab=updates');
         }
 
-        // Find outdated agents
-        $outdated = $this->db->fetchAll(
-            "SELECT id, name FROM agents WHERE agent_version IS NOT NULL AND agent_version != ?",
-            [$serverAgentVersion]
-        );
+        // Only agents genuinely behind the bundled version, and only ones that
+        // accept server-driven updates — a string comparison here would offer
+        // an "upgrade" that walks a newer agent backwards (#387).
+        $outdated = (new \BBS\Services\UpdateService())->getOutdatedAgents();
 
         // Find agents that already have a pending update job
         $pending = $this->db->fetchAll(
@@ -808,6 +1151,13 @@ class SettingsController extends Controller
         foreach ($agents as $agent) {
             // Skip if already has pending job
             if (in_array($agent['id'], $pendingIds)) {
+                continue;
+            }
+
+            // NixOS agents manage borg through nixpkgs — the agent skips
+            // update jobs, so queueing one is pure noise (#359)
+            if (stripos($agent['os_info'] ?? '', 'nixos') !== false) {
+                $skipped++;
                 continue;
             }
 

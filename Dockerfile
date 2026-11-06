@@ -1,5 +1,10 @@
 FROM php:8.4-apache
 
+# Refuse to build on a base older than 8.4.27, the release that fixes the
+# PHP2Shell RCEs (CVE-2026-109618, CVE-2026-109619). The 8.4-apache tag
+# floats, so this catches a stale cache or a mirror that hasn't caught up.
+RUN php -r 'if (version_compare(PHP_VERSION, "8.4.27", "<")) { fwrite(STDERR, "PHP " . PHP_VERSION . " is vulnerable to CVE-2026-109618/109619; need 8.4.27+\n"); exit(1); }'
+
 # Install system dependencies, apply security patches, and clean up in one layer.
 # dist-upgrade pulls kernel-abi and other fixes that plain upgrade skips — helps
 # reduce Docker Hub CVE scan counts.
@@ -7,6 +12,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get dist-upgrade -y && apt-get i
     git \
     curl \
     ca-certificates \
+    gpgv \
     libpng-dev \
     libonig-dev \
     libxml2-dev \
@@ -16,6 +22,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get dist-upgrade -y && apt-get i
     unzip \
     cron \
     sudo \
+    tini \
     mariadb-server \
     mariadb-client \
     borgbackup \
@@ -67,7 +74,7 @@ RUN pip3 install --break-system-packages --no-cache-dir apprise wheel>=0.46.2 &&
     rm -rf /root/.cache /usr/lib/python3/dist-packages/wheel*
 
 # Install PHP extensions
-RUN docker-php-ext-install pdo pdo_mysql mbstring
+RUN docker-php-ext-install pdo pdo_mysql mbstring gd
 
 # PHP configuration: increase max_execution_time (default 30s is too short for
 # large backup operations, catalog imports, and API calls under load).
@@ -82,7 +89,7 @@ RUN { echo "max_execution_time = 300"; \
 RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
 
 # Enable Apache modules and configure in one layer
-RUN a2enmod rewrite && \
+RUN a2enmod rewrite remoteip && \
     echo "ServerName localhost" >> /etc/apache2/apache2.conf && \
     echo '<VirtualHost *:80>\n\
     DocumentRoot /var/www/bbs/public\n\
@@ -117,8 +124,7 @@ RUN cp /var/www/bbs/bin/bbs-ssh-helper /usr/local/bin/bbs-ssh-helper \
 
 # Configure scoped sudoers for www-data
 RUN echo "www-data ALL=(root) NOPASSWD: /usr/local/bin/bbs-ssh-helper, /var/www/bbs/bin/bbs-update" > /etc/sudoers.d/bbs-ssh-helper \
-    && echo "www-data ALL=(bbs-*) NOPASSWD: /usr/bin/borg, /usr/local/bin/borg, /usr/bin/rclone, /usr/bin/env" > /etc/sudoers.d/bbs-borg \
-    && chmod 440 /etc/sudoers.d/bbs-ssh-helper /etc/sudoers.d/bbs-borg
+    && chmod 440 /etc/sudoers.d/bbs-ssh-helper
 
 # Copy entrypoint script
 COPY entrypoint.sh /entrypoint.sh
@@ -130,4 +136,15 @@ ENV PGID=33
 
 EXPOSE 80 22
 
-ENTRYPOINT ["/entrypoint.sh"]
+# Apache, sshd and MariaDB must all answer; a container where one of them
+# is gone while the rest run is the case #440 is about. ClickHouse is left
+# out: the server runs without it (catalog features off), so its absence
+# isn't a reason to mark the whole container unhealthy.
+HEALTHCHECK --interval=60s --timeout=15s --start-period=5m --retries=3 \
+    CMD bash -c 'curl -fsS -o /dev/null http://127.0.0.1/login && mysqladmin ping -h localhost --silent && exec 3<>/dev/tcp/127.0.0.1/22'
+
+# tini is PID 1 (#440): it forwards SIGTERM to the entrypoint and reaps
+# orphans. The entrypoint then stops each service in order rather than
+# letting Docker kill MariaDB and ClickHouse mid-write.
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

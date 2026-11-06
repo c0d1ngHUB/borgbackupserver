@@ -23,8 +23,9 @@ class NotificationServiceController extends Controller
         'repo_compact_done' => 'Compact Done',
         // Storage
         'storage_low' => 'Storage Low',
-        's3_sync_failed' => 'S3 Sync Failed',
-        's3_sync_done' => 'S3 Sync Done',
+        'certificate_expiring' => 'SSL Certificate Expiring',
+        's3_sync_failed' => 'Offsite Sync Failed',
+        's3_sync_done' => 'Offsite Sync Done',
         // Schedules
         'missed_schedule' => 'Missed Schedule',
     ];
@@ -65,6 +66,10 @@ class NotificationServiceController extends Controller
             $this->flash('danger', 'Name and Apprise URL are required.');
             $this->redirect('/settings?tab=push');
         }
+        if (!AppriseService::isSafeUrl($appriseUrl)) {
+            $this->flash('danger', 'Apprise URL must look like scheme://... (for example pover://user@token).');
+            $this->redirect('/settings?tab=push');
+        }
 
         // Build events JSON from checkboxes
         $events = [];
@@ -102,6 +107,10 @@ class NotificationServiceController extends Controller
 
         if (empty($name) || empty($appriseUrl)) {
             $this->flash('danger', 'Name and Apprise URL are required.');
+            $this->redirect('/settings?tab=push');
+        }
+        if (!AppriseService::isSafeUrl($appriseUrl)) {
+            $this->flash('danger', 'Apprise URL must look like scheme://... (for example pover://user@token).');
             $this->redirect('/settings?tab=push');
         }
 

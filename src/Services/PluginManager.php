@@ -173,8 +173,18 @@ class PluginManager
 
             // Resolve config from named plugin_config if available, else inline
             if (!empty($pp['plugin_config_id'])) {
+                // Only this client's own configs: their secrets go to its agent
+                $owner = $this->getPluginConfig((int) $pp['plugin_config_id']);
+                if (!$owner || (int) ($owner['agent_id'] ?? 0) !== (int) $agentId) {
+                    continue;
+                }
                 $resolved = $this->buildTestPayload($pp['plugin_config_id']);
                 if (!empty($resolved)) {
+                    // Tag with config identity so the agent can keep results
+                    // per config (a plan may run two configs of one engine, #382)
+                    $resolved['config_id'] = (int) $pp['plugin_config_id'];
+                    $namedCfg = $this->getPluginConfig((int) $pp['plugin_config_id']);
+                    $resolved['config_name'] = $namedCfg['name'] ?? null;
                     $payload[] = $resolved;
                     continue;
                 }
@@ -252,17 +262,27 @@ class PluginManager
         $existing = $this->getPluginConfig($configId);
         if (!$existing) return;
 
-        // Preserve encrypted sensitive fields if new value is empty
+        // The form leaves secrets blank: a value means a new secret to
+        // encrypt, an empty one means keep the stored (encrypted) value.
         $existingConfig = json_decode($existing['config'], true) ?: [];
         $schema = $this->getPluginSchema($existing['slug']);
         foreach ($schema as $field => $def) {
-            if (!empty($def['sensitive']) && empty($config[$field]) && !empty($existingConfig[$field])) {
+            if (empty($def['sensitive'])) {
+                continue;
+            }
+            if (!empty($config[$field])) {
+                $config[$field] = Encryption::encrypt($config[$field]);
+            } elseif (!empty($existingConfig[$field])) {
                 $config[$field] = $existingConfig[$field];
             }
         }
         // Legacy password field
-        if (empty($config['password']) && !empty($existingConfig['password'])) {
-            $config['password'] = $existingConfig['password'];
+        if (empty($schema['password']['sensitive'])) {
+            if (!empty($config['password'])) {
+                $config['password'] = Encryption::encrypt($config['password']);
+            } elseif (!empty($existingConfig['password'])) {
+                $config['password'] = $existingConfig['password'];
+            }
         }
 
         $config = $this->processConfigFields($existing['slug'], $config, true);
@@ -355,6 +375,195 @@ class PluginManager
         return $plugin['slug'] ?? '';
     }
 
+
+    /**
+     * Why a shell hook's program may not run, or null when it may (#hooks).
+     * The agent enforces the same rules on the client, where the server
+     * cannot change them; this copy gives the form an answer before saving.
+     * The program must be an absolute path that is not in a system binary
+     * directory and is not a shell, interpreter or destructive utility by
+     * name. Arguments after it are fine: nothing goes through a shell.
+     */
+    public static function hookCommandProblem(string $value): ?string
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        $tokens = preg_split('/\s+/', $value);
+        $exe = trim((string) $tokens[0], "\"'");
+        if ($exe === '') {
+            return null;
+        }
+        $windows = (bool) preg_match('#^[A-Za-z]:[\\\\/]#', $exe);
+        if (!$windows && $exe[0] !== '/') {
+            return 'The script must be an absolute path, for example /usr/local/bin/pre-backup.sh';
+        }
+        $base = strtolower(basename(str_replace('\\', '/', $exe)));
+        $stem = preg_replace('/\.(exe|bat|cmd|ps1|com)$/', '', $base);
+        $stem = preg_replace('/[0-9][0-9.]*$/', '', $stem);
+        $denied = ['sh', 'bash', 'dash', 'zsh', 'ksh', 'mksh', 'csh', 'tcsh', 'fish', 'ash', 'busybox', 'env', 'sudo', 'su', 'doas', 'runuser',
+            'python', 'pypy', 'perl', 'ruby', 'php', 'node', 'nodejs', 'deno', 'bun', 'lua', 'luajit', 'tclsh',
+            'awk', 'gawk', 'mawk', 'nawk', 'sed', 'xargs', 'find', 'rm', 'rmdir', 'shred', 'dd', 'mkfs', 'wipefs', 'fdisk', 'sfdisk', 'parted',
+            'chmod', 'chown', 'chgrp', 'mv', 'cp', 'ln', 'unlink', 'truncate', 'install', 'nice', 'ionice', 'nohup', 'timeout', 'setsid',
+            'chroot', 'unshare', 'nsenter', 'systemctl', 'service', 'init', 'shutdown', 'reboot', 'halt', 'poweroff', 'telinit',
+            'kill', 'killall', 'pkill', 'curl', 'wget', 'nc', 'ncat', 'netcat', 'socat', 'ssh', 'scp', 'sftp', 'rsync', 'borg', 'docker', 'podman',
+            'kubectl', 'at', 'crontab', 'eval', 'exec', 'command', 'xdg-open', 'open', 'osascript', 'launchctl',
+            'cmd', 'powershell', 'pwsh', 'wscript', 'cscript', 'mshta', 'rundll32', 'regsvr32', 'certutil', 'bitsadmin', 'msiexec'];
+        if (in_array($stem, $denied, true) || in_array($base, $denied, true)) {
+            return "{$base} is a shell, interpreter or system utility. A hook must name a script of your own; put the commands inside it.";
+        }
+        if ($windows) {
+            if (preg_match('#^[A-Za-z]:[\\\\/]windows[\\\\/]#i', $exe)) {
+                return 'Programs under the Windows folder cannot be used as hooks.';
+            }
+            return null;
+        }
+        foreach (['/bin', '/sbin', '/usr/bin', '/usr/sbin', '/usr/lib', '/usr/lib32', '/usr/lib64', '/usr/libexec', '/lib', '/lib32', '/lib64', '/snap', '/usr/share', '/etc/alternatives', '/System', '/opt/homebrew/bin', '/opt/homebrew/sbin', '/opt/local/bin'] as $dir) {
+            if ($exe === $dir || str_starts_with($exe, $dir . '/')) {
+                return "Programs under {$dir} cannot be used as hooks. Put your script somewhere else, for example /usr/local/bin or /etc/bbs-agent/hooks.";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Options the dump tools must not get through extra_options: each names
+     * a file or directory the tool would write to or load from, and the
+     * tools run as root on the client. The agent refuses them too; this
+     * check reports the problem when the config is saved instead of at
+     * backup time. [long options, short option letters]
+     */
+    private const DUMP_BLOCKED_OPTIONS = [
+        'mysql_dump' => [['--result-file', '--tab', '--log-error', '--debug', '--plugin-dir', '--default-auth',
+                          '--defaults-file', '--defaults-extra-file', '--defaults-group-suffix',
+                          '--character-sets-dir', '--load-data-local-dir'], 'rT#'],
+        'pg_dump' => [['--file'], 'f'],
+        'mongo_dump' => [['--out', '--archive', '--config'], 'o'],
+        // No pass-through options: BACKUP DATABASE is built by the agent. The
+        // entry gives mssql_dump the shared dump_dir checks.
+        'mssql_dump' => [[], '#'],
+    ];
+
+    /**
+     * File name the agent gives a SQL Server database's backup: the database
+     * name with characters Windows refuses in file names replaced by "_",
+     * plus .bak. The agent (_mssql_dump_filename) must produce the same name,
+     * restore extracts exactly this file from the archive.
+     */
+    public static function mssqlDumpFileName(string $database): string
+    {
+        return preg_replace('/[<>:"\/\\\\|?*\x00-\x1f]/', '_', $database) . '.bak';
+    }
+
+    /**
+     * In hosted mode an Offsite Sync config copies to the platform's bucket
+     * only: no custom S3 credentials, no SSH or local destinations. Path
+     * prefix and bandwidth limit stay. Other plugins pass unchanged.
+     */
+    public static function hostedConfig(string $slug, array $config): array
+    {
+        if (!\BBS\Core\Config::isHosted() || $slug !== 's3_sync') {
+            return $config;
+        }
+        $config['target_type'] = S3SyncService::TYPE_S3;
+        $config['credential_source'] = 'global';
+        foreach (['endpoint', 'region', 'bucket', 'access_key', 'secret_key', 'remote_ssh_config_id', 'storage_location_id'] as $field) {
+            unset($config[$field]);
+        }
+        return $config;
+    }
+
+    /**
+     * What is wrong with a plugin config about to be saved, as a message;
+     * null when nothing is.
+     */
+    public static function configProblem(string $slug, array $config, bool $isAdmin): ?string
+    {
+        if ($slug === 'shell_hook') {
+            return self::hookConfigProblem($config);
+        }
+        if ($slug === 's3_sync') {
+            $type = (string) ($config['target_type'] ?? S3SyncService::TYPE_S3);
+            if (!$isAdmin && in_array($type, [S3SyncService::TYPE_SFTP, S3SyncService::TYPE_LOCAL], true)) {
+                return 'Only administrators can copy to an SSH host or a storage location.';
+            }
+            $endpoint = trim((string) ($config['endpoint'] ?? ''));
+            if ($endpoint !== '' && ($config['credential_source'] ?? 'global') === 'custom') {
+                $host = \BBS\Core\UrlGuard::hostOf(str_contains($endpoint, '://') ? $endpoint : 'https://' . $endpoint);
+                if ($host !== null && (\BBS\Core\Config::isHosted()
+                        ? \BBS\Core\UrlGuard::reachesInternal($host)
+                        : !$isAdmin && \BBS\Core\UrlGuard::reachesLocal($host))) {
+                    return 'The S3 endpoint cannot point at this server or a link-local address.';
+                }
+            }
+            return S3SyncService::pathPrefixProblem((string) ($config['path_prefix'] ?? ''), $type, true);
+        }
+        if ($slug === 'mssql_dump' && trim((string) ($config['databases'] ?? '')) === '') {
+            return 'Databases: select at least one database, or use * for all.';
+        }
+        if (isset(self::DUMP_BLOCKED_OPTIONS[$slug])) {
+            [$long, $short] = self::DUMP_BLOCKED_OPTIONS[$slug];
+            foreach (preg_split('/\s+/', trim((string) ($config['extra_options'] ?? ''))) ?: [] as $arg) {
+                if (str_starts_with($arg, '--')) {
+                    $name = strtolower(explode('=', $arg, 2)[0]);
+                    foreach ($long as $blocked) {
+                        // mysqldump accepts any unambiguous prefix of a long option
+                        if ($blocked === $name || (strlen($name) > 4 && str_starts_with($blocked, $name))) {
+                            return "Extra options: {$name} is not allowed, it makes the dump tool write or load files.";
+                        }
+                    }
+                } elseif (str_starts_with($arg, '-') && strpbrk(substr($arg, 1), $short) !== false) {
+                    return "Extra options: {$arg} is not allowed. Short options that can write files are refused; use the long form of other options.";
+                }
+            }
+            $dir = trim((string) ($config['dump_dir'] ?? ''));
+            if ($dir !== '' && !str_starts_with($dir, '/') && !preg_match('#^[A-Za-z]:[\\\\/]#', $dir)) {
+                return 'Dump directory must be an absolute path.';
+            }
+            if ($dir !== '' && preg_match('#^/(etc|bin|sbin|lib|lib32|lib64|boot|dev|proc|sys|usr|snap|root/\.ssh)(/|$)|^/(root|var|home|tmp|opt|srv|var/lib|var/www)?/?$#', $dir)) {
+                return 'Dump directory cannot be a system directory. Its .sql files are deleted after each backup.';
+            }
+        }
+        return null;
+    }
+
+    /** The first hook field of a shell_hook config that fails the rules, as a message; null when both pass. */
+    public static function hookConfigProblem(array $config): ?string
+    {
+        foreach (['pre_script' => 'Pre-backup script', 'post_script' => 'Post-backup script'] as $field => $label) {
+            $problem = self::hookCommandProblem((string) ($config[$field] ?? ''));
+            if ($problem !== null) {
+                return "{$label}: {$problem}";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The hosts and disks an Offsite Sync config can copy to, as
+     * id => label, for the schema and the forms (#413).
+     */
+    public function offsiteTargetChoices(): array
+    {
+        static $choices = null;
+        if ($choices !== null) {
+            return $choices;
+        }
+        $remote = [];
+        foreach ($this->db->fetchAll("SELECT id, name, provider, remote_host, remote_user FROM remote_ssh_configs ORDER BY name") as $r) {
+            if (($r['provider'] ?? '') === 'borgbase' || str_contains((string) $r['remote_host'], '.repo.borgbase.com')) {
+                continue;
+            }
+            $remote[(string) $r['id']] = $r['name'] . ' (' . $r['remote_user'] . '@' . $r['remote_host'] . ')';
+        }
+        $locations = [];
+        foreach ($this->db->fetchAll("SELECT id, label, path FROM storage_locations ORDER BY is_default DESC, label") as $l) {
+            $locations[(string) $l['id']] = $l['label'] . ' (' . $l['path'] . ')';
+        }
+        return $choices = ['remote_ssh' => $remote, 'storage_locations' => $locations];
+    }
+
     /**
      * Get config schema for a plugin.
      */
@@ -401,7 +610,8 @@ class PluginManager
                 'compress' => [
                     'type' => 'checkbox',
                     'label' => 'Compress dumps (gzip)',
-                    'default' => true,
+                    'default' => false,
+                    'help' => 'Off (default): plain .sql. Borg compresses the archive anyway, and a plain dump deduplicates against last night\'s, so the repository grows by what changed. On: smaller on this client\'s disk while the backup runs, but a gzipped dump deduplicates poorly and the repository stores most of it again every night. Streamed dumps are never gzipped.',
                 ],
                 'cleanup_after' => [
                     'type' => 'checkbox',
@@ -460,7 +670,8 @@ class PluginManager
                 'compress' => [
                     'type' => 'checkbox',
                     'label' => 'Compress dumps (gzip)',
-                    'default' => true,
+                    'default' => false,
+                    'help' => 'Off (default): plain .sql. Borg compresses the archive anyway, and a plain dump deduplicates against last night\'s, so the repository grows by what changed. On: smaller on this client\'s disk while the backup runs, but a gzipped dump deduplicates poorly and the repository stores most of it again every night. Streamed dumps are never gzipped.',
                 ],
                 'cleanup_after' => [
                     'type' => 'checkbox',
@@ -477,6 +688,82 @@ class PluginManager
                     'type' => 'text',
                     'label' => 'Extra pg_dump Options',
                     'default' => '--no-owner --no-privileges',
+                ],
+            ],
+            'mssql_dump' => [
+                'host' => [
+                    'type' => 'text',
+                    'label' => 'SQL Server Host',
+                    'default' => 'localhost',
+                    'help' => 'The BACKUP command runs on the SQL Server and writes into the Dump Directory, so the agent should run on the SQL Server machine (localhost). For a named instance use host\\INSTANCE and leave the port empty.',
+                ],
+                'port' => [
+                    'type' => 'number',
+                    'label' => 'Port',
+                    'default' => 1433,
+                ],
+                'user' => [
+                    'type' => 'text',
+                    'label' => 'Username',
+                    'required' => true,
+                    'default' => 'bbs_backup',
+                    'help' => 'SQL Server login (SQL authentication).',
+                ],
+                'password' => [
+                    'type' => 'text',
+                    'label' => 'Password',
+                    'required' => true,
+                    'generate' => true,
+                    'sensitive' => true,
+                ],
+                'databases' => [
+                    'type' => 'text',
+                    'label' => 'Databases',
+                    'default' => '*',
+                    'picker' => true,
+                    'help' => 'Use * for all online databases, or a comma-separated list of specific names. After saving, edit the configuration and use Detect databases to pick them from the server.',
+                ],
+                'dump_dir' => [
+                    'type' => 'text',
+                    'label' => 'Dump Directory',
+                    'default' => 'C:\\ProgramData\\BBS\\mssql',
+                    'required' => true,
+                    'help' => 'Directory on the SQL Server machine where the .bak files are written. Automatically included in backup directories. On Linux use e.g. /var/opt/mssql/bbs-backup.',
+                ],
+                'compress' => [
+                    'type' => 'checkbox',
+                    'label' => 'Use SQL Server backup compression',
+                    'default' => false,
+                    'help' => 'Off (default): borg compresses the archive anyway and an uncompressed .bak deduplicates against last night\'s, so the repository grows by what changed. On: smaller on the client\'s disk while the backup runs, but deduplicates poorly. Not available on every edition.',
+                ],
+                'cleanup_after' => [
+                    'type' => 'checkbox',
+                    'label' => 'Delete .bak files after backup completes',
+                    'default' => true,
+                ],
+                'safety_backup' => [
+                    'type' => 'checkbox',
+                    'label' => 'Safety backup before Replace',
+                    'default' => true,
+                    'help' => 'When a restore replaces an existing database, back the current one up first (to <dump directory>_pre_restore). If that backup fails the database is left untouched. Switch off only if you accept having no way back.',
+                ],
+                'safety_keep_days' => [
+                    'type' => 'number',
+                    'label' => 'Keep safety backups (days)',
+                    'default' => 7,
+                    'help' => 'Safety backups older than this are deleted after the next one is made. 0 keeps them forever (they are never cleaned up otherwise, so mind the disk).',
+                ],
+                'trust_cert' => [
+                    'type' => 'checkbox',
+                    'label' => 'Trust server certificate',
+                    'default' => true,
+                    'help' => 'Accept the SQL Server\'s TLS certificate without validating it (needed for the default self-signed certificate).',
+                ],
+                'exclude_databases' => [
+                    'type' => 'tags',
+                    'label' => 'Exclude Databases',
+                    'default' => ['tempdb'],
+                    'help' => 'Comma-separated list of databases to skip when using * above. tempdb is never backed up. Add master, model, msdb here to skip system databases.',
                 ],
             ],
             'mongo_dump' => [
@@ -526,7 +813,8 @@ class PluginManager
                 'compress' => [
                     'type' => 'checkbox',
                     'label' => 'Compress dumps (gzip)',
-                    'default' => true,
+                    'default' => false,
+                    'help' => 'Off (default): plain BSON. Borg compresses the archive anyway, and a plain dump deduplicates against last night\'s. On: smaller on this client\'s disk while the backup runs, but gzipped dumps deduplicate poorly.',
                 ],
                 'cleanup_after' => [
                     'type' => 'checkbox',
@@ -618,11 +906,34 @@ class PluginManager
                 ],
             ],
             's3_sync' => [
+                // Where the copy goes (#413). S3 is the default so configs
+                // from before destination types existed keep working.
+                'target_type' => [
+                    'type' => 'select',
+                    'label' => 'Destination',
+                    'options' => ['s3' => 'S3-compatible storage', 'sftp' => 'SSH host (SFTP)', 'local' => 'Local disk (a storage location)'],
+                    'default' => 's3',
+                ],
+                'remote_ssh_config_id' => [
+                    'type' => 'select',
+                    'label' => 'SSH host',
+                    'options' => $this->offsiteTargetChoices()['remote_ssh'],
+                    'help' => 'A Remote SSH storage from the Storage page. The copy goes to bbs-sync/<client>/<repo> under its base path. BorgBase hosts are borg-only and are not listed.',
+                    'show_when' => ['target_type' => 'sftp'],
+                ],
+                'storage_location_id' => [
+                    'type' => 'select',
+                    'label' => 'Storage location',
+                    'options' => $this->offsiteTargetChoices()['storage_locations'],
+                    'help' => 'The copy goes to bbs-sync/<client>/<repo> on that location. Pick a different disk from the one the repository lives on.',
+                    'show_when' => ['target_type' => 'local'],
+                ],
                 'credential_source' => [
                     'type' => 'select',
                     'label' => 'S3 Credentials',
                     'options' => ['global' => 'Use Global S3 Settings', 'custom' => 'Custom Credentials'],
                     'default' => 'global',
+                    'show_when' => ['target_type' => 's3'],
                 ],
                 'endpoint' => [
                     'type' => 'text',
@@ -668,6 +979,13 @@ class PluginManager
                     'default' => '',
                     'help' => 'e.g. 50M for 50 MB/s. Leave empty for unlimited. Overrides global setting.',
                 ],
+                'max_concurrent' => [
+                    'type' => 'number',
+                    'label' => 'Max Concurrent Jobs',
+                    'default' => 0,
+                    'help' => 'Syncs and restores that may run against this destination at once (#154). 0 means only the global Max Concurrent Offsite Syncs setting applies. Never more than Max Concurrent Jobs in Settings. SSH and local-disk destinations use the limit set on the Storage page instead.',
+                    'show_when' => ['target_type' => 's3'],
+                ],
                 'storage_class' => [
                     'type' => 'select',
                     'label' => 'Storage Class',
@@ -699,12 +1017,22 @@ class PluginManager
                 'pre_script' => [
                     'type' => 'text',
                     'label' => 'Pre-Backup Script Path',
-                    'help' => 'Absolute path to script on the client (e.g. /home/bbs/hooks/pre-backup.sh). Arguments are supported, e.g. /path/script.sh before. Runs before borg starts. Leave empty to skip.',
+                    'help' => 'Absolute path to a script of your own on the client (e.g. /usr/local/bin/pre-backup.sh), with optional arguments. Shells, interpreters and system utilities (/bin/sh -c, python3, rm) are refused: put the commands inside the script. Runs before borg starts. Leave empty to skip.',
                 ],
                 'post_script' => [
                     'type' => 'text',
                     'label' => 'Post-Backup Script Path',
-                    'help' => 'Absolute path to script on the client (e.g. /home/bbs/hooks/post-backup.sh). Arguments are supported, e.g. /path/script.sh after. Runs after borg completes. Leave empty to skip.',
+                    'help' => 'Absolute path to a script of your own on the client, with optional arguments; the same rules as the pre-backup script. Runs after borg completes. Leave empty to skip.',
+                ],
+                'post_script_timing' => [
+                    'type' => 'select',
+                    'label' => 'Run Post-Script',
+                    'options' => [
+                        'backup' => 'After backup — as soon as borg finishes',
+                        'repo_jobs' => 'After all repository jobs — prune and offsite sync too',
+                    ],
+                    'default' => 'backup',
+                    'help' => 'Prune and offsite sync run on the BBS server after the client has finished sending its data, so "after backup" fires while that work is still going. Choose the second option when the script does something the repository cannot survive mid-prune — powering the storage host down being the obvious one. BBS then waits until nothing is left running for this repository and sends the client a job to run the script. The client has to still be online at that point.',
                 ],
                 'abort_on_failure' => [
                     'type' => 'checkbox',
@@ -726,7 +1054,29 @@ class PluginManager
             ],
         ];
 
-        return $schemas[$slug] ?? [];
+        $schema = $schemas[$slug] ?? [];
+        if (!$schema) {
+            return [];
+        }
+
+        // Applies to every plugin, so it is appended here rather than repeated
+        // in each schema above.
+        //
+        // Default OFF: a pre-backup plugin that fails should not cost you the
+        // backup. A partially failed control-panel dump used to abort the run
+        // outright, so the filesystem data — which had nothing to do with the
+        // plugin — went unbacked too, and a client could sit for days with no
+        // backup at all while the underlying problem was a handful of domains.
+        // Turn it on for a plugin whose output you consider mandatory, e.g. a
+        // database dump that the archive is worthless without.
+        $schema['abort_on_failure'] = [
+            'type' => 'checkbox',
+            'label' => 'Abort the backup if this plugin fails',
+            'default' => false,
+            'help' => 'Off (default): if this plugin fails, the failure is logged, the backup still runs, and the job is marked "completed with warnings". On: the plugin failing stops the backup entirely — use it when an archive without this plugin\'s output would be worthless. With a plan that streams database dumps, a dump that fails while borg is already running cannot stop it; the job is marked "completed with warnings".',
+        ];
+
+        return $schema;
     }
 
     /**
@@ -756,7 +1106,10 @@ class PluginManager
                 . "GRANT CONNECT ON DATABASE mydb TO backup_user;\n"
                 . "GRANT USAGE ON SCHEMA public TO backup_user;\n"
                 . "GRANT SELECT ON ALL TABLES IN SCHEMA public TO backup_user;\n"
-                . "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO backup_user;\n\n"
+                . "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO backup_user;\n"
+                . "-- PostgreSQL 14+: read access to every table, including ones in\n"
+                . "-- other schemas or created later, so pg_dump can lock them.\n"
+                . "GRANT pg_read_all_data TO backup_user;\n\n"
                 . "-- For database restore via GUI (requires additional privileges):\n"
                 . "ALTER ROLE backup_user CREATEDB;\n"
                 . "GRANT ALL PRIVILEGES ON DATABASE mydb TO backup_user;",
@@ -777,6 +1130,23 @@ class PluginManager
                 . "])\n\n"
                 . "-- Note: Authentication is optional. Leave username/password\n"
                 . "-- empty if your MongoDB instance does not require auth.",
+            'mssql_dump' => "-- Simplest (backup + restore of every database): run as sysadmin in SSMS/sqlcmd\n"
+                . "CREATE LOGIN bbs_backup WITH PASSWORD = 'strong_password', CHECK_POLICY = OFF;\n"
+                . "ALTER SERVER ROLE [sysadmin] ADD MEMBER bbs_backup;\n\n"
+                . "-- Least privilege instead (backup only): per database to be backed up\n"
+                . "USE [MyDb];\n"
+                . "CREATE USER bbs_backup FOR LOGIN bbs_backup;\n"
+                . "ALTER ROLE db_backupoperator ADD MEMBER bbs_backup;\n"
+                . "-- plus, so that * can list databases and the service account is found:\n"
+                . "GRANT VIEW ANY DATABASE TO bbs_backup;\n"
+                . "GRANT VIEW SERVER STATE TO bbs_backup;\n"
+                . "-- Restore additionally needs: ALTER SERVER ROLE [dbcreator] ADD MEMBER bbs_backup;\n\n"
+                . "Requirements on the client:\n"
+                . "  Windows: nothing to install (the agent uses the built-in .NET SqlClient).\n"
+                . "  Linux:   sqlcmd from mssql-tools18 (or go-sqlcmd).\n"
+                . "The agent must run on the SQL Server machine, and the SQL Server service\n"
+                . "account needs write access to the Dump Directory (the agent tries to grant it).\n"
+                . "Backups use COPY_ONLY, so existing full/differential/log backup chains are untouched.",
             'interworx' => "InterWorx control panel backup plugin.\n\n"
                 . "Requires InterWorx to be installed at the default location\n"
                 . "(~iworx/bin/backup.pex must be accessible).\n\n"

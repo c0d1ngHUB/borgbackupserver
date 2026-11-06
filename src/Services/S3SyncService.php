@@ -6,6 +6,28 @@ use BBS\Core\Database;
 
 class S3SyncService
 {
+    /**
+     * Maximum file_catalog rows to embed in a manifest.
+     *
+     * The manifest is generated inline by the once-a-minute scheduler tick and
+     * holds the scheduler's flock for the whole run, so an unbounded catalog
+     * export stalls every other queued job. It is also pointless past this
+     * size: importManifestFile() json_decode()s the whole document in memory,
+     * so a multi-GB manifest can never be read back.
+     *
+     * At roughly 200 bytes of JSON per row this keeps the catalog section near
+     * the ~50MB ceiling the importer can actually handle. Larger repositories
+     * write archives only and rebuild the catalog via catalog_sync on restore.
+     */
+    public const MANIFEST_MAX_CATALOG_ROWS = 250000;
+
+    /**
+     * What makes rclone report as it goes. bin/bbs-ssh-helper already passes
+     * these on the helper path; the direct path was silent, so a run as the
+     * web user had nothing to show.
+     */
+    private const STATS_FLAGS = ['-v', '--stats-one-line', '--stats', '5s'];
+
     private Database $db;
 
     public function __construct()
@@ -49,7 +71,11 @@ class S3SyncService
                 'bucket' => $settings['bucket'] ?? '',
                 'access_key' => $settings['access_key'] ?? '',
                 'secret_key' => $settings['secret_key'] ?? '',
-                'path_prefix' => $config['path_prefix'] ?? $settings['path_prefix'] ?? '',
+                // Hosted tenants share the platform's bucket, so their own
+                // prefix goes under the platform's rather than replacing it.
+                'path_prefix' => \BBS\Core\Config::isHosted()
+                    ? trim(trim((string) ($settings['path_prefix'] ?? ''), '/') . '/' . trim((string) ($config['path_prefix'] ?? ''), '/'), '/')
+                    : ($config['path_prefix'] ?? $settings['path_prefix'] ?? ''),
                 'bandwidth_limit' => $config['bandwidth_limit'] ?? $settings['bandwidth_limit'] ?? '',
                 'storage_class' => $settings['storage_class'] ?? '',
                 'sse_mode' => $settings['sse_mode'] ?? '',
@@ -91,6 +117,33 @@ class S3SyncService
     }
 
     /**
+     * The stored global credentials with a form's unsaved values laid over
+     * them, for testing before saving (#441). Text fields replace the stored
+     * value when present in the input; the two keys only when non-empty,
+     * since a blank key field means "unchanged". Nothing is written.
+     */
+    public function globalCredentialsWithOverrides(array $input): array
+    {
+        $creds = $this->resolveCredentials(['credential_source' => 'global']);
+        foreach (['endpoint', 'region', 'bucket', 'path_prefix'] as $f) {
+            foreach ([$f, 's3_' . $f] as $k) {
+                if (array_key_exists($k, $input)) {
+                    $creds[$f] = trim((string) $input[$k]);
+                }
+            }
+        }
+        foreach (['access_key', 'secret_key'] as $f) {
+            foreach ([$f, 's3_' . $f] as $k) {
+                $v = trim((string) ($input[$k] ?? ''));
+                if ($v !== '') {
+                    $creds[$f] = $v;
+                }
+            }
+        }
+        return $creds;
+    }
+
+    /**
      * Build environment variables for rclone (env-based config, no rclone.conf needed).
      */
     public function buildRcloneEnv(array $creds): array
@@ -118,251 +171,766 @@ class S3SyncService
     }
 
     /**
-     * Sync a borg repository to S3.
-     * Returns ['success' => bool, 'output' => string].
+     * Queue a sync of one repository to one of its destinations now, rather
+     * than waiting for the next prune (#501). Returns ['ok' => bool,
+     * 'code' => int, 'error' => ?string, 'job_id' => ?int, 'note' => ?string].
+     * The queue runs one job per repository at a time, so a sync queued
+     * while a backup runs waits for it; 'note' says so.
      */
-    public function syncRepository(array $repo, array $agent, array $creds, ?string $runAsUser = null): array
+    public function queueSync(int $agentId, int $repoId, int $pluginConfigId): array
     {
-        if (empty($creds['bucket'])) {
-            return ['success' => false, 'output' => 'No S3 bucket configured'];
+        $repo = $this->db->fetchOne("SELECT id, name, storage_type, read_only FROM repositories WHERE id = ? AND agent_id = ?", [$repoId, $agentId]);
+        if (!$repo) {
+            return ['ok' => false, 'code' => 404, 'error' => 'Repository not found', 'job_id' => null, 'note' => null];
+        }
+        if (($repo['storage_type'] ?? 'local') !== 'local') {
+            return ['ok' => false, 'code' => 400, 'error' => 'Only local repositories are copied offsite', 'job_id' => null, 'note' => null];
+        }
+        if (!empty($repo['read_only'])) {
+            return ['ok' => false, 'code' => 409, 'error' => 'This repository is a read-only copy restored from an offsite sync. Backup plans and offsite sync cannot use it.', 'job_id' => null, 'note' => null];
+        }
+        $dest = $this->db->fetchOne(
+            "SELECT pc.name FROM repository_s3_configs rsc JOIN plugin_configs pc ON pc.id = rsc.plugin_config_id
+             WHERE rsc.repository_id = ? AND rsc.plugin_config_id = ?",
+            [$repoId, $pluginConfigId]
+        );
+        if (!$dest) {
+            return ['ok' => false, 'code' => 404, 'error' => 'That destination is not attached to this repository', 'job_id' => null, 'note' => null];
+        }
+        $pending = $this->db->fetchOne(
+            "SELECT id, status FROM backup_jobs WHERE repository_id = ? AND task_type = 's3_sync' AND plugin_config_id = ?
+               AND status IN ('queued', 'sent', 'running') LIMIT 1",
+            [$repoId, $pluginConfigId]
+        );
+        if ($pending) {
+            return ['ok' => false, 'code' => 409, 'error' => "A sync to \"{$dest['name']}\" is already {$pending['status']} (job #{$pending['id']})", 'job_id' => (int) $pending['id'], 'note' => null];
+        }
+        $active = $this->db->fetchOne(
+            "SELECT id, task_type FROM backup_jobs WHERE repository_id = ? AND status IN ('queued', 'sent', 'running') LIMIT 1",
+            [$repoId]
+        );
+        $jobId = (int) $this->db->insert('backup_jobs', [
+            'agent_id' => $agentId,
+            'repository_id' => $repoId,
+            'task_type' => 's3_sync',
+            'plugin_config_id' => $pluginConfigId,
+            'status' => 'queued',
+        ]);
+        $this->db->insert('server_log', [
+            'agent_id' => $agentId,
+            'backup_job_id' => $jobId,
+            'level' => 'info',
+            'message' => "Offsite sync to \"{$dest['name']}\" queued by request (job #{$jobId})",
+        ]);
+        $note = $active ? "It runs after the " . \BBS\Core\JobType::label($active['task_type']) . " job #{$active['id']} that is on this repository now, so the copy is taken from a settled repository." : null;
+        $maintenance = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'maintenance_mode'");
+        if (($maintenance['value'] ?? '0') === '1') {
+            $note = trim(($note ?? '') . ' Maintenance mode is on, so it waits until that is turned off.');
+        }
+        return ['ok' => true, 'code' => 202, 'error' => null, 'job_id' => $jobId, 'note' => $note];
+    }
+
+    /** Destination types an Offsite Sync config can point at (#413). */
+    public const TYPE_S3 = 's3';
+    public const TYPE_SFTP = 'sftp';
+    public const TYPE_LOCAL = 'local';
+
+    /**
+     * Turn a plugin config into an rclone destination: its type, a label
+     * for the UI, the RCLONE_CONFIG_DEST_* environment that configures the
+     * backend, the base "DEST:bucket/prefix" (or a bare local path) that
+     * client and repository folders hang under, and extra rclone flags.
+     * 'error' is set, and nothing else is usable, when the destination
+     * cannot be built: a missing bucket, a deleted SSH host or storage
+     * location, or a BorgBase host, which accepts borg only.
+     *
+     * S3 is the default so every config saved before destination types
+     * existed keeps working unchanged.
+     */
+    public function resolveDestination(array $config): array
+    {
+        $type = $config['target_type'] ?? self::TYPE_S3;
+        if (!in_array($type, [self::TYPE_S3, self::TYPE_SFTP, self::TYPE_LOCAL], true)) {
+            $type = self::TYPE_S3;
+        }
+        $prefix = trim((string) ($config['path_prefix'] ?? ''), '/');
+        $bandwidth = trim((string) ($config['bandwidth_limit'] ?? ''));
+
+        // Hosted tenants copy to the platform's bucket only, whatever the
+        // config says; configs saved through the API before this check
+        // could say otherwise.
+        if (\BBS\Core\Config::isHosted()) {
+            $type = self::TYPE_S3;
+            $config = ['credential_source' => 'global'] + array_intersect_key($config, array_flip(['path_prefix', 'bandwidth_limit']));
+        }
+        if (($problem = self::pathPrefixProblem($prefix, $type)) !== null) {
+            return $this->destinationError($type, $problem);
         }
 
-        if (!$this->isRcloneInstalled()) {
-            return ['success' => false, 'output' => 'rclone is not installed on this server'];
+        if ($type === self::TYPE_S3) {
+            return $this->destinationFromCredentials($this->resolveCredentials($config));
         }
 
-        // Build remote path: bucket/prefix/agent-name/repo-name/
-        $agentName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $agent['name'] ?? 'unknown');
-        $repoName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $repo['name'] ?? 'unknown');
-        $prefix = trim($creds['path_prefix'], '/');
-        $remotePath = $prefix ? "{$prefix}/{$agentName}/{$repoName}" : "{$agentName}/{$repoName}";
-        $remote = "S3:{$creds['bucket']}/{$remotePath}/";
-
-        // Get local repo path
-        $localPath = \BBS\Services\BorgCommandBuilder::getLocalRepoPath($repo);
-        if (empty($localPath) || !is_dir($localPath)) {
-            return ['success' => false, 'output' => "Local repo path not found: {$localPath}"];
-        }
-
-        // Build rclone command. --s3-no-check-bucket skips the pre-flight
-        // CreateBucket call rclone otherwise issues on every session — the
-        // bucket already exists (we never create it), and least-privilege
-        // IAM policies that don't grant s3:CreateBucket 403 on that probe
-        // and abort the whole sync before any object is written.
-        $cmd = ['rclone', 'sync', $localPath, $remote, '--transfers', '4', '--checkers', '8', '--s3-no-check-bucket'];
-
-        if (!empty($creds['bandwidth_limit'])) {
-            $cmd[] = '--bwlimit';
-            $cmd[] = $creds['bandwidth_limit'];
-        }
-
-        // Build environment
-        $env = $this->buildRcloneEnv($creds);
-
-        // Run via bbs-ssh-helper (runs as root via sudo, then sudo -u to the repo user)
-        if ($runAsUser) {
-            $cmd = [
-                'sudo', '/usr/local/bin/bbs-ssh-helper', 'rclone-sync',
-                $runAsUser, $localPath, $remote,
-                $creds['endpoint'] ?? '', $creds['region'] ?? '',
-                $creds['access_key'] ?? '', $creds['secret_key'] ?? '',
-            ];
-            if (!empty($creds['bandwidth_limit'])) {
-                $cmd[] = '--bwlimit';
-                $cmd[] = $creds['bandwidth_limit'];
+        if ($type === self::TYPE_SFTP) {
+            $sshId = (int) ($config['remote_ssh_config_id'] ?? 0);
+            $ssh = $sshId > 0 ? (new RemoteSshService())->getDecrypted($sshId) : null;
+            if (!$ssh) {
+                return $this->destinationError($type, 'The SSH host for this destination no longer exists');
             }
+            if (($ssh['provider'] ?? '') === 'borgbase' || str_contains((string) ($ssh['remote_host'] ?? ''), '.repo.borgbase.com')) {
+                return $this->destinationError($type, 'BorgBase hosts accept borg only, not SFTP; pick another host');
+            }
+            // The host's base path, relative to the login's home unless
+            // absolute. "./" and "" both mean home.
+            $rawBase = trim((string) ($ssh['remote_base_path'] ?? './'));
+            $absolute = str_starts_with($rawBase, '/');
+            $base = trim(preg_replace('#^\./#', '', $rawBase), '/');
+            $root = ($absolute ? '/' : '') . ($base !== '' ? $base . '/' : '') . ($prefix !== '' ? $prefix : 'bbs-sync');
+            // rclone takes the key inline, one line, newlines written as \n.
+            $pem = str_replace(["\r\n", "\r"], "\n", trim((string) ($ssh['ssh_private_key'] ?? ''))) . "\n";
+            return [
+                'type' => $type,
+                'label' => $ssh['name'] . ' (' . $ssh['remote_user'] . '@' . $ssh['remote_host'] . ')',
+                'env' => [
+                    'RCLONE_CONFIG_DEST_TYPE' => 'sftp',
+                    'RCLONE_CONFIG_DEST_HOST' => (string) $ssh['remote_host'],
+                    'RCLONE_CONFIG_DEST_PORT' => (string) ((int) ($ssh['remote_port'] ?? 22) ?: 22),
+                    'RCLONE_CONFIG_DEST_USER' => (string) $ssh['remote_user'],
+                    'RCLONE_CONFIG_DEST_KEY_PEM' => str_replace("\n", '\n', $pem),
+                ],
+                'base' => 'DEST:' . $root,
+                'flags' => [],
+                'bandwidth_limit' => $bandwidth,
+                'error' => null,
+            ];
         }
 
-        $desc = [
-            0 => ['pipe', 'r'],
-            1 => ['pipe', 'w'],
-            2 => ['pipe', 'w'],
-        ];
-
-        // For non-sudo runs (e.g. test connection), pass env vars directly
-        // Filter $_SERVER to only include string values (avoid "Array to string conversion" warnings)
-        $baseEnv = array_filter($_SERVER, 'is_string');
-        $procEnv = array_merge($baseEnv, $env);
-
-        $proc = proc_open($cmd, $desc, $pipes, null, $procEnv);
-        if (!is_resource($proc)) {
-            return ['success' => false, 'output' => 'Failed to start rclone process'];
+        $locId = (int) ($config['storage_location_id'] ?? 0);
+        $loc = $locId > 0 ? $this->db->fetchOne("SELECT * FROM storage_locations WHERE id = ?", [$locId]) : null;
+        if (!$loc) {
+            return $this->destinationError($type, 'The storage location for this destination no longer exists');
         }
-
-        fclose($pipes[0]);
-        $stdout = stream_get_contents($pipes[1]);
-        fclose($pipes[1]);
-        $stderr = stream_get_contents($pipes[2]);
-        fclose($pipes[2]);
-        $exitCode = proc_close($proc);
-
-        $fullOutput = trim($stdout . "\n" . $stderr);
-
-        // Extract just the final stats line (e.g. "65.046M / 65.046 MBytes, 100%, 26.503 MBytes/s, ETA 0s")
-        $summary = '';
-        if ($exitCode === 0 && !empty($fullOutput)) {
-            $lines = array_filter(array_map('trim', explode("\n", $fullOutput)));
-            $lastLine = end($lines);
-            // Strip rclone log prefix (e.g. "2026/02/02 23:44:04 INFO : ")
-            $summary = preg_replace('/^\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}\s+\w+\s+:\s+/', '', $lastLine);
-        }
-
         return [
-            'success' => $exitCode === 0,
-            'output' => $exitCode === 0
-                ? ($summary ?: 'Sync completed')
-                : ($fullOutput ?: "rclone exited with code {$exitCode}"),
+            'type' => $type,
+            'label' => $loc['label'] . ' (' . $loc['path'] . ')',
+            'env' => [],
+            'base' => rtrim($loc['path'], '/') . '/' . ($prefix !== '' ? $prefix : 'bbs-sync'),
+            'flags' => [],
+            'bandwidth_limit' => $bandwidth,
+            'error' => null,
         ];
     }
 
     /**
-     * Restore a borg repository from S3.
-     * Returns ['success' => bool, 'output' => string].
-     *
-     * @param array $repo Target repository to restore into
-     * @param array $agent Agent that owns the repository
-     * @param array $creds S3 credentials
-     * @param string|null $runAsUser Unix user to run as
-     * @param array|null $sourceRepo For "copy" mode: the source repo to pull S3 data from
+     * What is wrong with a sync path prefix, as a message; null when nothing
+     * is. The prefix is joined into a local path, an SFTP path or an S3 key,
+     * so "." and ".." folders would reach outside the sync area, including
+     * other clients' repositories on a storage location, where client
+     * folders are named by number. $strict adds the character rules applied
+     * when a config is saved; without it, only what is unsafe at use time.
      */
-    public function restoreRepository(array $repo, array $agent, array $creds, ?string $runAsUser = null, ?array $sourceRepo = null): array
+    public static function pathPrefixProblem(string $prefix, string $type, bool $strict = false): ?string
+    {
+        $prefix = trim($prefix, '/');
+        if ($prefix === '') {
+            return null;
+        }
+        $segments = explode('/', $prefix);
+        foreach ($segments as $seg) {
+            if ($seg === '' || $seg === '.' || $seg === '..' || str_contains($seg, "\0") || str_contains($seg, '\\')) {
+                return 'Path prefix cannot contain empty, "." or ".." folders.';
+            }
+            if ($strict && !preg_match('/^[A-Za-z0-9._-]+$/', $seg)) {
+                return 'Path prefix may only use letters, digits, ".", "_" and "-", with "/" between folders.';
+            }
+        }
+        if ($strict && strlen($prefix) > 200) {
+            return 'Path prefix is too long (200 characters at most).';
+        }
+        if ($type === self::TYPE_LOCAL && ctype_digit($segments[0])) {
+            return 'On a storage location the path prefix cannot start with a number; client folders use those names.';
+        }
+        return null;
+    }
+
+    /**
+     * An S3 destination from resolved credentials: the global settings, a
+     * config's custom credentials, or a form's unsaved values under test.
+     */
+    public function destinationFromCredentials(array $creds): array
     {
         if (empty($creds['bucket'])) {
-            return ['success' => false, 'output' => 'No S3 bucket configured'];
+            return $this->destinationError(self::TYPE_S3, 'No S3 bucket configured');
+        }
+        $env = [];
+        foreach ($this->buildRcloneEnv($creds) as $k => $v) {
+            $env[str_replace('RCLONE_CONFIG_S3_', 'RCLONE_CONFIG_DEST_', $k)] = $v;
+        }
+        $prefix = trim((string) ($creds['path_prefix'] ?? ''), '/');
+        $host = preg_replace('#^https?://#', '', (string) ($creds['endpoint'] ?? ''));
+        return [
+            'type' => self::TYPE_S3,
+            'label' => 'S3 bucket ' . $creds['bucket'] . ($host !== '' ? ' at ' . $host : ''),
+            'env' => $env,
+            'base' => 'DEST:' . $creds['bucket'] . ($prefix !== '' ? '/' . $prefix : ''),
+            // Skip the pre-flight CreateBucket call rclone otherwise issues
+            // on every session: the bucket exists, and least-privilege IAM
+            // policies without s3:CreateBucket 403 on the probe.
+            'flags' => ['--s3-no-check-bucket'],
+            'bandwidth_limit' => trim((string) ($creds['bandwidth_limit'] ?? '')),
+            'error' => null,
+        ];
+    }
+
+    /**
+     * Type and label of a config's destination without touching secrets,
+     * for lists and badges.
+     */
+    public function describeDestination(array $config): array
+    {
+        $type = $config['target_type'] ?? self::TYPE_S3;
+        if ($type === self::TYPE_SFTP) {
+            $ssh = (new RemoteSshService())->getById((int) ($config['remote_ssh_config_id'] ?? 0));
+            return ['type' => $type, 'label' => $ssh ? $ssh['name'] . ' (' . $ssh['remote_user'] . '@' . $ssh['remote_host'] . ')' : 'SSH host (deleted)'];
+        }
+        if ($type === self::TYPE_LOCAL) {
+            $loc = $this->db->fetchOne("SELECT label, path FROM storage_locations WHERE id = ?", [(int) ($config['storage_location_id'] ?? 0)]);
+            return ['type' => $type, 'label' => $loc ? $loc['label'] . ' (' . $loc['path'] . ')' : 'Storage location (deleted)'];
+        }
+        if (($config['credential_source'] ?? 'global') === 'global') {
+            $bucket = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 's3_bucket'");
+            return ['type' => self::TYPE_S3, 'label' => !empty($bucket['value']) ? 'S3 bucket ' . $bucket['value'] . ' (global settings)' : 'Global S3 settings (not configured)'];
+        }
+        return ['type' => self::TYPE_S3, 'label' => 'S3 bucket ' . ($config['bucket'] ?? '?')];
+    }
+
+    private function destinationError(string $type, string $error): array
+    {
+        return ['type' => $type, 'label' => '', 'env' => [], 'base' => '', 'flags' => [], 'bandwidth_limit' => '', 'error' => $error];
+    }
+
+    /** Callers that still pass S3 credentials get a destination made of them. */
+    private function asDestination(array $destOrCreds): array
+    {
+        if (isset($destOrCreds['type'], $destOrCreds['base'])) {
+            return $destOrCreds;
+        }
+        return $this->destinationFromCredentials($destOrCreds);
+    }
+
+    /**
+     * Where a client's copies live on the destination:
+     * <base>/<client>/[<repo>/][suffix]. Names are reduced to
+     * [A-Za-z0-9_-], as they always were, so existing S3 layouts are
+     * unchanged.
+     */
+    private function remoteFor(array $dest, string $agentName, ?string $repoName = null, string $suffix = ''): string
+    {
+        $clean = fn(string $n) => preg_replace('/[^a-zA-Z0-9_-]/', '_', $n !== '' ? $n : 'unknown');
+        $path = $dest['base'] . '/' . $clean($agentName) . '/';
+        if ($repoName !== null) {
+            $path .= $clean($repoName) . '/';
+        }
+        return $path . $suffix;
+    }
+
+    private function rcloneFlags(array $dest, bool $withBandwidth = true): array
+    {
+        $flags = $dest['flags'] ?? [];
+        if ($withBandwidth && !empty($dest['bandwidth_limit'])) {
+            $flags[] = '--bwlimit';
+            $flags[] = $dest['bandwidth_limit'];
+        }
+        return $flags;
+    }
+
+    /**
+     * Drain a running process, handing each complete output line to $onLine.
+     *
+     * The blocking stream_get_contents() this replaces held every line until
+     * rclone exited, so the periodic stats lines it already emits — transferred
+     * / total, percent, speed, ETA — were read and thrown away, and a sync of
+     * several hours showed no progress at all.
+     *
+     * stdout and stderr are drained in the same pass: rclone logs to stderr
+     * when run directly, while the SSH helper folds both into its stdout with
+     * 2>&1. A partial line is kept until its newline arrives, so a stats line
+     * split across two reads is never handed over truncated.
+     *
+     * @return array{stdout:string,stderr:string,timedOut:bool}
+     */
+    private function pump($proc, array $pipes, ?callable $onLine, ?int $timeoutSeconds): array
+    {
+        stream_set_blocking($pipes[1], false);
+        stream_set_blocking($pipes[2], false);
+        $out = ['', ''];
+        $tail = ['', ''];
+        $timedOut = false;
+        $deadline = $timeoutSeconds === null ? null : time() + $timeoutSeconds;
+
+        while (true) {
+            // Status first, read second: a process that exits between the two
+            // has already closed its pipes, so the read that follows still
+            // returns everything it wrote.
+            $running = (bool) proc_get_status($proc)['running'];
+
+            foreach ([0, 1] as $i) {
+                $chunk = stream_get_contents($pipes[$i + 1]);
+                if ($chunk === false || $chunk === '') {
+                    continue;
+                }
+                $out[$i] .= $chunk;
+                if ($onLine === null) {
+                    continue;
+                }
+                $tail[$i] .= $chunk;
+                while (($nl = strpos($tail[$i], "\n")) !== false) {
+                    $line = rtrim(substr($tail[$i], 0, $nl), "\r");
+                    $tail[$i] = substr($tail[$i], $nl + 1);
+                    if ($line !== '') {
+                        $onLine($line);
+                    }
+                }
+            }
+
+            if (!$running) {
+                break;
+            }
+            if ($deadline !== null && time() >= $deadline) {
+                $timedOut = true;
+                proc_terminate($proc, 9);
+                break;
+            }
+            // rclone reports every 5s; polling five times a second is enough to
+            // stay responsive without spinning.
+            usleep(200000);
         }
 
+        return ['stdout' => $out[0], 'stderr' => $out[1], 'timedOut' => $timedOut];
+    }
+
+    /**
+     * Run rclone as the web user with the destination in its environment.
+     * A timeout kills a run that hangs on a dead endpoint; null waits.
+     * Returns ['stdout', 'stderr', 'exitCode', 'timedOut'].
+     */
+    private function runDirect(array $dest, array $args, ?int $timeoutSeconds = null, ?callable $onLine = null): array
+    {
+        $env = [
+            'RCLONE_CONFIG' => '/dev/null',
+            'HOME' => '/tmp',
+            'PATH' => '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+        ] + ($dest['env'] ?? []);
+        $desc = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+        $proc = proc_open(array_merge(['rclone'], $args), $desc, $pipes, null, $env);
+        if (!is_resource($proc)) {
+            return ['stdout' => '', 'stderr' => 'Failed to start rclone process', 'exitCode' => -1, 'timedOut' => false];
+        }
+        fclose($pipes[0]);
+        $r = $this->pump($proc, $pipes, $onLine, $timeoutSeconds);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $exitCode = proc_close($proc);
+        return [
+            'stdout' => $r['stdout'],
+            'stderr' => $r['stderr'],
+            'exitCode' => $r['timedOut'] ? -1 : $exitCode,
+            'timedOut' => $r['timedOut'],
+        ];
+    }
+
+    /**
+     * Run a repository transfer through bbs-ssh-helper as the repo-owning
+     * user. The destination's environment goes to the helper in a 0600
+     * file of KEY=base64(value) lines, never on the command line, so
+     * credentials and SSH keys do not show in ps. The helper removes the
+     * file; this removes it too in case the helper never ran.
+     */
+    private function runViaHelper(array $dest, string $runAsUser, string $direction, string $localPath, string $remote, ?callable $onLine = null): array
+    {
+        $envFile = tempnam(sys_get_temp_dir(), 'bbs-dest-');
+        if ($envFile === false) {
+            return ['stdout' => '', 'stderr' => 'Cannot create a temp file in ' . sys_get_temp_dir(), 'exitCode' => -1, 'timedOut' => false];
+        }
+        chmod($envFile, 0600);
+        $lines = '';
+        foreach ($dest['env'] ?? [] as $k => $v) {
+            $lines .= $k . '=' . base64_encode((string) $v) . "\n";
+        }
+        file_put_contents($envFile, $lines);
+        try {
+            $cmd = array_merge(
+                ['sudo', '/usr/local/bin/bbs-ssh-helper', 'rclone-transfer', $runAsUser, $direction, $localPath, $remote, $envFile],
+                $this->rcloneFlags($dest)
+            );
+            $desc = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+            $proc = proc_open($cmd, $desc, $pipes, null, array_filter($_SERVER, 'is_string'));
+            if (!is_resource($proc)) {
+                return ['stdout' => '', 'stderr' => 'Failed to start rclone process', 'exitCode' => -1, 'timedOut' => false];
+            }
+            fclose($pipes[0]);
+            $r = $this->pump($proc, $pipes, $onLine, null);
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            return [
+                'stdout' => $r['stdout'],
+                'stderr' => $r['stderr'],
+                'exitCode' => proc_close($proc),
+                'timedOut' => false,
+            ];
+        } finally {
+            @unlink($envFile);
+        }
+    }
+
+    /**
+     * A line handler that turns rclone's periodic stats into job progress.
+     *
+     * rclone already prints, every 5s under --stats-one-line:
+     *   Transferred: 521.469 MiB / 1.196 GiB, 43%, 9.185 MiB/s, ETA 1m15s
+     * which carries everything the queue needs. The columns it fills —
+     * bytes_processed, bytes_total, status_message, last_progress_at — are
+     * the ones /api/v1/queue already returns for every task type, so the
+     * queue page and the API draw the bar with no further change.
+     *
+     * Writing last_progress_at is safe here: the stalled-job sweep that reads
+     * it skips server-side task types, s3_sync among them.
+     *
+     * The total and the ETA are rough while rclone is still walking the tree,
+     * and settle once the listing is done. That is rclone's behaviour, not a
+     * rounding choice made here.
+     */
+    private function progressReporter(int $jobId): callable
+    {
+        $lastWrite = 0.0;
+        return function (string $line) use ($jobId, &$lastWrite): void {
+            // The "Transferred:" label is optional: rclone dropped it from the
+            // one-line format (1.75 prints "  178.168 MiB / 178.168 MiB, 100%,
+            // 0 B/s, ETA -"), older builds still print it. Requiring it matched
+            // nothing at all on a current rclone, and said nothing about why.
+            // The size units are what makes this a stats line and not a file
+            // name — the sibling "Transferred: 12 / 12, 100%" counter carries
+            // no unit and is correctly ignored.
+            if (!preg_match(
+                '~(?:Transferred:)?\s*([\d.]+)\s*([KMGTP]?i?B)\s*/\s*([\d.]+)\s*([KMGTP]?i?B),\s*(\d+)\s*%~',
+                $line, $m
+            )) {
+                return;
+            }
+            // rclone speaks every 5s; this only guards against a build that
+            // was configured to speak far more often. The last line is never
+            // dropped, whatever its timing: a finished sync left showing 93%
+            // reads as a partial failure, and rclone's closing line often
+            // follows the previous one by less than the guard.
+            $now = microtime(true);
+            if ((int) $m[5] < 100 && $now - $lastWrite < 2.0) {
+                return;
+            }
+            $lastWrite = $now;
+
+            $clean = preg_replace('/^\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}\s+\w+\s*:\s*/', '', $line);
+
+            $row = [
+                'bytes_processed' => self::toBytes($m[1], $m[2]),
+                'bytes_total' => self::toBytes($m[3], $m[4]),
+                'status_message' => mb_substr(trim($clean), 0, 255),
+                'last_progress_at' => date('Y-m-d H:i:s'),
+            ];
+            // rclone appends "(xfr#29/923)" while transfers are in flight:
+            // files started over files queued. Matched on its own rather than
+            // folded into the pattern above — it is absent from the closing
+            // line, and an optional tail makes the whole expression fragile.
+            if (preg_match('~\(xfr#(\d+)/(\d+)\)~', $line, $x)) {
+                $row['files_processed'] = (int) $x[1];
+                $row['files_total'] = (int) $x[2];
+            }
+
+            try {
+                $this->db->update('backup_jobs', $row, 'id = ?', [$jobId]);
+            } catch (\Throwable $e) {
+                // Progress is a courtesy: a failed write must never abort a
+                // transfer that is otherwise going fine.
+            }
+        };
+    }
+
+    /** rclone's human sizes back to bytes. Binary units, as rclone prints them. */
+    private static function toBytes(string $n, string $unit): int
+    {
+        $mult = ['B' => 1, 'KiB' => 1024, 'MiB' => 1024 ** 2, 'GiB' => 1024 ** 3,
+                 'TiB' => 1024 ** 4, 'PiB' => 1024 ** 5,
+                 'KB' => 1000, 'MB' => 1000 ** 2, 'GB' => 1000 ** 3,
+                 'TB' => 1000 ** 4, 'PB' => 1000 ** 5];
+        return (int) round(((float) $n) * ($mult[$unit] ?? 1));
+    }
+
+    /** The final rclone stats line, without its timestamp prefix. */
+    private function summaryLine(string $output): string
+    {
+        $lines = array_filter(array_map('trim', explode("\n", $output)));
+        $last = end($lines);
+        return $last ? preg_replace('/^\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}\s+\w+\s+:\s+/', '', $last) : '';
+    }
+
+    /**
+     * Copy a repository to its destination.
+     * Returns ['success' => bool, 'output' => string].
+     */
+    public function syncRepository(array $repo, array $agent, array $destOrCreds, ?string $runAsUser = null, ?int $jobId = null): array
+    {
+        $dest = $this->asDestination($destOrCreds);
+        if ($dest['error']) {
+            return ['success' => false, 'output' => $dest['error']];
+        }
         if (!$this->isRcloneInstalled()) {
             return ['success' => false, 'output' => 'rclone is not installed on this server'];
         }
-
-        // Build remote path: bucket/prefix/agent-name/repo-name/
-        // For "copy" mode, use sourceRepo's name for the S3 path
-        $agentName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $agent['name'] ?? 'unknown');
-        $sourceRepoName = $sourceRepo['name'] ?? $repo['name'];
-        $repoName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $sourceRepoName ?? 'unknown');
-        $prefix = trim($creds['path_prefix'], '/');
-        $remotePath = $prefix ? "{$prefix}/{$agentName}/{$repoName}" : "{$agentName}/{$repoName}";
-        $remote = "S3:{$creds['bucket']}/{$remotePath}/";
-
-        // Get local repo path
+        $remote = $this->remoteFor($dest, (string) ($agent['name'] ?? ''), (string) ($repo['name'] ?? ''));
         $localPath = \BBS\Services\BorgCommandBuilder::getLocalRepoPath($repo);
-        if (empty($localPath)) {
-            return ['success' => false, 'output' => "Local repo path not configured"];
+        if (empty($localPath) || !is_dir($localPath)) {
+            return ['success' => false, 'output' => "Local repo path not found: {$localPath}"];
+        }
+        if ($dest['type'] === self::TYPE_LOCAL && str_starts_with(rtrim($remote, '/') . '/', rtrim($localPath, '/') . '/')) {
+            return ['success' => false, 'output' => 'The destination is inside the repository itself'];
         }
 
-        // Create local directory if it doesn't exist
-        if (!is_dir($localPath)) {
+        // The helper already runs rclone with -v --stats-one-line --stats 5s;
+        // the direct path did not, so it had nothing to report. Both now do.
+        $onLine = $jobId !== null ? $this->progressReporter($jobId) : null;
+        if ($runAsUser) {
+            $r = $this->runViaHelper($dest, $runAsUser, 'push', $localPath, $remote, $onLine);
+        } else {
+            $r = $this->runDirect($dest, array_merge(
+                ['sync', $localPath, $remote, '--transfers', '4', '--checkers', '8'],
+                self::STATS_FLAGS,
+                $this->rcloneFlags($dest)
+            ), null, $onLine);
+        }
+        $fullOutput = trim($r['stdout'] . "\n" . $r['stderr']);
+        $ok = $r['exitCode'] === 0;
+        return [
+            'success' => $ok,
+            'output' => $ok ? ($this->summaryLine($fullOutput) ?: 'Sync completed') : ($fullOutput ?: "rclone exited with code {$r['exitCode']}"),
+        ];
+    }
+
+    /**
+     * Bring a repository back from its destination, over the local copy.
+     * For "copy" mode, $sourceRepo names the repository whose offsite copy
+     * to pull, into $repo's path.
+     * Returns ['success' => bool, 'output' => string].
+     */
+    public function restoreRepository(array $repo, array $agent, array $destOrCreds, ?string $runAsUser = null, ?array $sourceRepo = null, ?int $jobId = null): array
+    {
+        $dest = $this->asDestination($destOrCreds);
+        if ($dest['error']) {
+            return ['success' => false, 'output' => $dest['error']];
+        }
+        if (!$this->isRcloneInstalled()) {
+            return ['success' => false, 'output' => 'rclone is not installed on this server'];
+        }
+        $remote = $this->remoteFor($dest, (string) ($agent['name'] ?? ''), (string) (($sourceRepo['name'] ?? null) ?? ($repo['name'] ?? '')));
+        $localPath = \BBS\Services\BorgCommandBuilder::getLocalRepoPath($repo);
+        if (empty($localPath)) {
+            return ['success' => false, 'output' => 'Local repo path not configured'];
+        }
+        if (!is_dir($localPath) && !$runAsUser) {
             $parentDir = dirname($localPath);
             if (!is_dir($parentDir)) {
                 mkdir($parentDir, 0755, true);
             }
         }
 
-        // Build rclone command - sync FROM S3 TO local (reverse of syncRepository).
-        // --s3-no-check-bucket: see syncRepository().
-        $cmd = ['rclone', 'sync', $remote, $localPath, '--transfers', '4', '--checkers', '8', '--s3-no-check-bucket'];
-
-        if (!empty($creds['bandwidth_limit'])) {
-            $cmd[] = '--bwlimit';
-            $cmd[] = $creds['bandwidth_limit'];
-        }
-
-        // Build environment
-        $env = $this->buildRcloneEnv($creds);
-
-        // Run via bbs-ssh-helper (runs as root via sudo, then sudo -u to the repo user)
+        $onLine = $jobId !== null ? $this->progressReporter($jobId) : null;
         if ($runAsUser) {
-            $cmd = [
-                'sudo', '/usr/local/bin/bbs-ssh-helper', 'rclone-restore',
-                $runAsUser, $remote, $localPath,
-                $creds['endpoint'] ?? '', $creds['region'] ?? '',
-                $creds['access_key'] ?? '', $creds['secret_key'] ?? '',
-            ];
-            if (!empty($creds['bandwidth_limit'])) {
-                $cmd[] = '--bwlimit';
-                $cmd[] = $creds['bandwidth_limit'];
-            }
+            $r = $this->runViaHelper($dest, $runAsUser, 'pull', $localPath, $remote, $onLine);
+        } else {
+            $r = $this->runDirect($dest, array_merge(
+                ['sync', $remote, $localPath, '--transfers', '4', '--checkers', '8'],
+                self::STATS_FLAGS,
+                $this->rcloneFlags($dest)
+            ), null, $onLine);
         }
-
-        $desc = [
-            0 => ['pipe', 'r'],
-            1 => ['pipe', 'w'],
-            2 => ['pipe', 'w'],
-        ];
-
-        // For non-sudo runs, pass env vars directly
-        // When running via helper (runAsUser is set), env is handled by the helper
-        $envStrings = $runAsUser ? null : array_filter($_SERVER, 'is_string') + $env;
-
-        $proc = proc_open($cmd, $desc, $pipes, null, $envStrings);
-        if (!is_resource($proc)) {
-            return ['success' => false, 'output' => 'Failed to start rclone process'];
-        }
-
-        fclose($pipes[0]);
-        $stdout = stream_get_contents($pipes[1]);
-        fclose($pipes[1]);
-        $stderr = stream_get_contents($pipes[2]);
-        fclose($pipes[2]);
-        $exitCode = proc_close($proc);
-
-        $fullOutput = trim($stdout . "\n" . $stderr);
-
-        // Extract summary
-        $summary = '';
-        if ($exitCode === 0 && !empty($fullOutput)) {
-            $lines = array_filter(array_map('trim', explode("\n", $fullOutput)));
-            $lastLine = end($lines);
-            $summary = preg_replace('/^\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}\s+\w+\s+:\s+/', '', $lastLine);
-        }
-
+        $fullOutput = trim($r['stdout'] . "\n" . $r['stderr']);
+        $ok = $r['exitCode'] === 0;
         return [
-            'success' => $exitCode === 0,
-            'output' => $exitCode === 0
-                ? ($summary ?: 'Restore completed')
-                : ($fullOutput ?: "rclone exited with code {$exitCode}"),
+            'success' => $ok,
+            'output' => $ok ? ($this->summaryLine($fullOutput) ?: 'Restore completed') : ($fullOutput ?: "rclone exited with code {$r['exitCode']}"),
         ];
     }
 
     /**
-     * Test S3 connection by listing the bucket root.
+     * Can the destination be reached? Lists the bucket, the SSH login's
+     * home, or checks the local folder exists.
+     * Returns ['success' => bool, 'error' => string|null, 'label' => string].
      */
-    public function testConnection(array $creds): array
+    public function testConnection(array $destOrCreds): array
     {
-        if (empty($creds['bucket'])) {
-            return ['success' => false, 'error' => 'No bucket configured'];
+        $dest = $this->asDestination($destOrCreds);
+        if ($dest['error']) {
+            return ['success' => false, 'error' => $dest['error'], 'label' => ''];
         }
-
+        if ($dest['type'] === self::TYPE_LOCAL) {
+            $root = preg_replace('#/[^/]+$#', '', $dest['base']);
+            if (!is_dir($root)) {
+                return ['success' => false, 'error' => "Folder not found: {$root}", 'label' => $dest['label']];
+            }
+            return ['success' => true, 'error' => null, 'label' => $dest['label']];
+        }
         if (!$this->isRcloneInstalled()) {
-            return ['success' => false, 'error' => 'rclone is not installed on this server. Install with: apt install rclone'];
+            return ['success' => false, 'error' => 'rclone is not installed on this server. Install with: apt install rclone', 'label' => $dest['label']];
         }
-
-        // Validate endpoint looks like a real URL before wasting time on rclone
-        $endpoint = $creds['endpoint'] ?? '';
-        if (!empty($endpoint)) {
-            if (!preg_match('#^https?://#i', $endpoint)) {
-                $endpoint = 'https://' . $endpoint;
+        if ($dest['type'] === self::TYPE_S3) {
+            $endpoint = (string) ($dest['env']['RCLONE_CONFIG_DEST_ENDPOINT'] ?? '');
+            if ($endpoint !== '') {
+                if (!preg_match('#^https?://#i', $endpoint)) {
+                    $endpoint = 'https://' . $endpoint;
+                }
+                $parsed = parse_url($endpoint);
+                if (empty($parsed['host']) || !preg_match('/\.[a-z]{2,}$/i', $parsed['host'])) {
+                    return ['success' => false, 'error' => 'Invalid endpoint URL — must be a hostname like s3.us-east-1.amazonaws.com', 'label' => $dest['label']];
+                }
             }
-            $parsed = parse_url($endpoint);
-            if (empty($parsed['host']) || !preg_match('/\.[a-z]{2,}$/i', $parsed['host'])) {
-                return ['success' => false, 'error' => 'Invalid endpoint URL — must be a hostname like s3.us-east-1.amazonaws.com'];
+            // The bucket root, whatever prefix the config adds.
+            $target = preg_replace('#^(DEST:[^/]+).*$#', '$1/', $dest['base']);
+        } else {
+            $target = 'DEST:';
+        }
+        $r = $this->runDirect($dest, array_merge(['lsd', $target, '--max-depth', '1', '--contimeout', '5s', '--timeout', '8s'], $this->rcloneFlags($dest, false)), 12);
+        if ($r['exitCode'] !== 0) {
+            $error = trim($r['stderr']) ?: trim($r['stdout']) ?: "rclone exited with code {$r['exitCode']}";
+            if ($r['timedOut']) {
+                $error = 'Connection timed out — check the host or endpoint and the credentials';
+            }
+            return ['success' => false, 'error' => $error, 'label' => $dest['label']];
+        }
+        return ['success' => true, 'error' => null, 'label' => $dest['label']];
+    }
+
+    /**
+     * Repository folders present for a client on the destination, for
+     * finding copies whose local repository is gone.
+     * Returns ['success' => bool, 'repos' => string[], 'error' => string|null].
+     */
+    public function listRemoteRepos(string $agentName, array $destOrCreds): array
+    {
+        $dest = $this->asDestination($destOrCreds);
+        if ($dest['error']) {
+            return ['success' => false, 'repos' => [], 'error' => $dest['error']];
+        }
+        $remote = $this->remoteFor($dest, $agentName);
+        if ($dest['type'] === self::TYPE_LOCAL) {
+            if (!is_dir($remote)) {
+                return ['success' => true, 'repos' => [], 'error' => null];
+            }
+            $repos = array_values(array_filter(scandir($remote) ?: [], fn($n) => $n[0] !== '.' && is_dir($remote . $n)));
+            return ['success' => true, 'repos' => $repos, 'error' => null];
+        }
+        if (!$this->isRcloneInstalled()) {
+            return ['success' => false, 'repos' => [], 'error' => 'rclone is not installed'];
+        }
+        $r = $this->runDirect($dest, array_merge(['lsd', $remote, '--contimeout', '5s', '--timeout', '8s'], $this->rcloneFlags($dest, false)), 10);
+        // Exit code 3: the client folder does not exist yet.
+        if ($r['exitCode'] === 3) {
+            return ['success' => true, 'repos' => [], 'error' => null];
+        }
+        if ($r['exitCode'] !== 0) {
+            $error = trim($r['stderr']) ?: trim($r['stdout']) ?: "rclone exited with code {$r['exitCode']}";
+            if ($r['timedOut']) {
+                $error = 'Connection timed out — check the host or endpoint and the credentials';
+            }
+            return ['success' => false, 'repos' => [], 'error' => $error];
+        }
+        // rclone lsd: "          -1 2024-01-15 10:30:00        -1 repo-name"
+        $repos = [];
+        foreach (array_filter(array_map('trim', explode("\n", $r['stdout']))) as $line) {
+            $parts = preg_split('/\s+/', $line);
+            $name = end($parts);
+            if (!empty($name)) {
+                $repos[] = $name;
             }
         }
+        return ['success' => true, 'repos' => $repos, 'error' => null];
+    }
 
-        $remote = "S3:{$creds['bucket']}/";
-        $cmd = ['rclone', 'lsd', $remote, '--max-depth', '1', '--contimeout', '5s', '--timeout', '8s', '--s3-no-check-bucket'];
-
-        $result = $this->runRcloneWithTimeout($cmd, $creds, 10);
-
-        if ($result['exitCode'] !== 0) {
-            $error = trim($result['stderr']) ?: trim($result['stdout']) ?: "rclone exited with code {$result['exitCode']}";
-            if ($result['timedOut']) {
-                $error = 'Connection timed out — check endpoint URL and credentials';
-            }
-            return ['success' => false, 'error' => $error];
+    /**
+     * Put the manifest beside the repository copy on the destination.
+     * Returns ['success' => bool, 'output' => string]. The file is removed.
+     */
+    public function uploadManifestFile(string $manifestFile, array $repo, array $agent, array $destOrCreds): array
+    {
+        $dest = $this->asDestination($destOrCreds);
+        if ($dest['error']) {
+            @unlink($manifestFile);
+            return ['success' => false, 'output' => $dest['error']];
         }
+        if (!$this->isRcloneInstalled()) {
+            @unlink($manifestFile);
+            return ['success' => false, 'output' => 'rclone is not installed'];
+        }
+        $remote = $this->remoteFor($dest, (string) ($agent['name'] ?? ''), (string) ($repo['name'] ?? ''), '.bbs-manifest.json');
+        $r = $this->runDirect($dest, array_merge(['copyto', $manifestFile, $remote], $this->rcloneFlags($dest, false)));
+        @unlink($manifestFile);
+        return [
+            'success' => $r['exitCode'] === 0,
+            'output' => $r['exitCode'] === 0 ? 'Manifest uploaded' : (trim($r['stderr'] . $r['stdout']) ?: "rclone exited with code {$r['exitCode']}"),
+        ];
+    }
 
-        return ['success' => true];
+    /**
+     * Fetch the manifest from the destination into a temp file.
+     * Returns ['success' => bool, 'file' => string|null, 'error' => string|null].
+     * The caller deletes the file.
+     */
+    public function downloadManifestFile(array $repo, array $agent, array $destOrCreds, ?array $sourceRepo = null): array
+    {
+        $dest = $this->asDestination($destOrCreds);
+        if ($dest['error']) {
+            return ['success' => false, 'file' => null, 'error' => $dest['error']];
+        }
+        if (!$this->isRcloneInstalled()) {
+            return ['success' => false, 'file' => null, 'error' => 'rclone is not installed'];
+        }
+        $remote = $this->remoteFor($dest, (string) ($agent['name'] ?? ''), (string) (($sourceRepo['name'] ?? null) ?? ($repo['name'] ?? '')), '.bbs-manifest.json');
+        $tempFile = tempnam(sys_get_temp_dir(), 'bbs-manifest-');
+        if ($tempFile === false) {
+            return ['success' => false, 'file' => null, 'error' => 'Cannot create temp file in ' . sys_get_temp_dir() . ' — check that the directory exists and is writable (TMPDIR)'];
+        }
+        $r = $this->runDirect($dest, array_merge(['copyto', $remote, $tempFile], $this->rcloneFlags($dest, false)));
+        if ($r['exitCode'] !== 0) {
+            @unlink($tempFile);
+            if ($r['exitCode'] === 3 || strpos($r['stderr'] . $r['stdout'], 'not found') !== false) {
+                return ['success' => false, 'file' => null, 'error' => 'Manifest not found'];
+            }
+            return ['success' => false, 'file' => null, 'error' => trim($r['stderr'] . $r['stdout']) ?: "rclone exited with code {$r['exitCode']}"];
+        }
+        if (!file_exists($tempFile) || filesize($tempFile) === 0) {
+            @unlink($tempFile);
+            return ['success' => false, 'file' => null, 'error' => 'Empty manifest file'];
+        }
+        return ['success' => true, 'file' => $tempFile, 'error' => null];
+    }
+
+    /**
+     * Remove a repository's copy from the destination.
+     * Returns ['success' => bool, 'output' => string].
+     */
+    public function deleteFromS3(array $repo, array $agent, array $destOrCreds): array
+    {
+        $dest = $this->asDestination($destOrCreds);
+        if ($dest['error']) {
+            return ['success' => false, 'output' => $dest['error']];
+        }
+        if (!$this->isRcloneInstalled()) {
+            return ['success' => false, 'output' => 'rclone is not installed on this server'];
+        }
+        $remote = $this->remoteFor($dest, (string) ($agent['name'] ?? ''), (string) ($repo['name'] ?? ''));
+        $r = $this->runDirect($dest, array_merge(['purge', $remote], $this->rcloneFlags($dest, false)));
+        $fullOutput = trim($r['stdout'] . "\n" . $r['stderr']);
+        return [
+            'success' => $r['exitCode'] === 0,
+            'output' => $r['exitCode'] === 0 ? 'Offsite copy deleted' : ($fullOutput ?: "rclone exited with code {$r['exitCode']}"),
+        ];
     }
 
     /**
@@ -375,140 +943,19 @@ class S3SyncService
     }
 
     /**
-     * Run an rclone command with a PHP-level timeout to prevent hangs.
-     * Returns ['stdout' => ..., 'stderr' => ..., 'exitCode' => int, 'timedOut' => bool]
-     */
-    private function runRcloneWithTimeout(array $cmd, array $creds, int $timeoutSeconds = 10): array
-    {
-        $env = $this->buildRcloneEnv($creds);
-
-        $desc = [
-            0 => ['pipe', 'r'],
-            1 => ['pipe', 'w'],
-            2 => ['pipe', 'w'],
-        ];
-
-        $envStrings = [
-            'RCLONE_CONFIG' => '/dev/null',
-            'HOME' => '/tmp',
-            'PATH' => '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-        ];
-        foreach ($env as $k => $v) {
-            $envStrings[$k] = $v;
-        }
-
-        $proc = proc_open($cmd, $desc, $pipes, null, $envStrings);
-        if (!is_resource($proc)) {
-            return ['stdout' => '', 'stderr' => 'Failed to start rclone process', 'exitCode' => -1, 'timedOut' => false];
-        }
-
-        fclose($pipes[0]);
-
-        // Set pipes to non-blocking so we can enforce a timeout
-        stream_set_blocking($pipes[1], false);
-        stream_set_blocking($pipes[2], false);
-
-        $stdout = '';
-        $stderr = '';
-        $timedOut = false;
-        $deadline = time() + $timeoutSeconds;
-
-        while (true) {
-            $status = proc_get_status($proc);
-            if (!$status['running']) {
-                // Process finished — drain remaining output
-                $stdout .= stream_get_contents($pipes[1]);
-                $stderr .= stream_get_contents($pipes[2]);
-                break;
-            }
-
-            if (time() >= $deadline) {
-                $timedOut = true;
-                proc_terminate($proc, 9);
-                break;
-            }
-
-            $stdout .= fread($pipes[1], 8192);
-            $stderr .= fread($pipes[2], 8192);
-            usleep(50000); // 50ms
-        }
-
-        fclose($pipes[1]);
-        fclose($pipes[2]);
-        $exitCode = proc_close($proc);
-
-        if ($timedOut) {
-            $exitCode = -1;
-        }
-
-        return ['stdout' => $stdout, 'stderr' => $stderr, 'exitCode' => $exitCode, 'timedOut' => $timedOut];
-    }
-
-    /**
-     * List remote repositories in S3 for a given agent.
-     * Returns array of repo names found in S3 for this agent.
-     */
-    public function listRemoteRepos(string $agentName, array $creds): array
-    {
-        if (empty($creds['bucket'])) {
-            return ['success' => false, 'repos' => [], 'error' => 'No S3 bucket configured'];
-        }
-
-        if (!$this->isRcloneInstalled()) {
-            return ['success' => false, 'repos' => [], 'error' => 'rclone is not installed'];
-        }
-
-        // Sanitize agent name same way as sync
-        $agentName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $agentName);
-        $prefix = trim($creds['path_prefix'], '/');
-        $remotePath = $prefix ? "{$prefix}/{$agentName}/" : "{$agentName}/";
-        $remote = "S3:{$creds['bucket']}/{$remotePath}";
-
-        // List directories (repos) under the agent folder
-        $cmd = ['rclone', 'lsd', $remote, '--contimeout', '5s', '--timeout', '8s', '--s3-no-check-bucket'];
-
-        $result = $this->runRcloneWithTimeout($cmd, $creds, 10);
-
-        // Exit code 3 means directory not found (no repos for this agent yet)
-        if ($result['exitCode'] === 3) {
-            return ['success' => true, 'repos' => []];
-        }
-
-        if ($result['exitCode'] !== 0) {
-            $error = trim($result['stderr']) ?: trim($result['stdout']) ?: "rclone exited with code {$result['exitCode']}";
-            if ($result['timedOut']) {
-                $error = 'Connection timed out — check endpoint URL and credentials';
-            }
-            return ['success' => false, 'repos' => [], 'error' => $error];
-        }
-
-        $stdout = $result['stdout'];
-
-        // Parse rclone lsd output - format: "          -1 2024-01-15 10:30:00        -1 repo-name"
-        $repos = [];
-        $lines = array_filter(array_map('trim', explode("\n", $stdout)));
-        foreach ($lines as $line) {
-            // Last space-separated token is the directory name
-            $parts = preg_split('/\s+/', $line);
-            if (!empty($parts)) {
-                $repoName = end($parts);
-                if (!empty($repoName)) {
-                    $repos[] = $repoName;
-                }
-            }
-        }
-
-        return ['success' => true, 'repos' => $repos];
-    }
-
-    /**
      * Generate a manifest file containing repository metadata, archives, and file catalog.
      * Streams directly to file to handle large catalogs (millions of files) without memory issues.
      * Returns ['success' => bool, 'file' => string, 'archives' => int, 'files' => int].
      */
     public function generateManifestFile(array $repo, array $agent, string $passphrase): array
     {
+        // tempnam() returns false when the temp dir is unusable — e.g. TMPDIR
+        // pointing at a directory that doesn't exist (#371). Fail cleanly
+        // instead of fataling on fopen('').
         $tempFile = tempnam(sys_get_temp_dir(), 'bbs-manifest-');
+        if ($tempFile === false) {
+            return ['success' => false, 'error' => 'Cannot create temp file in ' . sys_get_temp_dir() . ' — check that the directory exists and is writable (TMPDIR)'];
+        }
         $fp = fopen($tempFile, 'w');
 
         // Write opening brace and header fields
@@ -555,11 +1002,34 @@ class S3SyncService
         // Stream file catalog from ClickHouse in batches
         $ch = \BBS\Core\ClickHouse::getInstance();
         $agentId = (int) $agent['id'];
+
+        // Count first: repositories with tens of millions of catalog rows would
+        // otherwise block the scheduler for an hour writing a manifest no
+        // importer can read back. Skip the catalog and flag it instead.
+        $catalogRows = 0;
+        if (!empty($archiveNameById)) {
+            $idList = implode(',', array_map('intval', array_keys($archiveNameById)));
+            $countRow = $ch->fetchOne(
+                "SELECT count() AS c FROM file_catalog
+                 WHERE agent_id = {$agentId} AND archive_id IN ({$idList})"
+            );
+            $catalogRows = (int) ($countRow['c'] ?? 0);
+        }
+
+        $catalogSkipped = $catalogRows > self::MANIFEST_MAX_CATALOG_ROWS;
+        fwrite($fp, '  "file_catalog_skipped": ' . ($catalogSkipped ? 'true' : 'false') . ",\n");
+        fwrite($fp, '  "file_catalog_row_count": ' . $catalogRows . ",\n");
         fwrite($fp, '  "file_catalog": [' . "\n");
 
         $batchSize = 10000;
         $firstFile = true;
         $fileCount = 0;
+
+        // An oversized catalog writes an empty array — archives are still
+        // present, and restore falls back to catalog_sync to rebuild.
+        if ($catalogSkipped) {
+            $archiveNameById = [];
+        }
 
         // Keyset pagination: iterate one archive at a time, paging on path > last.
         // OFFSET-based pagination is O(N^2) in ClickHouse because every batch
@@ -572,7 +1042,7 @@ class S3SyncService
                 $lastPathEsc = addslashes($lastPath);
                 $files = $ch->fetchAll(
                     "SELECT path, file_size,
-                            formatDateTime(mtime, '%Y-%m-%d %H:%i:%S') as mtime
+                            toString(mtime) as mtime
                      FROM file_catalog
                      WHERE agent_id = {$agentId}
                        AND archive_id = {$aid}
@@ -609,149 +1079,9 @@ class S3SyncService
             'file' => $tempFile,
             'archives' => $archiveCount,
             'files' => $fileCount,
+            'catalog_skipped' => $catalogSkipped,
+            'catalog_rows' => $catalogRows,
         ];
-    }
-
-    /**
-     * Upload manifest file to S3 alongside the repository.
-     * Manifest is stored as .bbs-manifest.json in the repo's S3 folder.
-     * @param string $manifestFile Path to the manifest file (will be deleted after upload)
-     */
-    public function uploadManifestFile(string $manifestFile, array $repo, array $agent, array $creds): array
-    {
-        if (empty($creds['bucket'])) {
-            @unlink($manifestFile);
-            return ['success' => false, 'output' => 'No S3 bucket configured'];
-        }
-
-        if (!$this->isRcloneInstalled()) {
-            @unlink($manifestFile);
-            return ['success' => false, 'output' => 'rclone is not installed'];
-        }
-
-        // Build remote path
-        $agentName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $agent['name'] ?? 'unknown');
-        $repoName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $repo['name'] ?? 'unknown');
-        $prefix = trim($creds['path_prefix'], '/');
-        $remotePath = $prefix ? "{$prefix}/{$agentName}/{$repoName}" : "{$agentName}/{$repoName}";
-        $remote = "S3:{$creds['bucket']}/{$remotePath}/.bbs-manifest.json";
-
-        // Upload via rclone copyto.
-        // --s3-no-check-bucket: skip the pre-flight CreateBucket probe that
-        // 403s on least-privilege IAM policies (see syncRepository()).
-        $cmd = ['rclone', 'copyto', $manifestFile, $remote, '--s3-no-check-bucket'];
-        $env = $this->buildRcloneEnv($creds);
-
-        $desc = [
-            0 => ['pipe', 'r'],
-            1 => ['pipe', 'w'],
-            2 => ['pipe', 'w'],
-        ];
-
-        $envStrings = [
-            'RCLONE_CONFIG' => '/dev/null',
-            'HOME' => '/tmp',
-            'PATH' => '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-        ];
-        foreach ($env as $k => $v) {
-            $envStrings[$k] = $v;
-        }
-
-        $proc = proc_open($cmd, $desc, $pipes, null, $envStrings);
-        if (!is_resource($proc)) {
-            @unlink($manifestFile);
-            return ['success' => false, 'output' => 'Failed to start rclone process'];
-        }
-
-        fclose($pipes[0]);
-        $stdout = stream_get_contents($pipes[1]);
-        fclose($pipes[1]);
-        $stderr = stream_get_contents($pipes[2]);
-        fclose($pipes[2]);
-        $exitCode = proc_close($proc);
-
-        @unlink($manifestFile);
-
-        return [
-            'success' => $exitCode === 0,
-            'output' => $exitCode === 0
-                ? 'Manifest uploaded'
-                : (trim($stderr . $stdout) ?: "rclone exited with code {$exitCode}"),
-        ];
-    }
-
-    /**
-     * Download manifest from S3.
-     * Returns ['success' => bool, 'file' => string|null, 'error' => string|null].
-     * Caller is responsible for deleting the temp file after use.
-     */
-    public function downloadManifestFile(array $repo, array $agent, array $creds, ?array $sourceRepo = null): array
-    {
-        if (empty($creds['bucket'])) {
-            return ['success' => false, 'file' => null, 'error' => 'No S3 bucket configured'];
-        }
-
-        if (!$this->isRcloneInstalled()) {
-            return ['success' => false, 'file' => null, 'error' => 'rclone is not installed'];
-        }
-
-        // Build remote path (use sourceRepo for copy mode)
-        $agentName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $agent['name'] ?? 'unknown');
-        $sourceRepoName = $sourceRepo['name'] ?? $repo['name'];
-        $repoName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $sourceRepoName ?? 'unknown');
-        $prefix = trim($creds['path_prefix'], '/');
-        $remotePath = $prefix ? "{$prefix}/{$agentName}/{$repoName}" : "{$agentName}/{$repoName}";
-        $remote = "S3:{$creds['bucket']}/{$remotePath}/.bbs-manifest.json";
-
-        // Download to temp file
-        $tempFile = tempnam(sys_get_temp_dir(), 'bbs-manifest-');
-
-        $cmd = ['rclone', 'copyto', $remote, $tempFile];
-        $env = $this->buildRcloneEnv($creds);
-
-        $desc = [
-            0 => ['pipe', 'r'],
-            1 => ['pipe', 'w'],
-            2 => ['pipe', 'w'],
-        ];
-
-        $envStrings = [
-            'RCLONE_CONFIG' => '/dev/null',
-            'HOME' => '/tmp',
-            'PATH' => '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-        ];
-        foreach ($env as $k => $v) {
-            $envStrings[$k] = $v;
-        }
-
-        $proc = proc_open($cmd, $desc, $pipes, null, $envStrings);
-        if (!is_resource($proc)) {
-            @unlink($tempFile);
-            return ['success' => false, 'file' => null, 'error' => 'Failed to start rclone process'];
-        }
-
-        fclose($pipes[0]);
-        $stdout = stream_get_contents($pipes[1]);
-        fclose($pipes[1]);
-        $stderr = stream_get_contents($pipes[2]);
-        fclose($pipes[2]);
-        $exitCode = proc_close($proc);
-
-        if ($exitCode !== 0) {
-            @unlink($tempFile);
-            // Exit code 3 typically means file not found
-            if ($exitCode === 3 || strpos($stderr . $stdout, 'not found') !== false) {
-                return ['success' => false, 'file' => null, 'error' => 'Manifest not found'];
-            }
-            return ['success' => false, 'file' => null, 'error' => trim($stderr . $stdout) ?: "rclone exited with code {$exitCode}"];
-        }
-
-        if (!file_exists($tempFile) || filesize($tempFile) === 0) {
-            @unlink($tempFile);
-            return ['success' => false, 'file' => null, 'error' => 'Empty manifest file'];
-        }
-
-        return ['success' => true, 'file' => $tempFile, 'error' => null];
     }
 
     /**
@@ -885,6 +1215,8 @@ class S3SyncService
             @unlink($tsvFile);
         }
 
+        $catalogSkipped = !empty($manifest['file_catalog_skipped']);
+
         // Update repository stats
         $this->db->update('repositories', [
             'archive_count' => $archiveCount,
@@ -895,70 +1227,9 @@ class S3SyncService
             'success' => true,
             'archives' => $archiveCount,
             'files' => $fileCount,
+            'catalog_skipped' => $catalogSkipped,
             'error' => null,
         ];
     }
 
-    /**
-     * Delete a repository from S3.
-     * Returns ['success' => bool, 'output' => string].
-     */
-    public function deleteFromS3(array $repo, array $agent, array $creds): array
-    {
-        if (empty($creds['bucket'])) {
-            return ['success' => false, 'output' => 'No S3 bucket configured'];
-        }
-
-        if (!$this->isRcloneInstalled()) {
-            return ['success' => false, 'output' => 'rclone is not installed on this server'];
-        }
-
-        // Build remote path: bucket/prefix/agent-name/repo-name/
-        $agentName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $agent['name'] ?? 'unknown');
-        $repoName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $repo['name'] ?? 'unknown');
-        $prefix = trim($creds['path_prefix'], '/');
-        $remotePath = $prefix ? "{$prefix}/{$agentName}/{$repoName}" : "{$agentName}/{$repoName}";
-        $remote = "S3:{$creds['bucket']}/{$remotePath}/";
-
-        // Use rclone purge to delete the directory and all contents
-        $cmd = ['rclone', 'purge', $remote];
-
-        $env = $this->buildRcloneEnv($creds);
-
-        $desc = [
-            0 => ['pipe', 'r'],
-            1 => ['pipe', 'w'],
-            2 => ['pipe', 'w'],
-        ];
-
-        $envStrings = [
-            'RCLONE_CONFIG' => '/dev/null',
-            'HOME' => '/tmp',
-            'PATH' => '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-        ];
-        foreach ($env as $k => $v) {
-            $envStrings[$k] = $v;
-        }
-
-        $proc = proc_open($cmd, $desc, $pipes, null, $envStrings);
-        if (!is_resource($proc)) {
-            return ['success' => false, 'output' => 'Failed to start rclone process'];
-        }
-
-        fclose($pipes[0]);
-        $stdout = stream_get_contents($pipes[1]);
-        fclose($pipes[1]);
-        $stderr = stream_get_contents($pipes[2]);
-        fclose($pipes[2]);
-        $exitCode = proc_close($proc);
-
-        $fullOutput = trim($stdout . "\n" . $stderr);
-
-        return [
-            'success' => $exitCode === 0,
-            'output' => $exitCode === 0
-                ? 'Deleted from S3'
-                : ($fullOutput ?: "rclone exited with code {$exitCode}"),
-        ];
-    }
 }

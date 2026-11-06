@@ -81,17 +81,85 @@ class RemoteSshService
     }
 
     /**
+     * Validate the fields of a Remote SSH host that end up on an ssh or borg
+     * command line. A value starting with "-" there is read as an option, and
+     * ssh's ProxyCommand runs a program locally before connecting
+     * (GHSA-4jqx-9f92-rc8p). Returns an error message, or null when valid.
+     */
+    public static function fieldError(?string $host, ?string $user, ?string $borgRemotePath): ?string
+    {
+        if (!preg_match('/^[A-Za-z0-9._:\[\]][A-Za-z0-9._:\[\]-]*$/', (string) $host)) {
+            return 'Host must be a hostname or IP address.';
+        }
+        if (!preg_match('/^[A-Za-z0-9._][A-Za-z0-9._-]*$/', (string) $user)) {
+            return 'User may contain only letters, digits, dot, dash and underscore, and cannot start with a dash.';
+        }
+        if ($borgRemotePath !== null && $borgRemotePath !== '' && self::safeBorgPath($borgRemotePath) === null) {
+            return 'Remote Borg Path must be a command name or path (for example borg-1.4 or /usr/local/bin/borg), with no spaces, and cannot start with a dash.';
+        }
+        return null;
+    }
+
+    /**
+     * Why a host's stored settings can't be used, or null when they can.
+     * Saving validates them, but a host saved before validation existed
+     * may still hold a user or host that borg's ssh would read as an option
+     * (borg puts user@host on the ssh command line with no "--").
+     */
+    public static function configProblem(array $config): ?string
+    {
+        $err = self::fieldError($config['remote_host'] ?? '', $config['remote_user'] ?? '', $config['borg_remote_path'] ?? null);
+        return $err === null ? null : "This Remote SSH host's settings are not valid: {$err} Edit the host and save it again.";
+    }
+
+    /**
+     * The same check for repository URLs (ssh://user@host[:port]/path) in
+     * borg arguments: repository paths store the user and host from when
+     * the repository was created.
+     */
+    public static function borgArgsProblem(array $args): ?string
+    {
+        foreach ($args as $arg) {
+            if (!is_string($arg) || !str_starts_with($arg, 'ssh://')) {
+                continue;
+            }
+            if (!preg_match('#^ssh://([^@/]*)@(\[[^\]]*\]|[^/:]*)#', $arg, $m)
+                || self::fieldError($m[2], $m[1], null) !== null) {
+                return 'The repository path has an invalid SSH user or host. Edit the Remote SSH host and save it again.';
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The Remote Borg Path if it is a plain command name or path, else null.
+     * Checked again where it is used, so a value stored before validation
+     * existed can never reach a command line.
+     */
+    public static function safeBorgPath(?string $path): ?string
+    {
+        $path = trim((string) $path);
+        return preg_match('#^[A-Za-z0-9_./~][A-Za-z0-9_./~+-]*$#', $path) ? $path : null;
+    }
+
+    /**
      * Test connection to remote SSH host.
      * Runs borg --version (or custom borg_remote_path) over SSH.
      */
     public function testConnection(array $config): array
     {
+        if (($problem = self::configProblem($config)) !== null) {
+            return ['success' => false, 'error' => $problem];
+        }
         $keyFile = null;
         try {
             $sshKey = $this->decryptKey($config);
             $keyFile = $this->writeTempKey($sshKey);
 
-            $borgBin = $config['borg_remote_path'] ?: 'borg';
+            if (!empty($config['borg_remote_path']) && self::safeBorgPath($config['borg_remote_path']) === null) {
+                return ['success' => false, 'error' => 'Invalid Remote Borg Path'];
+            }
+            $borgBin = self::safeBorgPath($config['borg_remote_path'] ?? '') ?? 'borg';
             $port = (int) ($config['remote_port'] ?? 22);
 
             $sshCmd = [
@@ -103,6 +171,7 @@ class RemoteSshService
                 '-o', 'BatchMode=yes',
                 '-o', 'LogLevel=ERROR',
                 '-o', 'ConnectTimeout=10',
+                '--',
                 "{$config['remote_user']}@{$config['remote_host']}",
                 "{$borgBin} --version",
             ];
@@ -139,7 +208,10 @@ class RemoteSshService
      */
     public function initRepo(array $config, string $repoPath, string $encryption, string $passphrase = ''): array
     {
-        $borgRemotePath = $config['borg_remote_path'] ?? null;
+        if (($problem = self::configProblem($config) ?? self::borgArgsProblem([$repoPath])) !== null) {
+            return ['success' => false, 'output' => $problem, 'exit_code' => -1];
+        }
+        $borgRemotePath = self::safeBorgPath($config['borg_remote_path'] ?? null);
         $cmd = ['borg', 'init', '--encryption=' . $encryption];
         if ($borgRemotePath) {
             $cmd[] = '--remote-path=' . $borgRemotePath;
@@ -164,9 +236,17 @@ class RemoteSshService
      * @param array  $borgArgs  Borg subcommand args (e.g. ['prune', '--keep-daily=7', $repoPath])
      * @param string $passphrase Repository passphrase (already decrypted)
      */
-    public function runBorgCommand(array $config, string $repoPath, array $borgArgs, string $passphrase = ''): array
+    /**
+     * @param array $extraEnv Additional borg env vars. Used for
+     *                        BORG_NEW_PASSPHRASE, which `key change-passphrase`
+     *                        reads instead of prompting (#412).
+     */
+    public function runBorgCommand(array $config, string $repoPath, array $borgArgs, string $passphrase = '', array $extraEnv = []): array
     {
-        $borgRemotePath = $config['borg_remote_path'] ?? null;
+        if (($problem = self::configProblem($config) ?? self::borgArgsProblem(array_merge([$repoPath], $borgArgs))) !== null) {
+            return ['success' => false, 'output' => $problem, 'exit_code' => -1];
+        }
+        $borgRemotePath = self::safeBorgPath($config['borg_remote_path'] ?? null);
 
         $cmd = array_merge(['borg'], $borgArgs);
 
@@ -175,8 +255,20 @@ class RemoteSshService
         // rather than failing immediately when a concurrent backup or
         // another server-side task is still holding it. break-lock is the
         // one case where --lock-wait is meaningless, so skip it there.
+        // Skip injection when the caller has already placed one. The index
+        // below assumes a one-word subcommand, so a two-word one such as
+        // `key change-passphrase` would have --lock-wait spliced between the
+        // two halves and borg would reject it (#412).
+        $hasLockWait = false;
+        foreach ($borgArgs as $a) {
+            if (str_starts_with((string) $a, '--lock-wait')) {
+                $hasLockWait = true;
+                break;
+            }
+        }
+
         $subcmd = $borgArgs[0] ?? '';
-        if ($subcmd !== '' && $subcmd !== 'break-lock') {
+        if (!$hasLockWait && $subcmd !== '' && $subcmd !== 'break-lock') {
             array_splice($cmd, 2, 0, ['--lock-wait=600']);
         }
 
@@ -194,6 +286,9 @@ class RemoteSshService
         // Skip the interactive 'YES' prompt when running `check --repair`;
         // borg only reads this env var for that subcommand.
         $env['BORG_CHECK_I_KNOW_WHAT_I_AM_DOING'] = 'YES';
+        foreach ($extraEnv as $k => $v) {
+            $env[$k] = $v;
+        }
 
         return $this->runBorgWithKey($config, $cmd, $env);
     }
@@ -210,7 +305,7 @@ class RemoteSshService
             $keyFile = $this->writeTempKey($sshKey);
 
             $port = (int) ($config['remote_port'] ?? 22);
-            $env['BORG_RSH'] = "ssh -i {$keyFile} -p {$port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR";
+            $env['BORG_RSH'] = "ssh -i {$keyFile} -p {$port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=30 -o LogLevel=ERROR";
 
             $proc = proc_open($cmd, [
                 0 => ['pipe', 'r'],
@@ -246,9 +341,22 @@ class RemoteSshService
      * Check disk usage on a remote SSH host by running df -k.
      * Returns ['total' => bytes, 'used' => bytes, 'free' => bytes, 'percent' => int] or null if unavailable.
      */
+    /** Why the last getDiskUsage() call came back empty, for the UI to show. */
+    private ?string $lastDiskError = null;
+
+    public function lastDiskError(): ?string
+    {
+        return $this->lastDiskError;
+    }
+
     public function getDiskUsage(array $config): ?array
     {
         $keyFile = null;
+        $this->lastDiskError = null;
+        if (($problem = self::configProblem($config)) !== null) {
+            $this->lastDiskError = $problem;
+            return null;
+        }
         try {
             $sshKey = $this->decryptKey($config);
             $keyFile = $this->writeTempKey($sshKey);
@@ -260,7 +368,8 @@ class RemoteSshService
             // that runs on the REMOTE shell (proc_open's array form only
             // protects the local side). Reject anything that isn't a plain
             // POSIX path so shell metacharacters can't escape.
-            if (!preg_match('#^[A-Za-z0-9_./\-]+$#', $basePath)) {
+            if (!preg_match('#^[A-Za-z0-9_./][A-Za-z0-9_./\-]*$#', $basePath)) {
+                $this->lastDiskError = 'Base path contains characters that are unsafe to send to a remote shell';
                 return null;
             }
 
@@ -273,8 +382,9 @@ class RemoteSshService
                 '-o', 'BatchMode=yes',
                 '-o', 'LogLevel=ERROR',
                 '-o', 'ConnectTimeout=10',
+                '--',
                 "{$config['remote_user']}@{$config['remote_host']}",
-                "df -k {$basePath}",
+                "df -k -- {$basePath}",
             ];
 
             $proc = proc_open($sshCmd, [
@@ -284,22 +394,31 @@ class RemoteSshService
             ], $pipes, null, $this->buildServerEnv());
 
             if (!is_resource($proc)) {
+                $this->lastDiskError = 'Could not start ssh on the server';
                 return null;
             }
 
             fclose($pipes[0]);
             $stdout = trim(stream_get_contents($pipes[1]));
             fclose($pipes[1]);
+            $stderr = trim(stream_get_contents($pipes[2]));
             fclose($pipes[2]);
             $exitCode = proc_close($proc);
 
             if ($exitCode !== 0 || empty($stdout)) {
+                // ssh's own message is the useful part — "Name or service not
+                // known", "Permission denied", "Connection timed out" — and
+                // saying which of those happened is the whole point.
+                $this->lastDiskError = $stderr !== ''
+                    ? substr(preg_replace('/\s+/', ' ', $stderr), 0, 200)
+                    : "df exited {$exitCode} with no output";
                 return null;
             }
 
             // Parse df -k output (second line has the data)
             $lines = preg_split('/\n/', $stdout);
             if (count($lines) < 2) {
+                $this->lastDiskError = 'This provider does not support df — no usage figures to read';
                 return null;
             }
 
@@ -314,6 +433,7 @@ class RemoteSshService
 
             // Fields: Filesystem 1K-blocks Used Available Use% Mounted
             if (count($fields) < 4) {
+                $this->lastDiskError = 'df output was not in the expected format';
                 return null;
             }
 
@@ -324,6 +444,7 @@ class RemoteSshService
 
             return ['total' => $total, 'used' => $used, 'free' => $free, 'percent' => $percent];
         } catch (\Exception $e) {
+            $this->lastDiskError = substr($e->getMessage(), 0, 200);
             return null;
         } finally {
             $this->cleanupTempKey($keyFile);
@@ -423,7 +544,7 @@ class RemoteSshService
     /**
      * Store disk usage data for a remote SSH config, including the source when known.
      */
-    public function updateDiskUsage(int $configId, ?array $diskData, ?string $source = null): void
+    public function updateDiskUsage(int $configId, ?array $diskData, ?string $source = null, ?string $error = null): void
     {
         $this->db->update('remote_ssh_configs', [
             'disk_total_bytes' => $diskData ? $diskData['total'] : null,
@@ -431,6 +552,7 @@ class RemoteSshService
             'disk_free_bytes' => $diskData ? $diskData['free'] : null,
             'disk_checked_at' => $this->db->now(),
             'borgbase_usage_source' => $source,
+            'disk_check_error' => $diskData ? null : $error,
         ], 'id = ?', [$configId]);
     }
 
@@ -518,6 +640,9 @@ class RemoteSshService
      */
     public function getRepositorySizeBytes(array $config, string $repoPath): ?int
     {
+        if (self::configProblem($config) !== null) {
+            return null;
+        }
         $remotePath = $this->remoteFilesystemPathFromRepoUrl($repoPath);
         if ($remotePath === null || $remotePath === '' || str_contains($remotePath, "\0")) {
             return null;
@@ -538,6 +663,7 @@ class RemoteSshService
                 '-o', 'BatchMode=yes',
                 '-o', 'LogLevel=ERROR',
                 '-o', 'ConnectTimeout=30',
+                '--',
                 "{$config['remote_user']}@{$config['remote_host']}",
                 'du -sk -- ' . escapeshellarg($remotePath),
             ];
@@ -660,7 +786,10 @@ class RemoteSshService
      */
     public function openBorgProcess(array $config, array $borgArgs, string $passphrase = ''): array
     {
-        $borgRemotePath = $config['borg_remote_path'] ?? null;
+        if (($problem = self::configProblem($config) ?? self::borgArgsProblem($borgArgs)) !== null) {
+            return ['error' => $problem];
+        }
+        $borgRemotePath = self::safeBorgPath($config['borg_remote_path'] ?? null);
         $cmd = array_merge(['borg'], $borgArgs);
         if ($borgRemotePath && count($borgArgs) >= 1) {
             array_splice($cmd, 2, 0, ['--remote-path=' . $borgRemotePath]);
@@ -672,6 +801,9 @@ class RemoteSshService
         }
         $env['BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK'] = 'yes';
         $env['BORG_RELOCATED_REPO_ACCESS_IS_OK'] = 'yes';
+        // Skips the interactive 'YES' prompt of `check --repair`; borg only
+        // reads this for that subcommand.
+        $env['BORG_CHECK_I_KNOW_WHAT_I_AM_DOING'] = 'YES';
 
         try {
             $sshKey = $this->decryptKey($config);
@@ -681,7 +813,7 @@ class RemoteSshService
         }
 
         $port = (int) ($config['remote_port'] ?? 22);
-        $env['BORG_RSH'] = "ssh -i {$keyFile} -p {$port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR";
+        $env['BORG_RSH'] = "ssh -i {$keyFile} -p {$port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=30 -o LogLevel=ERROR";
 
         $proc = proc_open($cmd, [
             0 => ['pipe', 'r'],

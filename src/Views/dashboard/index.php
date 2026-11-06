@@ -555,9 +555,13 @@ $dfFix = function (string $s): string {
                 <div class="card-body">
                     <?php
                         $cpuPct = (float) ($cpuLoad['percent'] ?? 0);
-                        $memPct = (float) ($memory['percent'] ?? 0);
-                        $memUsed = (int) ($memory['used'] ?? 0);
-                        $memTotal = (int) ($memory['total'] ?? 0);
+                        // getMemory() returns null, not zeros, when /proc/meminfo
+                        // cannot be read — the gauge must say so rather than
+                        // draw a plausible empty bar (#485).
+                        $memOk    = is_array($memory);
+                        $memPct   = $memOk ? (float) $memory['percent'] : 0.0;
+                        $memUsed  = $memOk ? (int) $memory['used'] : 0;
+                        $memTotal = $memOk ? (int) $memory['total'] : 0;
                         $cpuColor = $cpuPct > 80 ? '#ef4444' : ($cpuPct > 50 ? '#f59e0b' : '#22c55e');
                         $cpuStatus = $cpuPct > 80 ? 'High Usage' : ($cpuPct > 50 ? 'Moderate' : 'Healthy');
                         $memColor = $memPct > 85 ? '#ef4444' : ($memPct > 60 ? '#f59e0b' : '#0dcaf0');
@@ -606,7 +610,8 @@ $dfFix = function (string $s): string {
 
                         $arcLen    = 251.33;                              // π × radius 80, semicircle
                         $cpuOffset = $arcLen * (1 - $cpuPct / 100);
-                        $memPair   = ServerStats::formatBytesPair($memUsed, $memTotal);
+                        $memPair   = $memOk ? ServerStats::formatBytesPair($memUsed, $memTotal)
+                                            : 'unavailable';
 
                         // Network meter initial labels. First page load after a
                         // cold cache has no rate yet ("—"); the 15s poll fills it.
@@ -638,7 +643,9 @@ $dfFix = function (string $s): string {
                                 <div class="cpu-pct"><span id="cpu-pct-num"><?= round($cpuPct, 1) ?></span><span class="pct-suffix">%</span></div>
                                 <div class="cpu-status" id="cpu-status" style="color: <?= $cpuColor ?>"><?= $cpuStatus ?></div>
                             </div>
-                            <div class="cpu-mem-row" title="Memory: <?= round($memPct, 1) ?>% used">
+                            <div class="cpu-mem-row" title="<?= $memOk
+                                    ? 'Memory: ' . round($memPct, 1) . '% used'
+                                    : 'Memory unavailable — /proc/meminfo could not be read' ?>">
                                 <div class="cm-bar">
                                     <div id="mem-bar-fill" class="cm-bar-fill" style="width: <?= $memPct ?>%; background-color: <?= $memColor ?>;"></div>
                                     <span class="cm-bar-label"><span id="mem-pct"><?= round($memPct, 1) ?></span>%</span>
@@ -742,7 +749,11 @@ $dfFix = function (string $s): string {
                         <div>
                             <div class="sc-label"><?= htmlspecialchars($loc['label']) ?></div>
                             <div class="sc-kind <?= $loc['kind'] === 'remote' ? 'remote' : '' ?>">
+                                <?php if (!empty($loc['borgbase_account_id'])): ?>
+                                <a href="/borgbase-accounts/<?= (int) $loc['borgbase_account_id'] ?>" class="text-reset text-decoration-none">BorgBase account</a>
+                                <?php else: ?>
                                 <?= $loc['kind'] === 'remote' ? 'Remote SSH' : ($loc['is_default'] ? 'Default · Local' : 'Local') ?>
+                                <?php endif; ?>
                             </div>
                         </div>
                         <?php if ($loc['disk_percent'] !== null): ?>
@@ -799,7 +810,7 @@ $dfFix = function (string $s): string {
                                 ?>
                                 <tr style="cursor:pointer" onclick="window.location='/queue/<?= (int) $j['id'] ?>'">
                                     <td><?= htmlspecialchars($j['agent_name']) ?></td>
-                                    <td><?= htmlspecialchars(ucfirst($j['task_type'])) ?></td>
+                                    <td><?= htmlspecialchars(\BBS\Core\JobType::label($j['task_type'])) ?></td>
                                     <td class="d-table-cell-md"><?= htmlspecialchars($j['repo_name'] ?? '--') ?></td>
                                     <td>
                                         <?php if ($pct !== null && $j['status'] === 'running'): ?>
@@ -877,7 +888,7 @@ $dfFix = function (string $s): string {
                         ['restore', 'Restore',       'bi-box-arrow-up'],
                         ['prune',   'Prune',         'bi-scissors'],
                         ['compact', 'Compact',       'bi-archive'],
-                        ['s3',      'S3 Sync',       'bi-cloud-upload'],
+                        ['s3',      'Offsite Sync',  'bi-cloud-upload'],
                         ['other',   'Other / Maint', 'bi-tools'],
                     ];
                     foreach ($filterCats as [$key, $label, $icon]): ?>
@@ -916,6 +927,7 @@ $dfFix = function (string $s): string {
                             'restore_mysql'   => 'bi-database text-primary',
                             'restore_pg'      => 'bi-database text-primary',
                             'restore_mongo'   => 'bi-database text-primary',
+                            'restore_mssql'   => 'bi-database text-primary',
                             'check'           => 'bi-shield-check text-success',
                             'repo_check'      => 'bi-shield-check text-success',
                             'repo_repair'     => 'bi-tools text-warning',
@@ -923,6 +935,7 @@ $dfFix = function (string $s): string {
                             'update_borg'     => 'bi-arrow-up-square text-info',
                             'update_agent'    => 'bi-arrow-up-square text-info',
                             'plugin_test'     => 'bi-pencil text-secondary',
+                            'plugin_post'     => 'bi-terminal text-secondary',
                             's3_sync'         => 'bi-cloud-upload text-info',
                             's3_restore'      => 'bi-cloud-download text-info',
                             'catalog_sync'    => 'bi-list-ul text-success',
@@ -942,7 +955,7 @@ $dfFix = function (string $s): string {
                         ?>
                         <tr style="cursor:pointer" onclick="window.location='/queue/<?= (int) $j['id'] ?>'">
                             <td><?= htmlspecialchars($j['agent_name']) ?></td>
-                            <td class="text-nowrap"><i class="bi <?= $taskIcon ?> me-1"></i><?= htmlspecialchars(ucfirst($j['task_type'])) ?></td>
+                            <td class="text-nowrap"><i class="bi <?= $taskIcon ?> me-1"></i><?= htmlspecialchars(\BBS\Core\JobType::label($j['task_type'])) ?></td>
                             <td class="d-table-cell-md"><?= htmlspecialchars($j['plan_name'] ?? '--') ?></td>
                             <td class="d-table-cell-md"><?= htmlspecialchars($j['repo_name'] ?? '--') ?></td>
                             <td><?= TimeHelper::ago($j['completed_at']) ?></td>
@@ -1132,7 +1145,7 @@ document.addEventListener('DOMContentLoaded', function () {
             datasets: [
                 { label: 'Backups', data: chartData.map(d => d.backups), backgroundColor: 'rgba(54, 162, 235, 0.7)', borderRadius: 2 },
                 { label: 'Restores', data: chartData.map(d => d.restores), backgroundColor: 'rgba(255, 159, 64, 0.7)', borderRadius: 2 },
-                { label: 'S3 Sync', data: chartData.map(d => d.s3_sync), backgroundColor: 'rgba(75, 192, 192, 0.7)', borderRadius: 2 },
+                { label: 'Offsite Sync', data: chartData.map(d => d.s3_sync), backgroundColor: 'rgba(75, 192, 192, 0.7)', borderRadius: 2 },
                 { label: 'Errors', data: chartData.map(d => d.errors), backgroundColor: 'rgba(220, 53, 69, 0.8)', borderRadius: 2 },
             ]
         },
@@ -1265,7 +1278,13 @@ document.addEventListener('DOMContentLoaded', function () {
                     if (cpuStatus) { cpuStatus.textContent = status; cpuStatus.style.color = color; }
                 }
 
-                if (d.memory && memFill) {
+                if (d.memory === null && memSizeEl) {
+                    // Explicit null: the server could not read /proc/meminfo.
+                    // Leaving the last value on screen would pass for a live one.
+                    memSizeEl.textContent = 'unavailable';
+                    if (memFill) memFill.style.width = '0%';
+                    if (memPctEl) memPctEl.textContent = '0';
+                } else if (d.memory && memFill) {
                     const p = Number(d.memory.percent) || 0;
                     memFill.style.width = p + '%';
                     memFill.style.backgroundColor = memPalette(p);
@@ -1335,7 +1354,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 }
                 html += '<tr style="cursor:pointer" onclick="window.location=\'/queue/' + j.id + '\'">'
                     + '<td>' + escHtml(j.agent_name) + '</td>'
-                    + '<td>' + escHtml(ucfirst(j.task_type)) + '</td>'
+                    + '<td>' + escHtml(window.bbsTaskLabel(j.task_type)) + '</td>'
                     + '<td class="d-table-cell-md">' + escHtml(j.repo_name || '--') + '</td>'
                     + '<td>' + statusHtml + '</td></tr>';
             });
@@ -1434,6 +1453,7 @@ document.addEventListener('DOMContentLoaded', function () {
             'restore_mysql':   'bi-database text-primary',
             'restore_pg':      'bi-database text-primary',
             'restore_mongo':   'bi-database text-primary',
+            'restore_mssql':   'bi-database text-primary',
             'check':           'bi-shield-check text-success',
             'repo_check':      'bi-shield-check text-success',
             'repo_repair':     'bi-tools text-warning',
@@ -1441,6 +1461,7 @@ document.addEventListener('DOMContentLoaded', function () {
             'update_borg':     'bi-arrow-up-square text-info',
             'update_agent':    'bi-arrow-up-square text-info',
             'plugin_test':     'bi-pencil text-secondary',
+            'plugin_post':     'bi-terminal text-secondary',
             's3_sync':         'bi-cloud-upload text-info',
             's3_restore':      'bi-cloud-download text-info',
             'catalog_sync':    'bi-list-ul text-success',
@@ -1454,11 +1475,13 @@ document.addEventListener('DOMContentLoaded', function () {
             }
             let html = '<div class="table-responsive"><table class="table table-hover mb-0 small recent-jobs-table"><thead><tr><th>Client</th><th>Task</th><th class="d-th-md">Plan</th><th class="d-th-md">Repo</th><th>Completed</th><th class="d-th-md">Duration</th><th class="text-center">Status</th></tr></thead><tbody>';
             jobs.forEach(j => {
-                const icon = j.status === 'completed' ? 'bi-check-circle-fill text-success'
+                // had_warnings arrives as "0"/"1" — compare, don't test truthiness.
+                const icon = (j.status === 'completed' && j.had_warnings == 1) ? 'bi-exclamation-triangle-fill text-warning'
+                    : j.status === 'completed' ? 'bi-check-circle-fill text-success'
                     : j.status === 'failed' ? 'bi-x-circle-fill text-danger'
                     : 'bi-slash-circle-fill text-secondary';
                 const taskIcon = TASK_ICONS[j.task_type] || 'bi-gear text-muted';
-                const taskLabel = (j.task_type||'').charAt(0).toUpperCase() + (j.task_type||'').slice(1);
+                const taskLabel = window.bbsTaskLabel(j.task_type);
                 html += '<tr style="cursor:pointer" onclick="window.location=\'/queue/'+j.id+'\'">'
                     + '<td>' + esc(j.agent_name) + '</td>'
                     + '<td class="text-nowrap"><i class="bi ' + taskIcon + ' me-1"></i>' + esc(taskLabel) + '</td>'

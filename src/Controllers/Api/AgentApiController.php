@@ -12,6 +12,12 @@ use BBS\Services\SshKeyManager;
 
 class AgentApiController extends Controller
 {
+    /** Agent-sent log lines accepted per job (progress log_message). */
+    private const MAX_LOG_ROWS_PER_JOB = 2000;
+
+    /** Catalog entries accepted in one /api/agent/catalog request. */
+    private const MAX_CATALOG_BATCH = 10000;
+
     /**
      * Authenticate the agent via Bearer token.
      * Returns the agent record or sends 401 and exits.
@@ -116,14 +122,30 @@ class AgentApiController extends Controller
         $data = [];
         if (!empty($input['hostname']))             $data['hostname'] = substr($input['hostname'], 0, 255);
         if (!empty($input['ip_address']))           $data['ip_address'] = substr($input['ip_address'], 0, 45);
+        if (!empty($input['mac_address']) && preg_match('/^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$/', $input['mac_address'])) {
+            $data['mac_address'] = strtolower($input['mac_address']);
+        }
         if (!empty($input['os_info']))              $data['os_info'] = substr($input['os_info'], 0, 255);
         if (!empty($input['borg_version']))         $data['borg_version'] = substr($input['borg_version'], 0, 20);
         if (!empty($input['agent_version']))        $data['agent_version'] = substr($input['agent_version'], 0, 20);
+        // Agents that manage their own version (containers) opt out of
+        // server-driven updates entirely (#387). array_key_exists, not
+        // !empty — false is the meaningful value here.
+        if (array_key_exists('auto_update_enabled', $input)) {
+            $data['auto_update_enabled'] = !empty($input['auto_update_enabled']) ? 1 : 0;
+        }
         if (!empty($input['borg_install_method']))  $data['borg_install_method'] = substr($input['borg_install_method'], 0, 20);
         if (!empty($input['borg_binary_path']))     $data['borg_binary_path'] = substr($input['borg_binary_path'], 0, 255);
         if (!empty($input['glibc_version']))        $data['glibc_version'] = substr($input['glibc_version'], 0, 20);
         if (!empty($input['platform']))             $data['platform'] = substr($input['platform'], 0, 20);
         if (!empty($input['architecture']))         $data['architecture'] = substr($input['architecture'], 0, 20);
+        // What the host can snapshot (LVM, btrfs, ZFS), so the plan editor
+        // offers "Back up from a snapshot" only where it can work.
+        if (isset($input['snapshot_support']) && is_array($input['snapshot_support'])) {
+            $data['snapshot_capable'] = !empty($input['snapshot_support']['capable']) ? 1 : 0;
+            $snapshotJson = json_encode($input['snapshot_support']);
+            $data['snapshot_support'] = ($snapshotJson !== false && strlen($snapshotJson) <= 16384) ? $snapshotJson : null;
+        }
         $data['status'] = 'online';
 
         if (!empty($data)) {
@@ -142,7 +164,7 @@ class AgentApiController extends Controller
         $sshPort = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'ssh_port'");
 
         // Per-agent overrides take precedence over global settings
-        $host = !empty($agent['server_host_override']) ? $agent['server_host_override'] : SshKeyManager::stripHostPort($serverHost['value'] ?? '');
+        $host = SshKeyManager::stripHostPort(!empty($agent['server_host_override']) ? $agent['server_host_override'] : ($serverHost['value'] ?? ''));
         $port = !empty($agent['ssh_port_override']) ? (int) $agent['ssh_port_override'] : (int) ($sshPort['value'] ?? 22);
 
         $this->json([
@@ -192,7 +214,7 @@ class AgentApiController extends Controller
             SELECT bj.id FROM backup_jobs bj
             WHERE bj.agent_id = ?
               AND bj.status IN ('running', 'sent')
-              AND bj.task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete')
+              AND bj.task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete', 'archive_lock')
               {$excludeClause}
               AND (
                   (bj.last_progress_at IS NOT NULL AND bj.last_progress_at < DATE_SUB(NOW(), INTERVAL 10 MINUTE))
@@ -244,6 +266,13 @@ class AgentApiController extends Controller
         if (in_array($job['status'], ['completed', 'failed', 'cancelled'])) {
             $this->json(['status' => 'ok', 'cancel' => ($job['status'] === 'cancelled')]);
         }
+        // Only a job the queue handed out can run: a queued job reported as
+        // running would skip the queue and its concurrency limit. Server-side
+        // work is the scheduler's, never the agent's.
+        if (!in_array($job['status'], ['sent', 'running'], true)
+            || in_array($job['task_type'], \BBS\Services\QueueManager::SERVER_SIDE_TYPES, true)) {
+            $this->json(['status' => 'ok', 'cancel' => false]);
+        }
 
         $data = ['status' => 'running', 'last_progress_at' => $this->db->now()];
         if (isset($input['files_total']))      $data['files_total'] = (int) $input['files_total'];
@@ -265,20 +294,31 @@ class AgentApiController extends Controller
                 'agent_id' => $agent['id'],
                 'backup_job_id' => $jobId,
                 'level' => 'info',
-                'message' => "Agent started {$job['task_type']} job #{$jobId}" . ($planName ? " for plan \"{$planName}\"" : ''),
+                'message' => "Agent started " . \BBS\Core\JobType::label($job['task_type']) . " job #{$jobId}" . ($planName ? " for plan \"{$planName}\"" : ''),
             ]);
         }
 
         $this->db->update('backup_jobs', $data, 'id = ?', [$jobId]);
 
-        // Allow agent to send log messages (e.g. plugin activity)
-        if (!empty($input['log_message'])) {
-            $this->db->insert('server_log', [
-                'agent_id' => $agent['id'],
-                'backup_job_id' => $jobId,
-                'level' => $input['log_level'] ?? 'info',
-                'message' => substr($input['log_message'], 0, 2000),
-            ]);
+        // Allow agent to send log messages (e.g. plugin activity). Capped per
+        // job so a misbehaving agent can't flood the log table.
+        if (!empty($input['log_message']) && is_string($input['log_message'])) {
+            $level = $input['log_level'] ?? 'info';
+            if (!in_array($level, ['info', 'warning', 'error'], true)) {
+                $level = 'info';
+            }
+            $logged = $this->db->fetchOne(
+                "SELECT COUNT(*) AS n FROM server_log WHERE backup_job_id = ?",
+                [$jobId]
+            );
+            if ((int) ($logged['n'] ?? 0) < self::MAX_LOG_ROWS_PER_JOB) {
+                $this->db->insert('server_log', [
+                    'agent_id' => $agent['id'],
+                    'backup_job_id' => $jobId,
+                    'level' => $level,
+                    'message' => substr($input['log_message'], 0, 2000),
+                ]);
+            }
         }
 
         $this->json(['status' => 'ok', 'cancel' => false]);
@@ -293,6 +333,13 @@ class AgentApiController extends Controller
         $agent = $this->authenticateAgent();
         $input = $this->getJsonInput();
 
+        // The agent reports the archive name back; the server later passes it
+        // to borg. A name starting with "-" would be read as an option, and
+        // control characters have no place in one.
+        if (isset($input['archive_name'])
+            && !preg_match('/^[^\x00-\x1f\x7f\-][^\x00-\x1f\x7f]{0,199}$/u', (string) $input['archive_name'])) {
+            $input['archive_name'] = '';
+        }
         $jobId = (int) ($input['job_id'] ?? 0);
         $result = $input['result'] ?? '';  // 'completed', 'failed', or 'cataloging'
 
@@ -309,6 +356,18 @@ class AgentApiController extends Controller
             $this->json(['error' => 'Job not found'], 404);
         }
 
+        // Bound free text from the agent before it reaches the database,
+        // emails and notification commands. A list_dir result is the folder
+        // browser's JSON tree, not text: cutting it breaks the JSON, so it
+        // gets a limit that fits its bounded size (up to 20000 entries)
+        // and the MEDIUMTEXT column (#536).
+        foreach (['error_log', 'output_log'] as $k) {
+            $limit = ($k === 'output_log' && $job['task_type'] === 'list_dir') ? 8388608 : 65536;
+            if (isset($input[$k]) && is_string($input[$k]) && strlen($input[$k]) > $limit) {
+                $input[$k] = substr($input[$k], 0, $limit) . "\n[truncated]";
+            }
+        }
+
         // Idempotency: if job is already in a terminal state, return OK without
         // re-processing (prevents duplicate archives, notifications on retry)
         if (in_array($job['status'], ['completed', 'failed', 'cancelled'])) {
@@ -323,6 +382,17 @@ class AgentApiController extends Controller
             $this->json(['status' => 'ok', 'already_terminal' => true, 'archive_id' => $archiveId]);
         }
 
+        // An agent reports only on work the queue handed to it: not on a job
+        // still queued (that would skip the queue, or fake a backup that never
+        // ran), and never on server-side work such as repair, prune or
+        // offsite sync, which only the scheduler runs (GHSA-6423-m3jr-236x).
+        if (in_array($job['task_type'], \BBS\Services\QueueManager::SERVER_SIDE_TYPES, true)) {
+            $this->json(['error' => 'This job runs on the server, not on the agent'], 403);
+        }
+        if (!in_array($job['status'], ['sent', 'running'], true)) {
+            $this->json(['error' => 'Job has not been dispatched to this agent'], 409);
+        }
+
         // Handle "abandoned" — agent confirms it's no longer running this job
         // (typically means the original completion report was lost due to server error)
         if ($result === 'abandoned') {
@@ -330,9 +400,9 @@ class AgentApiController extends Controller
                 'status' => 'failed',
                 'completed_at' => date('Y-m-d H:i:s'),
                 'error_log' => 'Job abandoned — agent confirmed it is no longer running this task (status report likely lost)',
-            ], 'id = ?', [$jobId]);
+            ], "id = ? AND status IN ('sent', 'running')", [$jobId]);
 
-            $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
+            $taskLabel = \BBS\Core\JobType::label($job['task_type']);
             $this->db->insert('server_log', [
                 'agent_id' => $agent['id'],
                 'backup_job_id' => $jobId,
@@ -409,11 +479,37 @@ class AgentApiController extends Controller
         if (isset($input['bytes_total']))     $data['bytes_total'] = (int) $input['bytes_total'];
         if (isset($input['bytes_processed'])) $data['bytes_processed'] = (int) $input['bytes_processed'];
         if (!empty($input['error_log']))      $data['error_log'] = $input['error_log'];
-        if (!empty($input['had_warnings']))   $data['had_warnings'] = 1;
 
-        $this->db->update('backup_jobs', $data, 'id = ?', [$jobId]);
+        // A backup that stored nothing is almost always a source that isn't
+        // there. borg warns about a path that doesn't exist (#203) but an
+        // empty directory is perfectly valid to it, and a bind mount that
+        // failed to come up leaves exactly that behind — so the job went
+        // green with zero files and nobody found out for weeks (#429).
+        $hadWarnings = !empty($input['had_warnings']);
+        $storedFiles = (int) ($input['files_processed'] ?? 0) ?: (int) ($input['files_total'] ?? 0);
+        if ($job['task_type'] === 'backup'
+            && ($input['result'] ?? '') === 'completed'
+            && $storedFiles === 0
+        ) {
+            $hadWarnings = true;
+            if (empty($data['error_log'])) {
+                $data['error_log'] = 'Backup stored no files — every configured directory was empty or fully excluded. '
+                    . 'Check the source paths still hold data; a mount that did not come up leaves an empty directory behind.';
+            }
+        }
+        if ($hadWarnings) $data['had_warnings'] = 1;
 
-        $taskLabel = ucfirst(str_replace('_', ' ', $job['task_type']));
+        // Dry runs return their would-backup/excluded summary as task_result
+        // JSON for the job detail page (#257)
+        // Plugin tests may return structured data too (SQL Server: the
+        // databases found, for the Detect databases picker).
+        if (in_array($job['task_type'], ['backup_dry_run', 'plugin_test'], true) && !empty($input['task_result'])) {
+            $data['task_result'] = substr((string) $input['task_result'], 0, 262144);
+        }
+
+        $this->db->update('backup_jobs', $data, "id = ? AND status IN ('sent', 'running')", [$jobId]);
+
+        $taskLabel = \BBS\Core\JobType::label($job['task_type']);
 
         // For "cataloging", create the archive and return archive_id but skip
         // notifications, prune, and completion logging
@@ -422,7 +518,10 @@ class AgentApiController extends Controller
                 'repository_id' => $job['repository_id'],
                 'backup_job_id' => $jobId,
                 'archive_name' => $input['archive_name'],
-                'file_count' => (int) ($input['files_total'] ?? 0),
+                // What borg reported it stored, not the client's pre-count
+                // estimate — the estimate cannot see exclude patterns and on
+                // some plans is orders of magnitude higher (#407).
+                'file_count' => (int) ($input['files_processed'] ?? 0) ?: (int) ($input['files_total'] ?? 0),
                 'original_size' => (int) ($input['original_size'] ?? 0),
                 'deduplicated_size' => (int) ($input['deduplicated_size'] ?? 0),
             ];
@@ -539,7 +638,7 @@ class AgentApiController extends Controller
                         "Backup failed for plan \"{$planName}\" on client \"{$agent['name']}\" — " . ($input['error_log'] ?? 'unknown error'),
                         'critical'
                     );
-                } elseif ($result === 'completed' && !empty($input['had_warnings'])) {
+                } elseif ($result === 'completed' && $hadWarnings) {
                     // borg returned a warning — most commonly a configured
                     // source path that didn't exist (#203). Resolve any
                     // prior backup_failed and fire a warning-level event so
@@ -547,8 +646,8 @@ class AgentApiController extends Controller
                     if ($job['backup_plan_id']) {
                         $notificationService->resolve('backup_failed', $agent['id'], (int)$job['backup_plan_id']);
                     }
-                    $warningTail = !empty($input['error_log'])
-                        ? ' — ' . trim(substr($input['error_log'], 0, 300))
+                    $warningTail = !empty($data['error_log'])
+                        ? ' — ' . trim(substr($data['error_log'], 0, 300))
                         : '';
                     $notificationService->notify(
                         'backup_warning',
@@ -640,7 +739,10 @@ class AgentApiController extends Controller
                     'repository_id' => $job['repository_id'],
                     'backup_job_id' => $jobId,
                     'archive_name' => $input['archive_name'],
-                    'file_count' => (int) ($input['files_total'] ?? 0),
+                    // What borg reported it stored, not the client's pre-count
+                // estimate — the estimate cannot see exclude patterns and on
+                // some plans is orders of magnitude higher (#407).
+                'file_count' => (int) ($input['files_processed'] ?? 0) ?: (int) ($input['files_total'] ?? 0),
                     'original_size' => (int) ($input['original_size'] ?? 0),
                     'deduplicated_size' => (int) ($input['deduplicated_size'] ?? 0),
                 ];
@@ -683,17 +785,33 @@ class AgentApiController extends Controller
             }
         }
 
-        // Build catalog import info for after response is sent
+        // Build catalog import info for after response is sent.
+        //
+        // Every branch that declines to import says why. A backup whose files
+        // can't be browsed afterwards is a support conversation that starts
+        // from nothing otherwise: the import is the one step between a
+        // successful backup and an empty file browser, and it used to skip
+        // itself in four different ways without leaving a trace.
         $catalogImport = null;
+        $catalogSkipped = null;
         if ($result === 'completed' && $job['task_type'] === 'backup') {
-            if (!empty($agent['ssh_home_dir'])) {
+            if (empty($agent['ssh_home_dir'])) {
+                $catalogSkipped = 'this client has no SSH home directory on the server, so it has nowhere to stream a catalog to';
+            } else {
                 $catalogPath = $agent['ssh_home_dir'] . '/.catalog-logs/catalog-' . $jobId . '.jsonl';
-                if (file_exists($catalogPath)) {
+                if (!file_exists($catalogPath)) {
+                    $catalogSkipped = "no catalog file arrived at {$catalogPath} — the client either streamed nothing or could not reach the catalog channel";
+                } elseif (filesize($catalogPath) === 0) {
+                    $catalogSkipped = "the catalog file at {$catalogPath} is empty";
+                } else {
                     $archive = $this->db->fetchOne(
                         "SELECT id FROM archives WHERE backup_job_id = ?",
                         [$jobId]
                     );
-                    if ($archive) {
+                    if (!$archive) {
+                        $catalogSkipped = 'no archive record exists for this job, so there is nothing to attach the catalog to'
+                            . (empty($input['archive_name']) ? ' (the client reported no archive name)' : '');
+                    } else {
                         $catalogImport = [
                             'agent_id' => (int) $agent['id'],
                             'archive_id' => (int) $archive['id'],
@@ -703,6 +821,16 @@ class AgentApiController extends Controller
                     }
                 }
             }
+        }
+
+        if ($catalogSkipped !== null) {
+            $this->db->insert('server_log', [
+                'agent_id' => $agent['id'],
+                'backup_job_id' => $jobId,
+                'level' => 'warning',
+                'message' => "File catalog not imported for job #{$jobId} — {$catalogSkipped}. "
+                           . "The backup itself is fine; browsing and file-level restore won't work for it until the catalog is rebuilt.",
+            ]);
         }
 
         // Auto-prune is deferred until after catalog import (see below)
@@ -718,6 +846,17 @@ class AgentApiController extends Controller
             );
             $archiveId = $archive ? (int) $archive['id'] : null;
         }
+
+        // Everything below this point is work the agent has already been told
+        // was accepted: importing the catalog, then queueing the auto-prune at
+        // the very end. On PHP-FPM the response is flushed and the request runs
+        // on regardless, but under mod_php it stays tied to the client's
+        // connection — and a client that powers itself off in a post-backup
+        // script (#402) drops that connection mid-import, which can take the
+        // tail of this request with it. The prune then never gets queued at
+        // all, and the job is left sitting at "Importing file catalog...".
+        // Finish what we started.
+        ignore_user_abort(true);
 
         // Send response immediately so the agent isn't blocked
         http_response_code(200);
@@ -771,7 +910,13 @@ class AgentApiController extends Controller
                 $diagLog = dirname($catPath) . '/.catalog-diag.log';
                 $gateDiag = '';
                 if (file_exists($diagLog)) {
-                    $tail = file_get_contents($diagLog);
+                    // Only the end of the file matters; it can be large.
+                    $tail = '';
+                    if ($dfh = @fopen($diagLog, 'r')) {
+                        fseek($dfh, -min(8192, (int) @filesize($diagLog)), SEEK_END);
+                        $tail = (string) stream_get_contents($dfh);
+                        fclose($dfh);
+                    }
                     $lines = explode("\n", trim($tail));
                     $gateDiag = ' | gate-diag: ' . implode(' / ', array_slice($lines, -6));
                 }
@@ -791,6 +936,22 @@ class AgentApiController extends Controller
             );
             $this->db->update('backup_jobs', [
                 'status' => 'completed',
+                'completed_at' => $this->db->now(),
+                'duration_seconds' => max(0, (int) ($catDurRow['dur'] ?? 0)),
+                'status_message' => null,
+            ], 'id = ?', [$jobId]);
+        } elseif ($hasPendingCatalog) {
+            // A catalog file was on disk when the status came in, so the job was
+            // held at "Importing file catalog..." — but the import never got
+            // built (no archive record to attach it to). Nothing further will
+            // touch this job, so without this it sits at "running" forever on a
+            // backup that actually finished.
+            $catDurRow = $this->db->fetchOne(
+                "SELECT TIMESTAMPDIFF(SECOND, ?, NOW()) as dur",
+                [$startedAt]
+            );
+            $this->db->update('backup_jobs', [
+                'status' => $result,
                 'completed_at' => $this->db->now(),
                 'duration_seconds' => max(0, (int) ($catDurRow['dur'] ?? 0)),
                 'status_message' => null,
@@ -838,21 +999,30 @@ class AgentApiController extends Controller
         $archiveId = (int) ($input['archive_id'] ?? 0);
         $files = $input['files'] ?? [];
 
-        if (!$archiveId || empty($files)) {
+        if (!$archiveId || empty($files) || !is_array($files)) {
             $this->json(['error' => 'archive_id and files[] required'], 400);
+        }
+        if (count($files) > self::MAX_CATALOG_BATCH) {
+            $this->json(['error' => 'Too many files in one batch (max ' . self::MAX_CATALOG_BATCH . ')'], 413);
         }
 
         // Verify archive exists AND belongs to the calling agent. Without the
         // ownership check, a compromised agent token could upload catalog rows
         // against another tenant's archive (cross-tenant pollution).
         $archive = $this->db->fetchOne(
-            "SELECT ar.id FROM archives ar
+            "SELECT ar.id, ar.created_at FROM archives ar
              JOIN repositories r ON r.id = ar.repository_id
              WHERE ar.id = ? AND r.agent_id = ?",
             [$archiveId, (int) $agent['id']]
         );
         if (!$archive) {
             $this->json(['error' => 'Archive not found'], 404);
+        }
+        // A catalog is sent right after the backup that made the archive.
+        // Refusing late uploads stops an agent from padding an old archive's
+        // catalog forever.
+        if (strtotime($archive['created_at']) < time() - 86400) {
+            $this->json(['error' => 'Catalog uploads are only accepted for archives created in the last 24 hours'], 409);
         }
 
         $agentId = (int) $agent['id'];
@@ -867,10 +1037,10 @@ class AgentApiController extends Controller
         if ($fh) {
             foreach ($files as $file) {
                 $path = $file['path'] ?? '';
-                if (empty($path)) continue;
+                if (!is_string($path) || $path === '' || strlen($path) > 4096) continue;
 
-                $status = substr($file['status'] ?? 'U', 0, 1);
-                $mtime = $file['mtime'] ?? '\\N';
+                $status = \BBS\Services\CatalogImporter::safeStatus($file['status'] ?? 'U');
+                $mtime = \BBS\Services\CatalogImporter::safeMtime($file['mtime'] ?? null);
                 fwrite($fh, "{$agentId}\t{$archiveId}\t{$escape($path)}\t{$escape(basename($path))}\t{$escape(dirname($path))}\t" . (int) ($file['size'] ?? 0) . "\t{$status}\t{$mtime}\n");
                 $batchSize++;
             }
@@ -920,62 +1090,16 @@ class AgentApiController extends Controller
      */
     private function buildDirsFromCatalog(int $agentId, int $archiveId): void
     {
-        $ch = \BBS\Core\ClickHouse::getInstance();
-
-        // Remove old dir entries for this archive
+        // Aggregation and ancestor expansion both happen inside ClickHouse.
+        // Doing it in PHP meant pulling one row per directory into memory and
+        // then building a second map of every ancestor — hundreds of megabytes
+        // on a large archive, well past the default memory limit (#391).
         try {
-            $ch->exec("ALTER TABLE catalog_dirs DELETE WHERE agent_id = {$agentId} AND archive_id = {$archiveId} SETTINGS mutations_sync = 1");
-        } catch (\Exception $e) { /* ignore */ }
-
-        // Get dir stats grouped by parent_dir from ClickHouse
-        $dirRows = $ch->fetchAll("
-            SELECT parent_dir, count() as file_count, sum(file_size) as total_size
-            FROM file_catalog
-            WHERE agent_id = ? AND archive_id = ? AND status != 'D'
-            GROUP BY parent_dir
-        ", [$agentId, $archiveId]);
-
-        $allDirs = [];
-        foreach ($dirRows as $d) {
-            $dirPath = $d['parent_dir'];
-            if ($dirPath === '' || $dirPath === '/') continue;
-
-            if (!isset($allDirs[$dirPath])) {
-                $allDirs[$dirPath] = [0, 0];
-            }
-            $allDirs[$dirPath][0] += (int) $d['file_count'];
-            $allDirs[$dirPath][1] += (int) $d['total_size'];
-
-            // Walk up ancestors
-            $p = dirname($dirPath);
-            while ($p !== '/' && $p !== '.' && !isset($allDirs[$p])) {
-                $allDirs[$p] = [0, 0];
-                $p = dirname($p);
-            }
+            \BBS\Core\ClickHouse::getInstance()->rebuildDirIndex($agentId, $archiveId);
+        } catch (\Exception $e) {
+            // Non-fatal: the file catalog is already in place, only the
+            // directory browse index is missing and can be rebuilt later.
         }
-
-        if (empty($allDirs)) return;
-
-        // Write dirs TSV and upload to ClickHouse
-        $escape = fn(string $s) => str_replace(["\t", "\n", "\\"], ["\\t", "\\n", "\\\\"], $s);
-        $dirsTsv = sys_get_temp_dir() . "/catalog_dirs_api_{$agentId}_{$archiveId}_" . getmypid() . '.tsv';
-        $fh = fopen($dirsTsv, 'w');
-        if (!$fh) return;
-
-        foreach ($allDirs as $dirPath => [$fc, $sz]) {
-            $parent = dirname($dirPath);
-            if ($parent === '.') $parent = '/';
-            $name = basename($dirPath);
-            fwrite($fh, "{$agentId}\t{$archiveId}\t{$escape($dirPath)}\t{$escape($parent)}\t{$escape($name)}\t{$fc}\t{$sz}\n");
-        }
-        fclose($fh);
-
-        try {
-            $ch->insertTsv('catalog_dirs', $dirsTsv, [
-                'agent_id', 'archive_id', 'dir_path', 'parent_dir', 'name', 'file_count', 'total_size'
-            ]);
-        } catch (\Exception $e) { /* ignore */ }
-        @unlink($dirsTsv);
     }
 
     public function heartbeat(): void
@@ -998,7 +1122,7 @@ class AgentApiController extends Controller
             SELECT bj.id FROM backup_jobs bj
             WHERE bj.agent_id = ?
               AND bj.status = 'running'
-              AND bj.task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete')
+              AND bj.task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete', 'archive_lock')
               AND (
                   (bj.last_progress_at IS NOT NULL AND bj.last_progress_at < DATE_SUB(NOW(), INTERVAL {$stallMinutes} MINUTE))
                   OR
@@ -1008,13 +1132,14 @@ class AgentApiController extends Controller
 
         if (!empty($stalledJobs)) {
             $response['check_jobs'] = array_map(fn($j) => (int) $j['id'], $stalledJobs);
+            $response['stall_minutes'] = $stallMinutes;
         }
 
         // Also relay cancel signals for the currently running job
         $cancelledJob = $this->db->fetchOne("
             SELECT id FROM backup_jobs
             WHERE agent_id = ? AND status = 'cancelled'
-              AND task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete')
+              AND task_type NOT IN ('prune', 'compact', 's3_sync', 's3_restore', 'repo_check', 'repo_repair', 'break_lock', 'catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full', 'archive_delete', 'archive_lock')
               AND completed_at IS NULL
             LIMIT 1
         ", [$agent['id']]);
@@ -1038,14 +1163,30 @@ class AgentApiController extends Controller
         if (!empty($input['os_info']))              $data['os_info'] = substr($input['os_info'], 0, 255);
         if (!empty($input['borg_version']))         $data['borg_version'] = substr($input['borg_version'], 0, 20);
         if (!empty($input['agent_version']))        $data['agent_version'] = substr($input['agent_version'], 0, 20);
+        // Agents that manage their own version (containers) opt out of
+        // server-driven updates entirely (#387). array_key_exists, not
+        // !empty — false is the meaningful value here.
+        if (array_key_exists('auto_update_enabled', $input)) {
+            $data['auto_update_enabled'] = !empty($input['auto_update_enabled']) ? 1 : 0;
+        }
         if (!empty($input['hostname']))             $data['hostname'] = substr($input['hostname'], 0, 255);
         if (!empty($input['ip_address']))           $data['ip_address'] = substr($input['ip_address'], 0, 45);
+        if (!empty($input['mac_address']) && preg_match('/^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$/', $input['mac_address'])) {
+            $data['mac_address'] = strtolower($input['mac_address']);
+        }
         if (!empty($input['borg_install_method']))  $data['borg_install_method'] = substr($input['borg_install_method'], 0, 20);
         if (!empty($input['borg_source']))          $data['borg_source'] = substr($input['borg_source'], 0, 20);
         if (!empty($input['borg_binary_path']))     $data['borg_binary_path'] = substr($input['borg_binary_path'], 0, 255);
         if (!empty($input['glibc_version']))        $data['glibc_version'] = substr($input['glibc_version'], 0, 20);
         if (!empty($input['platform']))             $data['platform'] = substr($input['platform'], 0, 20);
         if (!empty($input['architecture']))         $data['architecture'] = substr($input['architecture'], 0, 20);
+        // What the host can snapshot (LVM, btrfs, ZFS), so the plan editor
+        // offers "Back up from a snapshot" only where it can work.
+        if (isset($input['snapshot_support']) && is_array($input['snapshot_support'])) {
+            $data['snapshot_capable'] = !empty($input['snapshot_support']['capable']) ? 1 : 0;
+            $snapshotJson = json_encode($input['snapshot_support']);
+            $data['snapshot_support'] = ($snapshotJson !== false && strlen($snapshotJson) <= 16384) ? $snapshotJson : null;
+        }
 
         if (!empty($data)) {
             $this->db->update('agents', $data, 'id = ?', [$agent['id']]);
@@ -1077,7 +1218,7 @@ class AgentApiController extends Controller
         $serverHost = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
         $sshPort = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'ssh_port'");
 
-        $host = !empty($agent['server_host_override']) ? $agent['server_host_override'] : SshKeyManager::stripHostPort($serverHost['value'] ?? '');
+        $host = SshKeyManager::stripHostPort(!empty($agent['server_host_override']) ? $agent['server_host_override'] : ($serverHost['value'] ?? ''));
         $port = !empty($agent['ssh_port_override']) ? (int) $agent['ssh_port_override'] : (int) ($sshPort['value'] ?? 22);
 
         $this->json([
@@ -1184,6 +1325,15 @@ class AgentApiController extends Controller
         $platform = $agent['platform'] ?? null;
         $arch = $agent['architecture'] ?? null;
         if (!$platform || !$arch) {
+            return;
+        }
+
+        // NixOS manages borg declaratively through nixpkgs — the agent can't
+        // install a foreign binary (no FHS ELF interpreter), has no package
+        // manager to drive, and pip is unavailable. The agent reports such
+        // jobs as skipped without changing borg_version, so queueing here
+        // would loop daily forever (#359).
+        if (stripos($agent['os_info'] ?? '', 'nixos') !== false) {
             return;
         }
 

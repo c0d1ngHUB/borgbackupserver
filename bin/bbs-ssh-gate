@@ -53,8 +53,12 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
 
         TARGET="$LOG_DIR/catalog-${JOB_ID}.jsonl"
 
-        # Diagnostic log for troubleshooting FUSE/shfs permission issues (#84)
+        # Diagnostic log for troubleshooting FUSE/shfs permission issues (#84).
+        # Appended on every backup, so keep only its tail once it passes 256 KB.
         DIAG_LOG="$LOG_DIR/.catalog-diag.log"
+        if [[ -f "$DIAG_LOG" ]] && (( $(stat -c %s "$DIAG_LOG" 2>/dev/null || echo 0) > 262144 )); then
+            tail -n 200 "$DIAG_LOG" > "$DIAG_LOG.tmp" 2>/dev/null && mv -f "$DIAG_LOG.tmp" "$DIAG_LOG" 2>/dev/null || rm -f "$DIAG_LOG.tmp"
+        fi
         {
             echo "=== catalog-write job=$JOB_ID $(date -Iseconds) ==="
             echo "user=$(id)"
@@ -63,7 +67,11 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
             echo "mount=$(stat -f -c '%T' "$LOG_DIR" 2>/dev/null || mount | grep "$(df "$LOG_DIR" --output=source 2>/dev/null | tail -1)" 2>/dev/null | head -1 || echo 'unknown')"
         } >> "$DIAG_LOG" 2>&1 || true
 
-        cat > "$TARGET"
+        # A catalog is one JSON line per file; 16 GiB covers tens of millions
+        # of files. The cap stops a client from filling the server's disk
+        # through this channel.
+        MAX_CATALOG_BYTES=$((16 * 1024 * 1024 * 1024))
+        head -c "$MAX_CATALOG_BYTES" > "$TARGET"
 
         # Log file state immediately after creation (before any chmod/chgrp)
         {
@@ -81,12 +89,40 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
             chmod 640 "$TARGET" 2>/dev/null || true
             echo "chgrp=ok final=$(stat -c '%A %U:%G' "$TARGET" 2>&1)" >> "$DIAG_LOG" 2>&1 || true
         else
-            # Fallback for setups where chgrp to www-data failed (existing
-            # users created before the supplementary-group fix, or filesystems
-            # that map ownership through a translation layer): make the file
-            # world-readable so www-data can import it via "other" permissions.
+            # Fallback for setups where chgrp to www-data failed (the SSH
+            # user is not in the www-data group, or a translation-layer
+            # filesystem): make the file world-readable AND the directory
+            # world-traversable, so www-data can reach and import the file
+            # through "other" permissions without group access (#506). We own
+            # the directory here, so this needs no root.
             chmod 644 "$TARGET" 2>/dev/null || true
-            echo "chgrp=FAILED fallback=644 final=$(stat -c '%A %U:%G' "$TARGET" 2>&1)" >> "$DIAG_LOG" 2>&1 || true
+            chmod o+rx "$LOG_DIR" 2>/dev/null || true
+            echo "chgrp=FAILED fallback=644+o+rx final=$(stat -c '%A %U:%G' "$TARGET" 2>&1) dir=$(stat -c '%A' "$LOG_DIR" 2>&1)" >> "$DIAG_LOG" 2>&1 || true
+        fi
+        ;;
+
+    "dryrun-write "*)
+        # A dry run's full file list (#414), kept for a day for download from
+        # the job page. Same sandbox as catalog-write: numeric job id, fixed
+        # file name, the client's own log directory.
+        JOB_ID="${SSH_ORIGINAL_COMMAND#dryrun-write }"
+        if [[ ! "$JOB_ID" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: invalid job_id" >&2
+            exit 1
+        fi
+        LOG_DIR="$HOME_DIR/.catalog-logs"
+        mkdir -p "$LOG_DIR" 2>/dev/null || true
+        TARGET="$LOG_DIR/dryrun-${JOB_ID}.txt"
+        # Replace, never write through, whatever is at the name already.
+        rm -f -- "$TARGET"
+        # 2 GiB is tens of millions of paths; the cap stops a client from
+        # filling the server's disk through this channel.
+        head -c $((2 * 1024 * 1024 * 1024)) > "$TARGET"
+        if chgrp www-data "$TARGET" 2>/dev/null; then
+            chmod 640 "$TARGET" 2>/dev/null || true
+        else
+            chmod 644 "$TARGET" 2>/dev/null || true
+            chmod o+rx "$LOG_DIR" 2>/dev/null || true
         fi
         ;;
 

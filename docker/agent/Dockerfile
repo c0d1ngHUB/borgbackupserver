@@ -9,7 +9,17 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
         ca-certificates \
         curl \
         default-mysql-client \
-        postgresql-client \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# PostgreSQL clients from the PostgreSQL apt repository, several majors at
+# once: pg_dump refuses a server newer than itself, and Debian's own
+# postgresql-client is one major behind whatever people run (#495). The
+# agent picks the pg_dump that matches the server it is dumping.
+RUN install -d /etc/apt/keyrings && \
+    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /etc/apt/keyrings/postgresql.asc && \
+    echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg main" > /etc/apt/sources.list.d/pgdg.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        postgresql-client-16 postgresql-client-17 postgresql-client-18 \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # MongoDB database tools aren't in the Debian archive anymore — pull the
@@ -31,9 +41,14 @@ RUN arch=$(dpkg --print-architecture) && \
     rm -rf /var/lib/apt/lists/* /tmp/mdbtools.deb
 
 # Force UTF-8 so the agent's ASCII-locale re-exec branch stays dormant.
+# BORG_BASE_DIR keeps borg's cache, config, and security dir under the
+# persisted /etc/bbs-agent volume — without it they live in /root and are
+# lost on container recreate, forcing borg to re-chunk every file on the
+# next backup (#373).
 ENV LC_ALL=C.UTF-8 \
     LANG=C.UTF-8 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    BORG_BASE_DIR=/etc/bbs-agent/borg
 
 RUN mkdir -p /opt/bbs-agent /etc/bbs-agent
 COPY agent/bbs-agent.py /opt/bbs-agent/bbs-agent.py

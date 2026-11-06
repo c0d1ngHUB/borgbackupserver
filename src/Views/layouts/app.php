@@ -31,16 +31,29 @@
     <link rel="icon" type="image/png" sizes="96x96" href="/branding/icon/96">
     <link rel="shortcut icon" href="/favicon.ico">
     <link rel="apple-touch-icon" sizes="180x180" href="/branding/icon/180">
-    <meta name="theme-color" content="#2c3e50">
+    <meta name="theme-color" content="#101417">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
+    <script>
+    // Escape text for HTML built in JS (innerHTML, attributes). Use it for
+    // anything a client agent reported: agents are untrusted, and their
+    // output, file names and host details can carry markup.
+    window.bbsEsc = function (s) {
+        return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    };
+    </script>
 </head>
 <body>
     <!-- Top bar -->
     <nav class="navbar navbar-expand navbar-dark topbar p-0">
         <div class="container-fluid p-0">
-            <a href="/" class="navbar-brand d-flex align-items-center justify-content-center m-0 p-0 topbar-logo">
+            <button class="btn btn-link text-white d-md-none px-3 border-0 topbar-burger" type="button"
+                    data-bs-toggle="offcanvas" data-bs-target="#mobileNav" aria-controls="mobileNav" aria-label="Menu">
+                <i class="bi bi-list" style="font-size:1.5rem;"></i>
+            </button>
+            <a href="/" class="navbar-brand d-flex align-items-center justify-content-center m-0 p-0 topbar-logo overflow-hidden">
                 <?php
                     $brandIcon = \BBS\Core\Database::getInstance()->fetchOne("SELECT `value` FROM settings WHERE `key` = 'branding_icon'");
                     if (!empty($brandIcon['value'])):
@@ -85,30 +98,13 @@
                 </a>
                 <?php
                 $isAdmin = (($_SESSION['user_role'] ?? '') === 'admin');
-                $upgradeAvailable = $isAdmin ? (new \BBS\Services\UpdateService())->isUpdateAvailable() : false;
-                $agentUpgradeCount = 0;
-                if ($isAdmin && !$upgradeAvailable) {
-                    $bundledAgentVer = null;
-                    $agentFile = dirname(__DIR__, 3) . '/agent/bbs-agent.py';
-                    if (file_exists($agentFile)) {
-                        $h = fopen($agentFile, 'r');
-                        if ($h) {
-                            for ($i = 0; $i < 50 && ($ln = fgets($h)) !== false; $i++) {
-                                if (preg_match('/^AGENT_VERSION\s*=\s*["\']([^"\']+)["\']/m', $ln, $mv)) {
-                                    $bundledAgentVer = $mv[1]; break;
-                                }
-                            }
-                            fclose($h);
-                        }
-                    }
-                    if ($bundledAgentVer) {
-                        $db = \BBS\Core\Database::getInstance();
-                        $agentUpgradeCount = (int)$db->fetchOne(
-                            "SELECT COUNT(*) as cnt FROM agents WHERE agent_version IS NOT NULL AND agent_version != ?",
-                            [$bundledAgentVer]
-                        )['cnt'];
-                    }
-                }
+                $updateService = new \BBS\Services\UpdateService();
+                $upgradeAvailable = $isAdmin ? $updateService->isUpdateAvailable() : false;
+                // Server updates take precedence over agent updates in this menu,
+                // so the agent count is only needed when there's no server update.
+                $agentUpgradeCount = ($isAdmin && !$upgradeAvailable)
+                    ? $updateService->countOutdatedAgents()
+                    : 0;
                 if ($upgradeAvailable): ?>
                 <a href="/settings?tab=updates" class="badge bg-warning text-dark text-decoration-none me-2 me-md-3 py-2 px-2 d-none d-sm-inline-block">
                     <i class="bi bi-cloud-arrow-down me-1"></i> Upgrade
@@ -156,72 +152,101 @@
     <div class="d-flex">
         <!-- Sidebar (desktop only) -->
         <nav id="sidebar" class="sidebar d-none d-md-flex flex-column flex-shrink-0 text-white">
-            <ul class="nav nav-pills flex-column mb-auto text-center">
+            <?php
+            $pt = $pageTitle ?? '';
+            $isAdmin = ($_SESSION['user_role'] ?? '') === 'admin';
+            // Which settings page is showing, so the matching child highlights
+            // and the group starts open on the page you are already on.
+            $settingsTab = $_GET['tab'] ?? 'general';
+            $onSettings = $pt === 'Settings';
+
+            // Reads the cached latest_version the update checker already
+            // stores — no network call on a page render.
+            $sidebarUpdateService = new \BBS\Services\UpdateService();
+            $sidebarUpdateAvailable = $sidebarUpdateService->isUpdateAvailable();
+
+            $settingsPages = \BBS\Services\SettingsNav::pages();
+            ?>
+            <ul class="nav flex-column mb-auto">
                 <li class="nav-item">
-                    <a href="/" class="nav-link sidebar-link <?= ($pageTitle ?? '') === 'Dashboard' ? 'active' : '' ?>">
-                        <i class="bi bi-speedometer2 d-block mb-1 fs-4"></i>
-                        <span class="small">Dashboard</span>
+                    <a href="/" class="nav-link sidebar-link <?= $pt === 'Dashboard' ? 'active' : '' ?>">
+                        <i class="bi bi-speedometer2"></i><span class="sidebar-label">Dashboard</span>
                     </a>
                 </li>
                 <li class="nav-item">
-                    <a href="/clients" class="nav-link sidebar-link <?= ($pageTitle ?? '') === 'Clients' ? 'active' : '' ?>">
-                        <i class="bi bi-display d-block mb-1 fs-4"></i>
-                        <span class="small">Clients</span>
+                    <a href="/clients" class="nav-link sidebar-link <?= $pt === 'Clients' ? 'active' : '' ?>">
+                        <i class="bi bi-display"></i><span class="sidebar-label">Clients</span>
                     </a>
                 </li>
                 <li class="nav-item">
-                    <a href="/queue" class="nav-link sidebar-link <?= ($pageTitle ?? '') === 'Queue' ? 'active' : '' ?>">
-                        <i class="bi bi-clock-history d-block mb-1 fs-4"></i>
-                        <span class="small">Queue</span>
+                    <a href="/queue" class="nav-link sidebar-link <?= $pt === 'Queue' ? 'active' : '' ?>">
+                        <i class="bi bi-clock-history"></i><span class="sidebar-label">Queue</span>
                     </a>
                 </li>
                 <li class="nav-item">
-                    <a href="/schedules" class="nav-link sidebar-link <?= ($pageTitle ?? '') === 'Schedules' ? 'active' : '' ?>">
-                        <i class="bi bi-calendar-week d-block mb-1 fs-4"></i>
-                        <span class="small">Schedules</span>
+                    <a href="/schedules" class="nav-link sidebar-link <?= $pt === 'Schedules' ? 'active' : '' ?>">
+                        <i class="bi bi-calendar-week"></i><span class="sidebar-label">Schedules</span>
                     </a>
                 </li>
+                <?php if ($isAdmin && !\BBS\Core\Config::isHosted()): ?>
                 <li class="nav-item">
-                    <a href="/log" class="nav-link sidebar-link <?= ($pageTitle ?? '') === 'Log' ? 'active' : '' ?>">
-                        <i class="bi bi-journal-text d-block mb-1 fs-4"></i>
-                        <span class="small">Log</span>
-                    </a>
-                </li>
-                <?php if (($_SESSION['user_role'] ?? '') === 'admin'): ?>
-                <?php if (!\BBS\Core\Config::isHosted()): ?>
-                <li class="nav-item">
-                    <a href="/storage-locations" class="nav-link sidebar-link <?= ($pageTitle ?? '') === 'Storage' ? 'active' : '' ?>">
-                        <i class="bi bi-hdd-stack d-block mb-1 fs-4"></i>
-                        <span class="small">Storage</span>
+                    <a href="/storage-locations" class="nav-link sidebar-link <?= $pt === 'Storage' ? 'active' : '' ?>">
+                        <i class="bi bi-hdd-stack"></i><span class="sidebar-label">Storage</span>
                     </a>
                 </li>
                 <?php endif; ?>
                 <li class="nav-item">
-                    <a href="/settings" class="nav-link sidebar-link <?= ($pageTitle ?? '') === 'Settings' ? 'active' : '' ?>">
-                        <i class="bi bi-gear d-block mb-1 fs-4"></i>
-                        <span class="small">Settings</span>
+                    <a href="/log" class="nav-link sidebar-link <?= $pt === 'Log' ? 'active' : '' ?>">
+                        <i class="bi bi-journal-text"></i><span class="sidebar-label">Log</span>
                     </a>
                 </li>
+
+                <?php if ($isAdmin): ?>
                 <li class="nav-item">
-                    <a href="/users" class="nav-link sidebar-link <?= str_contains($pageTitle ?? '', 'User') ? 'active' : '' ?>">
-                        <i class="bi bi-people d-block mb-1 fs-4"></i>
-                        <span class="small">Users</span>
+                    <div class="sidebar-section">Management</div>
+                </li>
+                <li class="nav-item">
+                    <a href="/users" class="nav-link sidebar-link <?= str_contains($pt, 'User') ? 'active' : '' ?>">
+                        <i class="bi bi-people"></i><span class="sidebar-label">Users</span>
                     </a>
+                </li>
+
+                <li class="nav-item">
+                    <button class="nav-link sidebar-link sidebar-group-toggle <?= $onSettings ? 'active' : '' ?>"
+                            type="button" data-bs-toggle="collapse" data-bs-target="#sidebarSettings"
+                            aria-expanded="<?= $onSettings ? 'true' : 'false' ?>" aria-controls="sidebarSettings">
+                        <i class="bi bi-sliders"></i><span class="sidebar-label">Settings</span>
+                        <i class="bi bi-chevron-up sidebar-group-caret"></i>
+                    </button>
+                    <div class="collapse <?= $onSettings ? 'show' : '' ?>" id="sidebarSettings">
+                        <ul class="sidebar-sub">
+                            <?php foreach ($settingsPages as $sp): ?>
+                            <li>
+                                <a href="/settings?tab=<?= $sp['tab'] ?>"
+                                   class="nav-link sidebar-link <?= ($onSettings && $settingsTab === $sp['tab']) ? 'active' : '' ?>">
+                                    <i class="bi <?= $sp['icon'] ?>"></i><span class="sidebar-label"><?= htmlspecialchars($sp['label']) ?></span>
+                                    <?php if ($sp['tab'] === 'updates' && !empty($sidebarUpdateAvailable)): ?>
+                                        <span class="badge bg-warning text-dark ms-1" style="font-size:.6rem;">New</span>
+                                    <?php endif; ?>
+                                </a>
+                            </li>
+                            <?php endforeach; ?>
+                        </ul>
+                    </div>
                 </li>
                 <?php endif; ?>
             </ul>
             <?php
-                $bbsVersionForSidebar = (new \BBS\Services\UpdateService())->getCurrentVersion();
+                $bbsVersionForSidebar = $sidebarUpdateService->getCurrentVersion();
             ?>
             <div class="text-center pb-2">
                 <span class="badge rounded-pill sidebar-version-pill">
                     v<?= htmlspecialchars($bbsVersionForSidebar) ?>
                 </span>
             </div>
-            <div class="border-top p-2 text-center">
+            <div class="border-top p-2">
                 <a href="/logout" class="nav-link sidebar-link">
-                    <i class="bi bi-box-arrow-left d-block mb-1 fs-4"></i>
-                    <span class="small">Logout</span>
+                    <i class="bi bi-box-arrow-left"></i><span class="sidebar-label">Logout</span>
                 </a>
             </div>
         </nav>
@@ -232,74 +257,60 @@
             <?php $flash = $flash ?? $this->getFlash(); ?>
 
             <!-- Page content -->
-            <div class="p-3 p-md-4">
+            <div class="page-canvas">
                 <?php require $viewPath . $template . '.php'; ?>
             </div>
         </div>
     </div>
 
-    <!-- Bottom nav (mobile only) -->
-    <?php
-        $pt = $pageTitle ?? '';
-        $isAdmin = ($_SESSION['user_role'] ?? '') === 'admin';
-        // Active state for the More menu: true if the current page is one of
-        // the items inside the More sheet, so the user sees which section of
-        // the app they're in even though it's not a top-level tab.
-        $moreActive = in_array($pt, ['Schedules', 'Log', 'Storage'], true)
-            || ($isAdmin && str_contains($pt, 'User'));
-    ?>
-    <nav class="mobile-bottom-nav d-md-none">
-        <a href="/" class="mobile-nav-item <?= $pt === 'Dashboard' ? 'active' : '' ?>">
-            <i class="bi bi-speedometer2"></i>
-            <span>Home</span>
-        </a>
-        <a href="/clients" class="mobile-nav-item <?= $pt === 'Clients' ? 'active' : '' ?>">
-            <i class="bi bi-display"></i>
-            <span>Clients</span>
-        </a>
-        <a href="/queue" class="mobile-nav-item <?= $pt === 'Queue' ? 'active' : '' ?>">
-            <i class="bi bi-clock-history"></i>
-            <span>Queue</span>
-        </a>
-        <?php if ($isAdmin): ?>
-        <a href="/settings" class="mobile-nav-item <?= $pt === 'Settings' ? 'active' : '' ?>">
-            <i class="bi bi-gear"></i>
-            <span>Settings</span>
-        </a>
-        <?php endif; ?>
-        <button type="button" class="mobile-nav-item <?= $moreActive ? 'active' : '' ?>"
-                data-bs-toggle="offcanvas" data-bs-target="#mobileMoreMenu" aria-controls="mobileMoreMenu">
-            <i class="bi bi-three-dots"></i>
-            <span>More</span>
-        </button>
-    </nav>
-
-    <!-- "More" offcanvas — pops up from the bottom with secondary nav items -->
-    <div class="offcanvas offcanvas-bottom mobile-more-sheet" tabindex="-1" id="mobileMoreMenu" aria-labelledby="mobileMoreMenuLabel">
+    <!-- Mobile navigation drawer.
+         One menu with everything the desktop sidebar has, rather than five
+         bottom-bar slots and a "More" sheet holding whatever didn't fit. -->
+    <div class="offcanvas offcanvas-start mobile-nav-drawer" tabindex="-1" id="mobileNav" aria-labelledby="mobileNavLabel">
         <div class="offcanvas-header border-bottom">
-            <h5 class="offcanvas-title" id="mobileMoreMenuLabel">More</h5>
+            <h5 class="offcanvas-title" id="mobileNavLabel">Menu</h5>
             <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
         </div>
         <div class="offcanvas-body p-0">
             <div class="list-group list-group-flush">
+                <a href="/" class="list-group-item list-group-item-action d-flex align-items-center <?= $pt === 'Dashboard' ? 'active' : '' ?>">
+                    <i class="bi bi-speedometer2 fs-6 me-3"></i>Dashboard
+                </a>
+                <a href="/clients" class="list-group-item list-group-item-action d-flex align-items-center <?= $pt === 'Clients' ? 'active' : '' ?>">
+                    <i class="bi bi-display fs-6 me-3"></i>Clients
+                </a>
+                <a href="/queue" class="list-group-item list-group-item-action d-flex align-items-center <?= $pt === 'Queue' ? 'active' : '' ?>">
+                    <i class="bi bi-clock-history fs-6 me-3"></i>Queue
+                </a>
                 <a href="/schedules" class="list-group-item list-group-item-action d-flex align-items-center <?= $pt === 'Schedules' ? 'active' : '' ?>">
-                    <i class="bi bi-calendar-week fs-5 me-3"></i>Schedules
+                    <i class="bi bi-calendar-week fs-6 me-3"></i>Schedules
                 </a>
-                <a href="/log" class="list-group-item list-group-item-action d-flex align-items-center <?= $pt === 'Log' ? 'active' : '' ?>">
-                    <i class="bi bi-journal-text fs-5 me-3"></i>Log
-                </a>
-                <?php if ($isAdmin): ?>
-                <a href="/users" class="list-group-item list-group-item-action d-flex align-items-center <?= str_contains($pt, 'User') ? 'active' : '' ?>">
-                    <i class="bi bi-people fs-5 me-3"></i>Users
-                </a>
-                <?php if (!\BBS\Core\Config::isHosted()): ?>
+                <?php if ($isAdmin && !\BBS\Core\Config::isHosted()): ?>
                 <a href="/storage-locations" class="list-group-item list-group-item-action d-flex align-items-center <?= $pt === 'Storage' ? 'active' : '' ?>">
-                    <i class="bi bi-hdd-stack fs-5 me-3"></i>Storage
+                    <i class="bi bi-hdd-stack fs-6 me-3"></i>Storage
                 </a>
                 <?php endif; ?>
+                <a href="/log" class="list-group-item list-group-item-action d-flex align-items-center <?= $pt === 'Log' ? 'active' : '' ?>">
+                    <i class="bi bi-journal-text fs-6 me-3"></i>Log
+                </a>
+
+                <?php if ($isAdmin): ?>
+                <div class="mobile-nav-heading">Management</div>
+                <a href="/users" class="list-group-item list-group-item-action d-flex align-items-center <?= str_contains($pt, 'User') ? 'active' : '' ?>">
+                    <i class="bi bi-people fs-6 me-3"></i>Users
+                </a>
+
+                <div class="mobile-nav-heading">Settings</div>
+                <?php foreach (\BBS\Services\SettingsNav::pages() as $sp): ?>
+                <a href="/settings?tab=<?= $sp['tab'] ?>"
+                   class="list-group-item list-group-item-action d-flex align-items-center <?= ($pt === 'Settings' && ($_GET['tab'] ?? 'general') === $sp['tab']) ? 'active' : '' ?>">
+                    <i class="bi <?= $sp['icon'] ?> fs-6 me-3"></i><?= htmlspecialchars($sp['label']) ?>
+                </a>
+                <?php endforeach; ?>
                 <?php endif; ?>
+
                 <a href="/logout" class="list-group-item list-group-item-action d-flex align-items-center text-danger">
-                    <i class="bi bi-box-arrow-right fs-5 me-3"></i>Logout
+                    <i class="bi bi-box-arrow-right fs-6 me-3"></i>Logout
                 </a>
             </div>
         </div>
@@ -327,27 +338,41 @@
     <script>
     window.BBS_TIME_24H = <?= json_encode(($_SESSION['time_format'] ?? '12h') === '24h') ?>;
     window.BBS_TIMEZONE = <?= json_encode($_SESSION['timezone'] ?? 'America/New_York') ?>;
+    window.BBS_SERVER_NOW = <?= time() ?>;
+    // Job type names (#497): the type strings never change, the words do.
+    window.BBS_TASK_LABELS = <?= json_encode(\BBS\Core\JobType::labels()) ?>;
+    window.bbsTaskLabel = function (t) { t = String(t || ''); return window.BBS_TASK_LABELS[t] || (t.replace(/_/g, ' ').replace(/^\w/, c => c.toUpperCase())); };
     </script>
     <!-- bootstrap.bundle moved to <head> (see comment there) — no second tag here. -->
     <script>
     // Global dropdown/tooltip escape fix (issue #161 and predecessors).
-    // Every dropdown toggle in the app gets data-bs-strategy="fixed" so Popper
-    // positions the menu with position:fixed, which escapes parent containers
-    // that clip it (cards with overflow:hidden, table wrappers, sticky headers).
+    // Every dropdown menu is positioned with Popper's fixed strategy so it
+    // escapes parent containers that clip it (cards with overflow:hidden,
+    // table wrappers, sticky headers, and `body` itself — which is the app's
+    // scroll container via overflow-y:auto, so on a short page an absolutely
+    // positioned menu is cut off at the end of the content, not the viewport).
     // Tooltips get boundary:'viewport' + container:'body' via a default instance
     // so they also clear parent clipping. This replaces the per-element patches
     // we were adding case-by-case.
+    //
+    // NB: the strategy has to be passed through popperConfig. `strategy` is a
+    // Popper option, not a Bootstrap one — there is no data-bs-strategy, so
+    // setting that attribute (as this did until v2.75.0) silently did nothing
+    // and every menu stayed position:absolute. That is why the plan menu lost
+    // its last item once "Dry Run" made it one row taller (#390).
     (function() {
         function upgradeDropdown(el) {
             if (el.dataset.bsDropdownFixed === '1') return;
-            el.setAttribute('data-bs-strategy', 'fixed');
             el.dataset.bsDropdownFixed = '1';
-            // If Bootstrap already instantiated this dropdown, dispose so the
-            // next open picks up the new strategy.
-            if (window.bootstrap && bootstrap.Dropdown) {
-                var existing = bootstrap.Dropdown.getInstance(el);
-                if (existing) existing.dispose();
-            }
+            if (!(window.bootstrap && bootstrap.Dropdown)) return;
+            // Replace any instance Bootstrap auto-created without our config.
+            var existing = bootstrap.Dropdown.getInstance(el);
+            if (existing) existing.dispose();
+            new bootstrap.Dropdown(el, {
+                popperConfig: function (defaults) {
+                    return Object.assign({}, defaults, { strategy: 'fixed' });
+                }
+            });
         }
         function upgradeTooltip(el) {
             if (el.dataset.bsTooltipFixed === '1') return;
@@ -389,6 +414,25 @@
             // bleeds through — e.g. a plan's Actions kebab showing inside the
             // Browse Filesystem modal (#328). Close any open dropdown when a
             // modal is shown.
+            // A menu inside a positioned wrapper that has its own z-index
+            // (the kebab on a plan or repository card) paints inside that
+            // wrapper's stacking context, so the wrappers of the cards after
+            // it, at the same z-index and later in the DOM, cover the open
+            // menu (#463). Lift only the open menu's wrapper above its
+            // siblings and put it back when the menu closes.
+            document.addEventListener('show.bs.dropdown', function(e) {
+                var wrap = e.target.closest('.dropdown, .btn-group, .dropup, .dropend, .dropstart');
+                if (!wrap || wrap.dataset.bbsZ !== undefined) return;
+                wrap.dataset.bbsZ = wrap.style.zIndex;
+                wrap.style.zIndex = '2147483647';
+            });
+            document.addEventListener('hidden.bs.dropdown', function(e) {
+                var wrap = e.target.closest('.dropdown, .btn-group, .dropup, .dropend, .dropstart');
+                if (!wrap || wrap.dataset.bbsZ === undefined) return;
+                wrap.style.zIndex = wrap.dataset.bbsZ;
+                delete wrap.dataset.bbsZ;
+            });
+
             document.addEventListener('show.bs.modal', function() {
                 document.querySelectorAll('[data-bs-toggle="dropdown"][aria-expanded="true"]').forEach(function(t) {
                     if (window.bootstrap && bootstrap.Dropdown) {
@@ -428,7 +472,8 @@
         var msgEl = document.getElementById('confirmMessage');
         var okBtn = document.getElementById('confirmOk');
         var icon = document.querySelector('#confirmModal .modal-body > i');
-        msgEl.innerHTML = message.replace(/\n/g, '<br>');
+        // Escaped: messages carry names users and agents set (GHSA-jwq4-qmhw-54mm)
+        msgEl.innerHTML = bbsEsc(message).replace(/\n/g, '<br>');
         // Style the OK button based on type
         okBtn.className = 'btn px-4 btn-' + (options.btnClass || 'success');
         okBtn.textContent = options.okText || 'OK';

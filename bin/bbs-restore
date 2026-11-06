@@ -109,20 +109,31 @@ fi
 # Step 2: Restore .env
 info "[2/7] Restoring config/.env..."
 
+# In Docker, config/.env is a symlink to the file on the data volume
+# (/var/bbs/config/.env). Every write below has to land on the real file:
+# `sed -i` on a symlink replaces the link with a plain file, which left the
+# fixed-up credentials in the container and the backup's stale password on
+# the volume — and the next container start, which re-links to the volume,
+# could no longer reach its own database (#447).
+ENV_FILE="$BBS_DIR/config/.env"
+if [ -L "$ENV_FILE" ]; then
+    ENV_FILE=$(readlink -f "$ENV_FILE")
+fi
+
 # Save current DB credentials before overwriting (the running MySQL may have different creds
 # than the backup's .env, e.g., Docker container with random password vs bare-metal backup)
 SAVED_DB_HOST=""
 SAVED_DB_NAME=""
 SAVED_DB_USER=""
 SAVED_DB_PASS=""
-if [ -f "$BBS_DIR/config/.env" ]; then
-    SAVED_DB_HOST=$(grep '^DB_HOST=' "$BBS_DIR/config/.env" | cut -d= -f2-)
-    SAVED_DB_NAME=$(grep '^DB_NAME=' "$BBS_DIR/config/.env" | cut -d= -f2-)
-    SAVED_DB_USER=$(grep '^DB_USER=' "$BBS_DIR/config/.env" | cut -d= -f2-)
-    SAVED_DB_PASS=$(grep '^DB_PASS=' "$BBS_DIR/config/.env" | cut -d= -f2-)
+if [ -f "$ENV_FILE" ]; then
+    SAVED_DB_HOST=$(grep '^DB_HOST=' "$ENV_FILE" | cut -d= -f2-)
+    SAVED_DB_NAME=$(grep '^DB_NAME=' "$ENV_FILE" | cut -d= -f2-)
+    SAVED_DB_USER=$(grep '^DB_USER=' "$ENV_FILE" | cut -d= -f2-)
+    SAVED_DB_PASS=$(grep '^DB_PASS=' "$ENV_FILE" | cut -d= -f2-)
 fi
 
-if [ -f "$BBS_DIR/config/.env" ]; then
+if [ -f "$ENV_FILE" ]; then
     if [ "$AUTO_YES" = true ]; then
         REPLY="y"
     else
@@ -132,20 +143,19 @@ if [ -f "$BBS_DIR/config/.env" ]; then
     if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
         echo "  Skipping .env restore (keeping existing)"
     else
-        cp "$TMPDIR/env" "$BBS_DIR/config/.env"
-        chmod 600 "$BBS_DIR/config/.env"
-        chown www-data:www-data "$BBS_DIR/config/.env"
+        cp "$TMPDIR/env" "$ENV_FILE"
+        chmod 600 "$ENV_FILE"
+        chown www-data:www-data "$ENV_FILE"
         ok "Restored .env"
     fi
 else
-    cp "$TMPDIR/env" "$BBS_DIR/config/.env"
-    chmod 600 "$BBS_DIR/config/.env"
-    chown www-data:www-data "$BBS_DIR/config/.env"
+    cp "$TMPDIR/env" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    chown www-data:www-data "$ENV_FILE"
     ok "Restored .env"
 fi
 
 # Read DB credentials from the (possibly restored) .env
-ENV_FILE="$BBS_DIR/config/.env"
 DB_HOST=$(grep '^DB_HOST=' "$ENV_FILE" | cut -d= -f2-)
 DB_NAME=$(grep '^DB_NAME=' "$ENV_FILE" | cut -d= -f2-)
 DB_USER=$(grep '^DB_USER=' "$ENV_FILE" | cut -d= -f2-)
@@ -195,6 +205,16 @@ else
     mysql -h "${DB_HOST:-localhost}" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" \
         -e "DELETE FROM backup_jobs WHERE status IN ('queued', 'sent', 'running')" 2>/dev/null
     ok "Cleared stale job queue"
+
+    # Drop the push identity. A restored database carries the identity of the
+    # install it came from, so without this a staging or DR copy comes up as
+    # that server and can deliver notifications to its devices. Clearing these
+    # makes this copy register as its own server on first use, and leaves the
+    # original's registration untouched. The queue goes too — those alerts are
+    # about events on a system this copy no longer represents.
+    mysql -h "${DB_HOST:-localhost}" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" \
+        -e "DELETE FROM settings WHERE \`key\` IN ('push_install_id', 'push_server_id', 'push_serverkey', 'push_relay_fail_count', 'push_relay_cooldown_until'); DELETE FROM push_queue;" 2>/dev/null
+    ok "Cleared push registration (this copy will register as a new server)"
 
     # Enable maintenance mode — prevents scheduler from queuing new jobs before repos are restored
     mysql -h "${DB_HOST:-localhost}" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" \
@@ -268,6 +288,9 @@ info "[6/7] Restoring system config..."
 if [ -d "$TMPDIR/sudoers" ]; then
     for sf in "$TMPDIR/sudoers"/*; do
         [ -f "$sf" ] || continue
+        # Never restore the legacy bbs-borg rule — its (bbs-*) RunAs wildcard
+        # is invalid on newer sudo and disables all www-data sudo (#368)
+        [ "$(basename "$sf")" = "bbs-borg" ] && continue
         cp "$sf" "/etc/sudoers.d/$(basename "$sf")"
         chmod 440 "/etc/sudoers.d/$(basename "$sf")"
     done
@@ -275,10 +298,10 @@ if [ -d "$TMPDIR/sudoers" ]; then
 else
     # Ensure defaults exist even without backup copy
     echo "www-data ALL=(root) NOPASSWD: /usr/local/bin/bbs-ssh-helper, $BBS_DIR/bin/bbs-update" > /etc/sudoers.d/bbs-ssh-helper
-    echo "www-data ALL=(bbs-*) NOPASSWD: /usr/bin/borg, /usr/local/bin/borg, /usr/bin/rclone, /usr/bin/env" > /etc/sudoers.d/bbs-borg
-    chmod 440 /etc/sudoers.d/bbs-ssh-helper /etc/sudoers.d/bbs-borg
+    chmod 440 /etc/sudoers.d/bbs-ssh-helper
     ok "Sudoers created (defaults)"
 fi
+rm -f /etc/sudoers.d/bbs-borg
 
 if [ -f "$TMPDIR/cron" ]; then
     cp "$TMPDIR/cron" /etc/cron.d/bbs-scheduler
@@ -304,13 +327,32 @@ else
         echo "  No agents with SSH users found"
     else
         COUNT=0
+        PATHS_COUNT=0
         while IFS=$'\t' read -r AGENT_ID UNIX_USER PUBLIC_KEY; do
             [ -z "$UNIX_USER" ] && continue
             HOME_DIR="${STORAGE_PATH%/}/${AGENT_ID}"
             /usr/local/bin/bbs-ssh-helper create-user "$UNIX_USER" "$HOME_DIR" "$PUBLIC_KEY" >/dev/null 2>&1 || true
             COUNT=$((COUNT + 1))
+
+            # bbs-ssh-gate only allows the home dir plus the paths listed in
+            # $HOME_DIR/.storage-paths. That file is not part of the backup, so
+            # rebuild it the way SshKeyManager::updateAgentStoragePaths() does —
+            # otherwise every repo on a non-default storage location fails with
+            # "Repository path not allowed".
+            EXTRA_PATHS=()
+            while IFS= read -r LOC_PATH; do
+                LOC_PATH="${LOC_PATH%/}"
+                [ -z "$LOC_PATH" ] || [ "$LOC_PATH" = "${STORAGE_PATH%/}" ] && continue
+                EXTRA_PATHS+=("$LOC_PATH/$AGENT_ID")
+            done < <(mysql -h "${DB_HOST:-localhost}" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e \
+                "SELECT DISTINCT sl.path FROM repositories r JOIN storage_locations sl ON sl.id = r.storage_location_id WHERE r.agent_id = ${AGENT_ID} AND r.storage_type = 'local'" </dev/null 2>/dev/null || true)
+            if [ ${#EXTRA_PATHS[@]} -gt 0 ]; then
+                /usr/local/bin/bbs-ssh-helper update-storage-paths "$HOME_DIR" "${EXTRA_PATHS[@]}" >/dev/null 2>&1 || true
+                PATHS_COUNT=$((PATHS_COUNT + 1))
+            fi
         done <<< "$AGENTS"
         ok "Recreated $COUNT Unix user(s)"
+        if [ "$PATHS_COUNT" -gt 0 ]; then ok "Restored storage location access for $PATHS_COUNT agent(s)"; fi
     fi
 fi
 

@@ -21,7 +21,7 @@ class BackupPlanController extends Controller
         $advancedOptions = trim($_POST['advanced_options'] ?? '');
         $frequency = $_POST['frequency'] ?? 'daily';
         $times = trim($_POST['times'] ?? '');
-        $dayOfWeek = !empty($_POST['day_of_week']) ? (int) $_POST['day_of_week'] : null;
+        $dayOfWeek = \BBS\Services\SchedulerService::formatDaysOfWeek($_POST['day_of_week'] ?? '');
         $dayOfMonth = !empty($_POST['day_of_month']) ? $_POST['day_of_month'] : null;
 
         $pruneMinutes = (int) ($_POST['prune_minutes'] ?? 0);
@@ -33,6 +33,10 @@ class BackupPlanController extends Controller
 
         if (empty($name) || empty($agentId) || empty($repositoryId) || empty($directories)) {
             $this->flash('danger', 'Name, repository, and directories are required.');
+            $this->redirect("/clients/{$agentId}?tab=schedules");
+        }
+        if (($fieldError = \BBS\Services\BorgCommandBuilder::validatePlanFields($advancedOptions, $directories)) !== null) {
+            $this->flash('danger', $fieldError);
             $this->redirect("/clients/{$agentId}?tab=schedules");
         }
 
@@ -50,6 +54,10 @@ class BackupPlanController extends Controller
             $this->flash('danger', 'Repository not found for this client.');
             $this->redirect("/clients/{$agentId}?tab=schedules");
         }
+        if (!empty($repo['read_only'])) {
+            $this->flash('danger', 'This repository is a read-only copy restored from an offsite sync. Backup plans and offsite sync cannot use it.');
+            $this->redirect("/clients/{$agentId}?tab=schedules");
+        }
 
         // Create backup plan
         $planId = $this->db->insert('backup_plans', [
@@ -59,6 +67,9 @@ class BackupPlanController extends Controller
             'directories' => $directories,
             'excludes' => $excludes ?: null,
             'advanced_options' => $advancedOptions ?: null,
+            'snapshot' => !empty($_POST['snapshot']) ? 1 : 0,
+            'stream_db_dumps' => !empty($_POST['stream_db_dumps']) ? 1 : 0,
+            'priority' => in_array($_POST['priority'] ?? 'normal', ['normal', 'low', 'idle'], true) ? $_POST['priority'] : 'normal',
             'prune_minutes' => $pruneMinutes,
             'prune_hours' => $pruneHours,
             'prune_days' => $pruneDays,
@@ -67,8 +78,16 @@ class BackupPlanController extends Controller
             'prune_years' => $pruneYears,
         ]);
 
+        // The zone comes from the client's profile, not from whoever is
+        // creating the plan: two admins in different places would otherwise
+        // produce schedules that run hours apart from the same profile (#411).
+        // A profile without a zone falls back to the creating admin's own,
+        // which is the zone the form's hours are shown in (#559).
+        $planTz = (new \BBS\Services\ClientProfileService())
+            ->planTimezoneFor($agentId, $_SESSION['timezone'] ?? null);
+
         // Create associated schedule
-        $nextRun = $this->calculateNextRun($frequency, $times, $dayOfWeek, $dayOfMonth);
+        $nextRun = $this->calculateNextRun($frequency, $times, $dayOfWeek, $dayOfMonth, $planTz);
 
         $this->db->insert('schedules', [
             'backup_plan_id' => $planId,
@@ -76,13 +95,18 @@ class BackupPlanController extends Controller
             'times' => $times ?: null,
             'day_of_week' => $dayOfWeek,
             'day_of_month' => $dayOfMonth,
-            'timezone' => $_SESSION['timezone'] ?? 'America/New_York',
+            'timezone' => $planTz,
             'enabled' => $frequency === 'manual' ? 0 : 1,
             'next_run' => $nextRun,
         ]);
 
         // Save plugin configurations
-        $this->savePluginConfigs($planId);
+        $pluginErr = $this->savePluginConfigs($planId, $agentId);
+        if ($pluginErr) {
+            $this->flash('warning', "Backup plan \"{$name}\" created, but plugins were not saved: {$pluginErr}");
+            $this->redirect("/clients/{$agentId}?tab=schedules");
+            return;
+        }
 
         $this->flash('success', "Backup plan \"{$name}\" created with schedule.");
         $this->redirect("/clients/{$agentId}?tab=schedules");
@@ -107,7 +131,44 @@ class BackupPlanController extends Controller
         if (isset($_POST['directories'])) $data['directories'] = trim($_POST['directories']);
         if (isset($_POST['excludes'])) $data['excludes'] = trim($_POST['excludes']) ?: null;
         if (isset($_POST['advanced_options'])) $data['advanced_options'] = trim($_POST['advanced_options']) ?: null;
-        if (isset($_POST['repository_id'])) $data['repository_id'] = (int) $_POST['repository_id'];
+        // An unticked checkbox is absent from the POST; the form carries a
+        // marker so "absent" can be told from "not on this form".
+        if (isset($_POST['snapshot_present'])) $data['snapshot'] = !empty($_POST['snapshot']) ? 1 : 0;
+        if (isset($_POST['stream_db_dumps_present'])) $data['stream_db_dumps'] = !empty($_POST['stream_db_dumps']) ? 1 : 0;
+        if (isset($_POST['priority']) && in_array($_POST['priority'], ['normal', 'low', 'idle'], true)) $data['priority'] = $_POST['priority'];
+        if (isset($_POST['advanced_options']) || isset($_POST['directories'])) {
+            $fieldError = \BBS\Services\BorgCommandBuilder::validatePlanFields(
+                $data['advanced_options'] ?? $plan['advanced_options'],
+                $data['directories'] ?? $plan['directories']
+            );
+            if ($fieldError !== null) {
+                $this->flash('danger', $fieldError);
+                $this->redirect("/clients/{$plan['agent_id']}?tab=schedules");
+            }
+        }
+        // The repository must belong to THIS plan's agent. requirePermission()
+        // above gates the plan, but that is object-level only — without this
+        // property-level check a user with manage_plans on their own client
+        // could repoint the plan at another client's repository by posting its
+        // id, since the backup_plans.repository_id foreign key is global rather
+        // than scoped per agent (GHSA-vm4w-wwpg-v3rc). store() has always
+        // checked this; update() did not.
+        if (isset($_POST['repository_id'])) {
+            $repositoryId = (int) $_POST['repository_id'];
+            $repo = $this->db->fetchOne(
+                "SELECT id, read_only FROM repositories WHERE id = ? AND agent_id = ?",
+                [$repositoryId, (int) $plan['agent_id']]
+            );
+            if (!$repo) {
+                $this->flash('danger', 'Repository not found for this client.');
+                $this->redirect("/clients/{$plan['agent_id']}?tab=schedules");
+            }
+            if (!empty($repo['read_only'])) {
+                $this->flash('danger', 'This repository is a read-only copy restored from an offsite sync. Backup plans and offsite sync cannot use it.');
+                $this->redirect("/clients/{$plan['agent_id']}?tab=schedules");
+            }
+            $data['repository_id'] = $repositoryId;
+        }
         if (isset($_POST['prune_minutes'])) $data['prune_minutes'] = (int) $_POST['prune_minutes'];
         if (isset($_POST['prune_hours'])) $data['prune_hours'] = (int) $_POST['prune_hours'];
         if (isset($_POST['prune_days'])) $data['prune_days'] = (int) $_POST['prune_days'];
@@ -123,23 +184,32 @@ class BackupPlanController extends Controller
         if (isset($_POST['frequency'])) {
             $frequency = $_POST['frequency'];
             $times = trim($_POST['times'] ?? '');
-            $dayOfWeek = isset($_POST['day_of_week']) && $_POST['day_of_week'] !== '' ? (int) $_POST['day_of_week'] : null;
+            $dayOfWeek = \BBS\Services\SchedulerService::formatDaysOfWeek($_POST['day_of_week'] ?? '');
             $dayOfMonth = isset($_POST['day_of_month']) && $_POST['day_of_month'] !== '' ? $_POST['day_of_month'] : null;
-            $nextRun = $this->calculateNextRun($frequency, $times, $dayOfWeek, $dayOfMonth);
+            // Same resolution as plan creation, so editing a plan does not
+            // move it from the profile's zone to the editor's (#559).
+            $planTz = (new \BBS\Services\ClientProfileService())
+                ->planTimezoneFor((int) $plan['agent_id'], $_SESSION['timezone'] ?? null);
+            $nextRun = $this->calculateNextRun($frequency, $times, $dayOfWeek, $dayOfMonth, $planTz);
 
             $this->db->update('schedules', [
                 'frequency' => $frequency,
                 'times' => $times ?: null,
                 'day_of_week' => $dayOfWeek,
                 'day_of_month' => $dayOfMonth,
-                'timezone' => $_SESSION['timezone'] ?? 'America/New_York',
+                'timezone' => $planTz,
                 'enabled' => $frequency === 'manual' ? 0 : 1,
                 'next_run' => $nextRun,
             ], 'backup_plan_id = ?', [$id]);
         }
 
         // Update plugin configurations
-        $this->savePluginConfigs($id);
+        $pluginErr = $this->savePluginConfigs($id, (int) $plan['agent_id']);
+        if ($pluginErr) {
+            $this->flash('warning', "Plan saved, but plugins were not updated: {$pluginErr}");
+            $this->redirect("/clients/{$plan['agent_id']}?tab=schedules");
+            return;
+        }
 
         $this->flash('success', 'Backup plan updated.');
         $this->redirect("/clients/{$plan['agent_id']}?tab=schedules");
@@ -211,6 +281,52 @@ class BackupPlanController extends Controller
         $this->redirect("/queue/{$jobId}");
     }
 
+    /**
+     * Queue a dry run (#257): the plan's exact borg command with --dry-run,
+     * so exclude patterns can be tested without writing anything to the repo.
+     */
+    public function dryRun(int $id): void
+    {
+        $this->requireAuth();
+        $this->verifyCsrf();
+
+        $plan = $this->getPlan($id);
+        if (!$plan) {
+            $this->flash('danger', 'Backup plan not found.');
+            $this->redirect('/clients');
+        }
+
+        $this->requirePermission(PermissionService::TRIGGER_BACKUP, $plan['agent_id']);
+
+        $planBusy = $this->db->fetchOne("
+            SELECT id FROM backup_jobs
+            WHERE backup_plan_id = ?
+              AND status IN ('queued', 'sent', 'running')
+        ", [$id]);
+        if ($planBusy) {
+            $this->flash('warning', 'This plan already has a job queued or running.');
+            $this->redirect("/clients/{$plan['agent_id']}?tab=backups");
+            return;
+        }
+
+        $jobId = $this->db->insert('backup_jobs', [
+            'backup_plan_id' => $id,
+            'agent_id' => $plan['agent_id'],
+            'repository_id' => $plan['repository_id'],
+            'task_type' => 'backup_dry_run',
+            'status' => 'queued',
+        ]);
+
+        $this->db->insert('server_log', [
+            'agent_id' => $plan['agent_id'],
+            'backup_job_id' => $jobId,
+            'level' => 'info',
+            'message' => "Dry run queued for plan \"{$plan['name']}\" (job #{$jobId})",
+        ]);
+
+        $this->redirect("/queue/{$jobId}");
+    }
+
     public function duplicate(int $id): void
     {
         $this->requireAuth();
@@ -232,6 +348,9 @@ class BackupPlanController extends Controller
             'directories' => $plan['directories'],
             'excludes' => $plan['excludes'],
             'advanced_options' => $plan['advanced_options'],
+            'snapshot' => $plan['snapshot'] ?? 0,
+            'stream_db_dumps' => $plan['stream_db_dumps'] ?? 0,
+            'priority' => $plan['priority'] ?? 'normal',
             'prune_minutes' => $plan['prune_minutes'],
             'prune_hours' => $plan['prune_hours'],
             'prune_days' => $plan['prune_days'],
@@ -287,34 +406,80 @@ class BackupPlanController extends Controller
         return $plan;
     }
 
-    private function savePluginConfigs(int $planId): void
+    /**
+     * Persist the plugin configs checked for a plan. Accepts a flat list of
+     * plugin_config ids (plan_plugin_configs[]) so a plan can run several
+     * configs, including two of the same engine. Falls back to the legacy
+     * plugin_config[plugin_id]=config_id map for older form posts.
+     * Returns an error string if the selection is invalid, else null.
+     */
+    private function savePluginConfigs(int $planId, int $agentId): ?string
     {
-        $pluginConfigs = $_POST['plugin_config'] ?? [];
+        $configIds = [];
+        if (isset($_POST['plan_plugin_configs']) && is_array($_POST['plan_plugin_configs'])) {
+            $configIds = array_map('intval', $_POST['plan_plugin_configs']);
+        } elseif (isset($_POST['plugin_config']) && is_array($_POST['plugin_config'])) {
+            foreach ($_POST['plugin_config'] as $cid) {
+                if (!empty($cid)) $configIds[] = (int) $cid;
+            }
+        }
+        $configIds = array_values(array_unique(array_filter($configIds)));
 
-        // Clear existing
+        // Resolve each config (must belong to this agent). Collect dump dirs
+        // for database engines to reject two configs that would clobber each
+        // other's dumps in the same directory.
+        $rows = [];
+        $dumpDirs = [];
+        foreach ($configIds as $cid) {
+            $pc = $this->db->fetchOne(
+                "SELECT pc.id, pc.plugin_id, pc.name, pc.config, p.slug
+                 FROM plugin_configs pc JOIN plugins p ON p.id = pc.plugin_id
+                 WHERE pc.id = ? AND pc.agent_id = ?",
+                [$cid, $agentId]
+            );
+            if (!$pc) continue;
+            if (in_array($pc['slug'], ['mysql_dump', 'pg_dump', 'mongo_dump', 'mssql_dump'], true)) {
+                $cfg = json_decode($pc['config'], true) ?: [];
+                $dir = rtrim($cfg['dump_dir'] ?? '', '/');
+                if ($dir !== '') {
+                    if (isset($dumpDirs[$dir])) {
+                        return "Plugin configs \"{$dumpDirs[$dir]}\" and \"{$pc['name']}\" both dump to {$dir}. "
+                             . "Give each database config its own dump directory so they don't overwrite each other.";
+                    }
+                    $dumpDirs[$dir] = $pc['name'];
+                }
+            }
+            $rows[] = $pc;
+        }
+
         $this->db->query("DELETE FROM backup_plan_plugins WHERE backup_plan_id = ?", [$planId]);
-
         $order = 0;
-        foreach ($pluginConfigs as $pluginId => $configId) {
-            if (empty($configId)) continue;
+        foreach ($rows as $pc) {
             $this->db->insert('backup_plan_plugins', [
                 'backup_plan_id' => $planId,
-                'plugin_id' => (int) $pluginId,
-                'plugin_config_id' => (int) $configId,
+                'plugin_id' => (int) $pc['plugin_id'],
+                'plugin_config_id' => (int) $pc['id'],
                 'config' => '{}',
                 'execution_order' => $order++,
                 'enabled' => 1,
             ]);
         }
+        return null;
     }
 
-    private function calculateNextRun(string $frequency, string $times, ?int $dayOfWeek, ?int $dayOfMonth): ?string
+    private function calculateNextRun(string $frequency, string $times, ?string $dayOfWeek, $dayOfMonth, string $timezone = 'UTC'): ?string
     {
         if ($frequency === 'manual') {
             return null;
         }
 
-        $userTz = new \DateTimeZone($_SESSION['timezone'] ?? 'America/New_York');
+        // The schedule's own zone: the first run used to be computed in the
+        // editor's zone while the scheduler used the plan's (#559).
+        try {
+            $userTz = new \DateTimeZone($timezone);
+        } catch (\Exception $e) {
+            $userTz = new \DateTimeZone('UTC');
+        }
         $utcTz = new \DateTimeZone('UTC');
         $now = new \DateTime('now', $utcTz);
 
@@ -358,10 +523,7 @@ class BackupPlanController extends Controller
         }
 
         if ($frequency === 'weekly' && $dayOfWeek !== null) {
-            $days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-            $next = new \DateTime("next {$days[$dayOfWeek]} {$firstTime}", $userTz);
-            $next->setTimezone($utcTz);
-            return $next->format('Y-m-d H:i:s');
+            return \BBS\Services\SchedulerService::nextWeeklyRun($dayOfWeek, $firstTime, $userTz);
         }
 
         if ($frequency === 'monthly' && $dayOfMonth !== null) {

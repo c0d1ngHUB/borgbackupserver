@@ -15,6 +15,18 @@ class NotificationService
 
     // Success/info events should always send (not deduplicate) since users want
     // to know every time a backup completes. Failure events deduplicate to avoid spam.
+    /**
+     * Events that describe one run rather than an ongoing state. A backup
+     * that finishes with warnings tonight is a new event, not the same one
+     * as last night, so the previous entry is resolved before this one is
+     * recorded and every run reaches email, Apprise and push (#496).
+     * Failures stay stateful on purpose: one alert per state change, with
+     * the periodic re-emit from #249.
+     */
+    private const PER_RUN_EVENTS = [
+        'backup_warning',
+    ];
+
     private const ALWAYS_SEND_EVENTS = [
         'backup_completed',
         'restore_completed',
@@ -46,13 +58,14 @@ class NotificationService
                 // toggles), but skip the in-app notification center record.
                 $this->sendEmailIfEnabled($type, $message);
                 $this->sendAppriseIfEnabled($type, $message, $agentId);
+                $this->queuePush($type, $agentId, $referenceId, $userId);
                 return;
             }
         }
 
         // For success events, resolve any previous unresolved notification first
         // so a fresh one is always created and notifications always fire
-        if ($alwaysSend) {
+        if ($alwaysSend || in_array($type, self::PER_RUN_EVENTS, true)) {
             $this->resolve($type, $agentId, $referenceId, $userId);
         }
 
@@ -68,7 +81,7 @@ class NotificationService
         if ($userId !== null) $params[] = $userId;
 
         $existing = $this->db->fetchOne(
-            "SELECT id, last_emailed_at FROM notifications WHERE type = ? AND {$agentClause} AND {$refClause} AND {$userClause} AND resolved_at IS NULL",
+            "SELECT id, last_emailed_at, last_pushed_at FROM notifications WHERE type = ? AND {$agentClause} AND {$refClause} AND {$userClause} AND resolved_at IS NULL",
             $params
         );
 
@@ -114,6 +127,51 @@ class NotificationService
             $this->sendEmailIfEnabled($type, $message, $userId);
             $this->db->update('notifications', ['last_emailed_at' => $this->db->now()], 'id = ?', [$notificationId]);
         }
+
+        // Push rides its own copy of the same throttle: a flapping alert is
+        // far more punishing on a lock screen than in an inbox.
+        $shouldPush = $isNew || $forceEmail || $this->shouldReEmit($existing['last_pushed_at'] ?? null);
+        if ($shouldPush) {
+            $this->queuePush($type, $agentId, $referenceId, $userId);
+            $this->db->update('notifications', ['last_pushed_at' => $this->db->now()], 'id = ?', [$notificationId]);
+        }
+    }
+
+    /**
+     * Queue a push for everyone this alert concerns.
+     *
+     * Recipients are decided by access, not by role: whoever can see the
+     * affected client. An admin still receives everything, but as a
+     * consequence of seeing every client rather than as a special case — and
+     * an operator who owns three clients now gets alerts for them, which
+     * email still doesn't do. Server-wide alerts have no client to scope by,
+     * so those fall back to admins.
+     *
+     * Only ever enqueues. The relay is never contacted from here: this runs
+     * inside the agent-facing API and inside the scheduler's locked tick.
+     */
+    private function queuePush(string $type, ?int $agentId, ?int $referenceId, ?int $userId): void
+    {
+        try {
+            $push = new PushService();
+            if (!$push->isConfigured()) {
+                return;
+            }
+
+            if ($userId !== null) {
+                $recipients = [$userId];           // already addressed to someone
+            } elseif ($agentId !== null) {
+                $recipients = (new PermissionService())->getUsersForAgent($agentId);
+            } else {
+                $recipients = (new PermissionService())->getAdminUserIds();
+            }
+
+            $push->enqueue($type, $recipients, $referenceId, $agentId);
+        } catch (\Exception $e) {
+            // Never let notification plumbing affect the thing being notified
+            // about. A push that doesn't queue is not a backup problem.
+            error_log('Push queue failed: ' . $e->getMessage());
+        }
     }
 
     private function shouldReEmit(?string $lastEmailedAt): bool
@@ -148,8 +206,9 @@ class NotificationService
             'repo_compact_done' => 'Compact Done',
             // Storage
             'storage_low' => 'Storage Low',
-            's3_sync_failed' => 'S3 Sync Failed',
-            's3_sync_done' => 'S3 Sync Done',
+            'certificate_expiring' => 'SSL Certificate Expiring',
+            's3_sync_failed' => 'Offsite Sync Failed',
+            's3_sync_done' => 'Offsite Sync Done',
             // Schedules
             'missed_schedule' => 'Missed Schedule',
         ];

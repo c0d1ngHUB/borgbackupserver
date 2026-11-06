@@ -104,6 +104,8 @@ class App
         $this->router->map('GET', '/clients/[i:id]/restore', 'ClientController@restore');
         $this->router->map('POST', '/clients/[i:id]/edit', 'ClientController@update');
         $this->router->map('POST', '/clients/[i:id]/delete', 'ClientController@delete');
+        $this->router->map('POST', '/clients/[i:id]/rotate-key', 'ClientController@rotateApiKey');
+        $this->router->map('POST', '/clients/[i:id]/reprovision-ssh', 'ClientController@reprovisionSsh');
         $this->router->map('POST', '/clients/[i:id]/update-borg', 'ClientController@updateBorg');
         $this->router->map('POST', '/clients/[i:id]/update-agent', 'ClientController@updateAgent');
         $this->router->map('POST', '/clients/[i:id]/browse', 'ClientController@browse');
@@ -124,14 +126,17 @@ class App
         $this->router->map('POST', '/repositories/[i:id]/delete', 'RepositoryController@delete');
         $this->router->map('POST', '/repositories/[i:id]/maintenance', 'RepositoryController@maintenance');
         $this->router->map('POST', '/repositories/[i:id]/rename', 'RepositoryController@rename');
+        $this->router->map('POST', '/repositories/[i:id]/passphrase', 'RepositoryController@changePassphrase');
         $this->router->map('GET', '/clients/[i:agentId]/repo/[i:id]', 'RepositoryController@detail');
         $this->router->map('GET', '/clients/[i:agentId]/repo/[i:id]/archive/[i:archiveId]', 'RepositoryController@archiveDetail');
         $this->router->map('GET', '/clients/[i:agentId]/repo/[i:id]/archive/[i:archiveId]/files', 'RepositoryController@archiveFiles');
         $this->router->map('GET', '/clients/[i:agentId]/repo/[i:id]/archive/[i:archiveId]/deleted-summary', 'RepositoryController@archiveDeletedSummary');
         $this->router->map('POST', '/clients/[i:agentId]/repo/[i:id]/archive/[i:archiveId]/delete', 'RepositoryController@deleteArchive');
+        $this->router->map('POST', '/clients/[i:agentId]/repo/[i:id]/archive/[i:archiveId]/lock', 'RepositoryController@toggleArchiveLock');
         $this->router->map('POST', '/clients/[i:agentId]/repo/[i:id]/s3-restore', 'RepositoryController@s3Restore');
         $this->router->map('POST', '/clients/[i:agentId]/repo/[i:id]/s3-config', 'RepositoryController@s3Config');
         $this->router->map('POST', '/clients/[i:agentId]/repo/[i:id]/s3-config/delete', 'RepositoryController@s3ConfigDelete');
+        $this->router->map('POST', '/clients/[i:agentId]/repo/[i:id]/s3-sync/run', 'RepositoryController@s3SyncRun');
         $this->router->map('POST', '/clients/[i:id]/restore-orphan', 'RepositoryController@restoreOrphan');
         $this->router->map('POST', '/repositories/import/verify', 'RepositoryController@verifyImport');
         $this->router->map('POST', '/repositories/import', 'RepositoryController@import');
@@ -144,6 +149,7 @@ class App
         $this->router->map('POST', '/plans/[i:id]/edit', 'BackupPlanController@update');
         $this->router->map('POST', '/plans/[i:id]/delete', 'BackupPlanController@delete');
         $this->router->map('POST', '/plans/[i:id]/trigger', 'BackupPlanController@trigger');
+        $this->router->map('POST', '/plans/[i:id]/dry-run', 'BackupPlanController@dryRun');
         $this->router->map('POST', '/plans/[i:id]/duplicate', 'BackupPlanController@duplicate');
 
         // Schedules
@@ -159,6 +165,8 @@ class App
         $this->router->map('GET', '/queue/[i:id]/json', 'QueueController@detailJson');
         $this->router->map('POST', '/queue/[i:id]/cancel', 'QueueController@cancel');
         $this->router->map('POST', '/queue/[i:id]/retry', 'QueueController@retry');
+        $this->router->map('GET', '/queue/[i:id]/dry-run-log', 'QueueController@dryRunLog');
+        $this->router->map('POST', '/queue/[i:id]/dry-run-log/delete', 'QueueController@deleteDryRunLog');
 
         // Notifications
         $this->router->map('GET', '/notifications', 'NotificationController@index');
@@ -166,21 +174,37 @@ class App
         $this->router->map('POST', '/notifications/read-all', 'NotificationController@markAllRead');
 
         // Log
+        $this->router->map('POST', '/notes/save', 'NotesController@save');
         $this->router->map('GET', '/log', 'LogController@index');
+        $this->router->map('POST', '/log/[i:id]/resolve', 'LogController@resolve');
+        $this->router->map('POST', '/log/resolve-all', 'LogController@resolveAll');
 
         // Settings
         $this->router->map('GET', '/settings', 'SettingsController@index');
         $this->router->map('POST', '/settings', 'SettingsController@update');
+        $this->router->map('POST', '/settings/profiles/add', 'ClientProfileController@store');
+        $this->router->map('POST', '/settings/profiles/[i:id]/edit', 'ClientProfileController@update');
+        $this->router->map('POST', '/settings/profiles/[i:id]/delete', 'ClientProfileController@delete');
+        $this->router->map('POST', '/settings/profiles/[i:id]/apply', 'ClientProfileController@apply');
         $this->router->map('POST', '/settings/templates/add', 'SettingsController@addTemplate');
         $this->router->map('POST', '/settings/templates/[i:id]/edit', 'SettingsController@editTemplate');
         $this->router->map('POST', '/settings/templates/[i:id]/delete', 'SettingsController@deleteTemplate');
+        $this->router->map('POST', '/settings/templates/[i:id]/duplicate', 'SettingsController@duplicateTemplate');
         $this->router->map('POST', '/settings/branding', 'SettingsController@saveBranding');
+        $this->router->map('POST', '/settings/push', 'SettingsController@savePush');
 
         // Branding icon dispenser — single-source app icon resized on demand
         // (favicons, apple-touch-icon, PWA tiles all served from one upload).
         $this->router->map('GET', '/branding/icon/[i:size]', 'BrandingController@icon');
+
+        // Unauthenticated liveness probe for uptime monitors / container checks
+        $this->router->map('GET', '/health', 'Api\\AdminApiController@healthLive');
+        // Prometheus scrape target. Gated by Settings → API → Monitoring,
+        // not by the admin token the JSON endpoints accept.
+        $this->router->map('GET', '/metrics', 'Api\\AdminApiController@prometheus');
         $this->router->map('POST', '/settings/oidc', 'SettingsController@saveOidc');
         $this->router->map('POST', '/settings/api/tokens/create', 'SettingsController@createApiToken');
+        $this->router->map('POST', '/settings/monitoring', 'SettingsController@saveMonitoring');
         $this->router->map('POST', '/settings/api/tokens/[i:id]/revoke', 'SettingsController@revokeApiToken');
         $this->router->map('POST', '/settings/docker-setup', 'SettingsController@dockerSetup');
         $this->router->map('POST', '/settings/test-smtp', 'SettingsController@testSmtp');
@@ -189,11 +213,17 @@ class App
         // Storage Locations
         $this->router->map('GET', '/storage-locations', 'StorageLocationController@index');
         $this->router->map('POST', '/storage-locations', 'StorageLocationController@store');
+        $this->router->map('POST', '/settings/ssl/renew', 'SettingsController@sslRenew');
+        $this->router->map('POST', '/settings/ssl/email', 'SettingsController@sslEmail');
+        $this->router->map('POST', '/settings/ssl/external', 'SettingsController@sslExternal');
+        $this->router->map('POST', '/storage-locations/[i:id]/update', 'StorageLocationController@update');
         $this->router->map('POST', '/storage-locations/[i:id]/delete', 'StorageLocationController@destroy');
         $this->router->map('POST', '/storage-locations/s3', 'StorageLocationController@saveS3');
         $this->router->map('POST', '/storage-locations/s3/test', 'StorageLocationController@testS3');
         $this->router->map('POST', '/storage-locations/s3/list-backups', 'StorageLocationController@listS3Backups');
         $this->router->map('POST', '/storage-locations/s3/restore-backup', 'StorageLocationController@restoreS3Backup');
+        $this->router->map('POST', '/storage-locations/s3/download-backup', 'StorageLocationController@downloadS3Backup');
+        $this->router->map('POST', '/storage-locations/s3/backup-now', 'StorageLocationController@backupNow');
 
         // Remote SSH Configs
         $this->router->map('POST', '/remote-ssh-configs/create', 'RemoteSshConfigController@store');
@@ -202,6 +232,16 @@ class App
         $this->router->map('POST', '/remote-ssh-configs/[i:id]/test', 'RemoteSshConfigController@test');
         $this->router->map('POST', '/remote-ssh-configs/test-new', 'RemoteSshConfigController@testNew');
         $this->router->map('POST', '/remote-ssh-configs/borgbase-api-test', 'RemoteSshConfigController@testBorgBaseApi');
+
+        // BorgBase accounts: one card per account, repos managed through its API
+        $this->router->map('POST', '/borgbase-accounts/create', 'BorgBaseAccountController@store');
+        $this->router->map('GET',  '/borgbase-accounts/[i:id]', 'BorgBaseAccountController@show');
+        $this->router->map('POST', '/borgbase-accounts/[i:id]/refresh', 'BorgBaseAccountController@refresh');
+        $this->router->map('POST', '/borgbase-accounts/[i:id]/update', 'BorgBaseAccountController@update');
+        $this->router->map('POST', '/borgbase-accounts/[i:id]/delete', 'BorgBaseAccountController@delete');
+        $this->router->map('POST', '/borgbase-accounts/[i:id]/repos/create', 'BorgBaseAccountController@createRepo');
+        $this->router->map('POST', '/borgbase-accounts/[i:id]/repos/import', 'BorgBaseAccountController@importRepo');
+        $this->router->map('POST', '/borgbase-accounts/[i:id]/locations/[i:locationId]/delete', 'BorgBaseAccountController@deleteLocation');
 
         // Notification Services
         $this->router->map('GET', '/notification-services', 'NotificationServiceController@index');
@@ -216,11 +256,13 @@ class App
         $this->router->map('GET', '/upgrade/status', 'UpgradeController@statusJson');
         $this->router->map('POST', '/upgrade/dismiss', 'UpgradeController@dismiss');
         $this->router->map('POST', '/settings/upgrade', 'SettingsController@upgrade');
+        $this->router->map('POST', '/settings/upgrade/cancel', 'SettingsController@cancelUpgrade');
         $this->router->map('POST', '/settings/sync', 'SettingsController@sync');
         $this->router->map('POST', '/settings/upgrade-agents', 'SettingsController@upgradeAgents');
         $this->router->map('GET', '/api/agent-updates', 'SettingsController@agentUpdatesJson');
         $this->router->map('GET', '/api/borg-status', 'SettingsController@borgStatusJson');
         $this->router->map('GET', '/api/templates/[i:id]', 'SettingsController@templateJson');
+        $this->router->map('GET', '/api/client-profiles/[i:id]', 'ClientProfileController@show');
         $this->router->map('POST', '/settings/offsite-storage', 'StorageLocationController@saveS3');
         $this->router->map('POST', '/settings/offsite-storage/test', 'StorageLocationController@testS3');
         $this->router->map('POST', '/settings/borg/sync', 'SettingsController@syncBorgVersions');
@@ -267,8 +309,37 @@ class App
         $this->router->map('GET', '/get-agent', 'Api\\AgentApiController@getAgent');
         $this->router->map('GET', '/get-agent-windows', 'Api\\AgentApiController@getAgentWindows');
 
+        // Token auth + session API. discover/login/2fa/oidc
+        // are unauthenticated by design (they ARE the login); the rest use
+        // requireApiAuth() (Bearer, no admin gate, PermissionService scoping).
+        $this->router->map('GET', '/api/v1/auth/discover', 'Api\\MobileAuthController@discover');
+        $this->router->map('POST', '/api/v1/auth/login', 'Api\\MobileAuthController@login');
+        $this->router->map('POST', '/api/v1/auth/2fa', 'Api\\MobileAuthController@twoFactor');
+        $this->router->map('GET', '/api/v1/auth/oidc/start', 'Api\\MobileAuthController@oidcStart');
+        $this->router->map('POST', '/api/v1/auth/oidc/exchange', 'Api\\MobileAuthController@oidcExchange');
+        $this->router->map('GET', '/api/v1/auth/me', 'Api\\MobileAuthController@me');
+        $this->router->map('POST', '/api/v1/auth/logout', 'Api\\MobileAuthController@logout');
+        $this->router->map('GET', '/api/v1/auth/sessions', 'Api\\MobileAuthController@sessions');
+        $this->router->map('DELETE', '/api/v1/auth/sessions/[i:id]', 'Api\\MobileAuthController@deleteSession');
+        $this->router->map('GET', '/api/v1/dashboard', 'Api\\AdminApiController@dashboard');
+        $this->router->map('GET', '/api/v1/server-stats', 'Api\\AdminApiController@serverStats');
+        $this->router->map('GET', '/api/v1/notifications', 'Api\\AdminApiController@listNotifications');
+        $this->router->map('POST', '/api/v1/notifications/[i:id]/read', 'Api\\AdminApiController@markNotificationRead');
+        $this->router->map('POST', '/api/v1/notifications/read-all', 'Api\\AdminApiController@markAllNotificationsRead');
+        $this->router->map('GET', '/api/v1/jobs/[i:jobId]', 'Api\\AdminApiController@getJobById');
+        $this->router->map('POST', '/api/v1/queue/[i:id]/cancel', 'Api\\AdminApiController@cancelQueueJob');
+        $this->router->map('POST', '/api/v1/queue/[i:id]/retry', 'Api\\AdminApiController@retryQueueJob');
+        $this->router->map('GET', '/api/v1/queue/[i:id]/dry-run-log', 'Api\\AdminApiController@getDryRunLog');
+        $this->router->map('DELETE', '/api/v1/queue/[i:id]/dry-run-log', 'Api\\AdminApiController@deleteDryRunLog');
+        $this->router->map('GET', '/api/v1/clients/[i:id]/repositories/[i:repoId]/archives/[i:archiveId]/files', 'Api\\AdminApiController@listArchiveFiles');
+        $this->router->map('POST', '/api/v1/clients/[i:id]/restore', 'Api\\AdminApiController@restoreFiles');
+        $this->router->map('POST', '/api/v1/push/register', 'Api\\AdminApiController@registerPush');
+        $this->router->map('DELETE', '/api/v1/push/register', 'Api\\AdminApiController@unregisterPush');
+
         // Admin API (token-authenticated)
         $this->router->map('GET', '/api/v1/summary', 'Api\\AdminApiController@summary');
+        $this->router->map('GET', '/api/v1/metrics', 'Api\\AdminApiController@metrics');
+        $this->router->map('GET', '/api/v1/health', 'Api\\AdminApiController@health');
         $this->router->map('GET', '/api/v1/clients', 'Api\\AdminApiController@listClients');
         $this->router->map('POST', '/api/v1/clients', 'Api\\AdminApiController@createClient');
         $this->router->map('GET', '/api/v1/clients/[i:id]', 'Api\\AdminApiController@getClient');
@@ -276,8 +347,15 @@ class App
         $this->router->map('DELETE', '/api/v1/clients/[i:id]', 'Api\\AdminApiController@deleteClient');
         $this->router->map('GET', '/api/v1/clients/[i:id]/repositories', 'Api\\AdminApiController@listRepositories');
         $this->router->map('POST', '/api/v1/clients/[i:id]/repositories', 'Api\\AdminApiController@createRepository');
+        // Import an existing repository (specs/borgbase.md in the app repo). Literal paths before /[i:repoId].
+        $this->router->map('POST', '/api/v1/clients/[i:id]/repositories/import/verify', 'Api\\AdminApiController@verifyRepositoryImport');
+        $this->router->map('POST', '/api/v1/clients/[i:id]/repositories/import', 'Api\\AdminApiController@importRepository');
         $this->router->map('PUT', '/api/v1/clients/[i:id]/repositories/[i:repoId]', 'Api\\AdminApiController@renameRepository');
         $this->router->map('DELETE', '/api/v1/clients/[i:id]/repositories/[i:repoId]', 'Api\\AdminApiController@deleteRepository');
+        $this->router->map('GET', '/api/v1/clients/[i:id]/repositories/[i:repoId]/archives', 'Api\\AdminApiController@listArchives');
+        $this->router->map('GET', '/api/v1/clients/[i:id]/repositories/[i:repoId]/archives/[i:archiveId]', 'Api\\AdminApiController@archiveDetail');
+        $this->router->map('GET', '/api/v1/clients/[i:id]/repositories/[i:repoId]/archives/[i:archiveId]/databases', 'Api\\AdminApiController@listArchiveDatabases');
+        $this->router->map('POST', '/api/v1/clients/[i:id]/repositories/[i:repoId]/archives/[i:archiveId]/lock', 'Api\\AdminApiController@setArchiveLock');
         $this->router->map('GET', '/api/v1/clients/[i:id]/plans', 'Api\\AdminApiController@listPlans');
         $this->router->map('POST', '/api/v1/clients/[i:id]/plans', 'Api\\AdminApiController@createPlan');
         $this->router->map('PUT', '/api/v1/clients/[i:id]/plans/[i:planId]', 'Api\\AdminApiController@updatePlan');
@@ -285,6 +363,8 @@ class App
         $this->router->map('POST', '/api/v1/clients/[i:id]/plans/[i:planId]/pause', 'Api\\AdminApiController@pausePlan');
         $this->router->map('POST', '/api/v1/clients/[i:id]/plans/[i:planId]/resume', 'Api\\AdminApiController@resumePlan');
         $this->router->map('POST', '/api/v1/clients/[i:id]/plans/[i:planId]/trigger', 'Api\\AdminApiController@triggerPlan');
+        $this->router->map('POST', '/api/v1/clients/[i:id]/browse', 'Api\\AdminApiController@browse');
+        $this->router->map('GET', '/api/v1/clients/[i:id]/browse/[i:taskId]', 'Api\\AdminApiController@browsePoll');
         $this->router->map('GET', '/api/v1/clients/[i:id]/jobs', 'Api\\AdminApiController@listJobs');
         $this->router->map('GET', '/api/v1/clients/[i:id]/jobs/[i:jobId]', 'Api\\AdminApiController@getJob');
         $this->router->map('GET', '/api/v1/queue', 'Api\\AdminApiController@getQueue');
@@ -292,16 +372,70 @@ class App
         $this->router->map('GET', '/api/v1/plugins/schema', 'Api\\AdminApiController@getPluginSchema');
         $this->router->map('GET', '/api/v1/clients/[i:id]/plugin-configs', 'Api\\AdminApiController@listPluginConfigs');
         $this->router->map('POST', '/api/v1/clients/[i:id]/plugin-configs', 'Api\\AdminApiController@createPluginConfig');
+        $this->router->map('PUT',    '/api/v1/clients/[i:id]/plugin-configs/[i:configId]', 'Api\\AdminApiController@updatePluginConfig');
+        $this->router->map('DELETE', '/api/v1/clients/[i:id]/plugin-configs/[i:configId]', 'Api\\AdminApiController@deletePluginConfig');
+        $this->router->map('POST',   '/api/v1/clients/[i:id]/plugin-configs/[i:configId]/test', 'Api\\AdminApiController@testPluginConfig');
+        $this->router->map('GET',    '/api/v1/clients/[i:id]/install', 'Api\\AdminApiController@clientInstall');
+        $this->router->map('GET',    '/api/v1/clients/[i:id]/stats', 'Api\\AdminApiController@clientStats');
+        $this->router->map('GET',  '/api/v1/clients/[i:id]/catalog/search', 'Api\\AdminApiController@catalogSearch');
+        $this->router->map('GET',  '/api/v1/clients/[i:id]/db-connectors', 'Api\\AdminApiController@listDbConnectors');
+        $this->router->map('POST', '/api/v1/clients/[i:id]/restore-db', 'Api\\AdminApiController@restoreDatabase');
+        $this->router->map('POST', '/api/v1/clients/[i:id]/download', 'Api\\AdminApiController@downloadArchive');
+        $this->router->map('POST',   '/api/v1/clients/[i:id]/repositories/[i:repoId]/check', 'Api\\AdminApiController@checkRepository');
+        $this->router->map('POST',   '/api/v1/clients/[i:id]/repositories/[i:repoId]/maintenance', 'Api\\AdminApiController@repositoryMaintenance');
+        $this->router->map('POST',   '/api/v1/clients/[i:id]/repositories/[i:repoId]/catalog/sync', 'Api\\AdminApiController@syncRepositoryCatalog');
+        $this->router->map('DELETE', '/api/v1/clients/[i:id]/repositories/[i:repoId]/archives/[i:archiveId]', 'Api\\AdminApiController@deleteArchive');
+        // TLS certificate — status, renew, contact address.
+        $this->router->map('GET',  '/api/v1/ssl', 'Api\\SslApiController@show');
+        $this->router->map('POST', '/api/v1/ssl/renew', 'Api\\SslApiController@renew');
+        $this->router->map('PUT',  '/api/v1/ssl/email', 'Api\\SslApiController@setEmail');
+        $this->router->map('PUT',  '/api/v1/ssl/external', 'Api\\SslApiController@setExternal');
+        $this->router->map('POST', '/api/v1/clients/[i:id]/rotate-key', 'Api\\AdminApiController@rotateClientKey');
+        $this->router->map('POST', '/api/v1/clients/[i:id]/reprovision-ssh', 'Api\\AdminApiController@reprovisionClientSsh');
+        $this->router->map('POST', '/api/v1/repositories/[i:repoId]/passphrase', 'Api\\AdminApiController@changeRepositoryPassphrase');
         $this->router->map('GET', '/api/v1/storage', 'Api\\AdminApiController@listStorageLocations');
         $this->router->map('POST', '/api/v1/storage', 'Api\\AdminApiController@createStorageLocation');
         $this->router->map('GET', '/api/v1/storage/capacity', 'Api\\AdminApiController@getStorageCapacity');
+        // Rename / re-default / unregister a local location. The path is not
+        // editable — repositories live under it.
+        $this->router->map('PUT',    '/api/v1/storage/[i:id]', 'Api\\StorageApiController@updateLocation');
+        $this->router->map('DELETE', '/api/v1/storage/[i:id]', 'Api\\StorageApiController@deleteLocation');
+
+        // Remote SSH targets. /test before /[i:id] so the literal wins.
+        $this->router->map('GET',    '/api/v1/remote-ssh-configs', 'Api\\StorageApiController@listRemote');
+        $this->router->map('POST',   '/api/v1/remote-ssh-configs', 'Api\\StorageApiController@createRemote');
+        $this->router->map('POST',   '/api/v1/remote-ssh-configs/test', 'Api\\StorageApiController@testNewRemote');
+        $this->router->map('POST',   '/api/v1/remote-ssh-configs/borgbase-api-test', 'Api\\StorageApiController@testBorgBaseApi');
+        $this->router->map('GET',    '/api/v1/remote-ssh-configs/[i:id]', 'Api\\StorageApiController@showRemote');
+        $this->router->map('PUT',    '/api/v1/remote-ssh-configs/[i:id]', 'Api\\StorageApiController@updateRemote');
+        $this->router->map('DELETE', '/api/v1/remote-ssh-configs/[i:id]', 'Api\\StorageApiController@deleteRemote');
+        $this->router->map('POST',   '/api/v1/remote-ssh-configs/[i:id]/test', 'Api\\StorageApiController@testRemote');
+
+        // BorgBase accounts (specs/borgbase.md in the app repo)
+        $this->router->map('GET',    '/api/v1/borgbase-accounts', 'Api\\BorgBaseApiController@index');
+        $this->router->map('POST',   '/api/v1/borgbase-accounts', 'Api\\BorgBaseApiController@create');
+        $this->router->map('GET',    '/api/v1/borgbase-accounts/[i:id]', 'Api\\BorgBaseApiController@show');
+        $this->router->map('PUT',    '/api/v1/borgbase-accounts/[i:id]', 'Api\\BorgBaseApiController@update');
+        $this->router->map('DELETE', '/api/v1/borgbase-accounts/[i:id]', 'Api\\BorgBaseApiController@delete');
+        $this->router->map('POST',   '/api/v1/borgbase-accounts/[i:id]/refresh', 'Api\\BorgBaseApiController@refresh');
+        $this->router->map('POST',   '/api/v1/borgbase-accounts/[i:id]/repos', 'Api\\BorgBaseApiController@createRepo');
+        $this->router->map('POST',   '/api/v1/borgbase-accounts/[i:id]/repos/import', 'Api\\BorgBaseApiController@importRepo');
+        $this->router->map('DELETE', '/api/v1/borgbase-accounts/[i:id]/locations/[i:locationId]', 'Api\\BorgBaseApiController@deleteLocation');
         $this->router->map('GET', '/api/v1/s3-credentials', 'Api\\AdminApiController@getS3Credentials');
         $this->router->map('POST', '/api/v1/s3-credentials', 'Api\\AdminApiController@setS3Credentials');
         $this->router->map('DELETE', '/api/v1/s3-credentials', 'Api\\AdminApiController@clearS3Credentials');
+        $this->router->map('POST', '/api/v1/s3-credentials/test', 'Api\\AdminApiController@testS3Credentials');
+        $this->router->map('GET', '/api/v1/server-backups', 'Api\\AdminApiController@listServerBackups');
+        $this->router->map('POST', '/api/v1/server-backups', 'Api\\AdminApiController@createServerBackup');
+        $this->router->map('POST', '/api/v1/server-backups/restore', 'Api\\AdminApiController@restoreServerBackup');
         $this->router->map('GET', '/api/v1/maintenance', 'Api\\AdminApiController@getMaintenance');
         $this->router->map('POST', '/api/v1/maintenance', 'Api\\AdminApiController@setMaintenance');
         $this->router->map('POST', '/api/v1/platform/rotate-token', 'Api\\AdminApiController@rotatePlatformToken');
         $this->router->map('PUT', '/api/v1/repositories/[i:repoId]/s3-sync', 'Api\\AdminApiController@setRepositoryS3Sync');
+        $this->router->map('POST', '/api/v1/repositories/[i:repoId]/s3-sync', 'Api\\AdminApiController@attachRepositoryS3');
+        $this->router->map('DELETE', '/api/v1/repositories/[i:repoId]/s3-sync', 'Api\\AdminApiController@detachRepositoryS3');
+        $this->router->map('POST', '/api/v1/repositories/[i:repoId]/s3-restore', 'Api\\AdminApiController@restoreRepositoryS3');
+        $this->router->map('POST', '/api/v1/repositories/[i:repoId]/s3-sync/run', 'Api\\AdminApiController@runRepositoryS3Sync');
         $this->router->map('GET', '/api/v1/repositories', 'Api\\AdminApiController@listAllRepositories');
         $this->router->map('GET', '/api/v1/users', 'Api\\AdminApiController@listUsers');
         $this->router->map('POST', '/api/v1/users', 'Api\\AdminApiController@createUser');
@@ -310,6 +444,61 @@ class App
         $this->router->map('DELETE', '/api/v1/users/[i:id]', 'Api\\AdminApiController@deleteUser');
         $this->router->map('GET', '/api/v1/log', 'Api\\AdminApiController@listLog');
         $this->router->map('GET', '/api/v1/schedules', 'Api\\AdminApiController@listSchedules');
+        $this->router->map('GET', '/api/v1/schedules/day', 'Api\\AdminApiController@schedulesDay');
+
+        // My Profile — token-authenticated twins of ProfileController
+        $this->router->map('GET',   '/api/v1/profile', 'Api\\ProfileApiController@show');
+        $this->router->map('PATCH', '/api/v1/profile', 'Api\\ProfileApiController@update');
+        $this->router->map('GET',   '/api/v1/profile/timezones', 'Api\\ProfileApiController@timezones');
+        $this->router->map('POST',  '/api/v1/profile/password', 'Api\\ProfileApiController@changePassword');
+        $this->router->map('PUT',   '/api/v1/profile/storage-alerts', 'Api\\ProfileApiController@storageAlerts');
+        $this->router->map('POST',  '/api/v1/profile/2fa/setup', 'Api\\ProfileApiController@twoFactorSetup');
+        $this->router->map('POST',  '/api/v1/profile/2fa/enable', 'Api\\ProfileApiController@twoFactorEnable');
+        $this->router->map('POST',  '/api/v1/profile/2fa/disable', 'Api\\ProfileApiController@twoFactorDisable');
+        $this->router->map('POST',  '/api/v1/profile/2fa/recovery-codes', 'Api\\ProfileApiController@twoFactorRecoveryCodes');
+        $this->router->map('GET',   '/api/v1/profile/reports', 'Api\\ProfileApiController@reports');
+        $this->router->map('PUT',   '/api/v1/profile/reports/preferences', 'Api\\ProfileApiController@reportPreferences');
+        $this->router->map('GET',   '/api/v1/reports/[i:id]', 'Api\\ProfileApiController@getReport');
+        $this->router->map('POST',  '/api/v1/reports/generate', 'Api\\ProfileApiController@generateReport');
+        $this->router->map('POST',  '/api/v1/reports/[i:id]/email', 'Api\\ProfileApiController@emailReport');
+
+        // Settings — admin-only, shapes documented in docs/API.md
+        $this->router->map('GET',    '/api/v1/settings', 'Api\\SettingsApiController@show');
+        $this->router->map('POST',   '/api/v1/settings/email/test', 'Api\\SettingsApiController@testEmail');
+        $this->router->map('PATCH',  '/api/v1/settings/[a:section]', 'Api\\SettingsApiController@updateSection');
+        $this->router->map('GET',    '/api/v1/notification-services', 'Api\\SettingsApiController@listNotificationServices');
+        $this->router->map('POST',   '/api/v1/notification-services', 'Api\\SettingsApiController@createNotificationService');
+        $this->router->map('PATCH',  '/api/v1/notification-services/[i:id]', 'Api\\SettingsApiController@updateNotificationService');
+        $this->router->map('DELETE', '/api/v1/notification-services/[i:id]', 'Api\\SettingsApiController@deleteNotificationService');
+        $this->router->map('POST',   '/api/v1/notification-services/[i:id]/test', 'Api\\SettingsApiController@testNotificationService');
+        $this->router->map('GET',    '/api/v1/backup-templates', 'Api\\SettingsApiController@listTemplates');
+        $this->router->map('POST',   '/api/v1/backup-templates', 'Api\\SettingsApiController@createTemplate');
+        $this->router->map('PATCH',  '/api/v1/backup-templates/[i:id]', 'Api\\SettingsApiController@updateTemplate');
+        $this->router->map('DELETE', '/api/v1/backup-templates/[i:id]', 'Api\\SettingsApiController@deleteTemplate');
+
+        $this->router->map('GET', '/api/v1/settings/push', 'Api\\SettingsApiController@showPush');
+        $this->router->map('PUT', '/api/v1/settings/push', 'Api\\SettingsApiController@updatePush');
+
+        // Client profiles (#402 onboarding model). Admin-only, like templates.
+        $this->router->map('GET',    '/api/v1/client-profiles', 'Api\\SettingsApiController@listProfiles');
+        $this->router->map('POST',   '/api/v1/client-profiles', 'Api\\SettingsApiController@createProfile');
+        $this->router->map('GET',    '/api/v1/client-profiles/[i:id]', 'Api\\SettingsApiController@getProfile');
+        $this->router->map('PATCH',  '/api/v1/client-profiles/[i:id]', 'Api\\SettingsApiController@updateProfile');
+        $this->router->map('DELETE', '/api/v1/client-profiles/[i:id]', 'Api\\SettingsApiController@deleteProfile');
+        $this->router->map('POST',   '/api/v1/client-profiles/[i:id]/apply', 'Api\\SettingsApiController@applyProfile');
+        $this->router->map('GET',    '/api/v1/tokens', 'Api\\SettingsApiController@listTokens');
+        $this->router->map('POST',   '/api/v1/tokens', 'Api\\SettingsApiController@createToken');
+        $this->router->map('DELETE', '/api/v1/tokens/[i:id]', 'Api\\SettingsApiController@deleteToken');
+        $this->router->map('GET',    '/api/v1/updates', 'Api\\SettingsApiController@updates');
+        $this->router->map('POST',   '/api/v1/updates/check', 'Api\\SettingsApiController@checkUpdates');
+        $this->router->map('POST',   '/api/v1/updates/upgrade-agents', 'Api\\SettingsApiController@upgradeAgents');
+        $this->router->map('POST',   '/api/v1/updates/upgrade-server', 'Api\\SettingsApiController@upgradeServer');
+        $this->router->map('DELETE', '/api/v1/updates/upgrade-server', 'Api\\SettingsApiController@cancelUpgradeServer');
+        $this->router->map('POST',   '/api/v1/clients/[i:id]/upgrade-agent', 'Api\\SettingsApiController@upgradeAgent');
+
+        // Push notification devices — per-user, not admin data
+        $this->router->map('GET',   '/api/v1/push/devices', 'Api\\AdminApiController@listPushDevices');
+        $this->router->map('PATCH', '/api/v1/push/devices/[*:deviceId]', 'Api\\AdminApiController@updatePushDevice');
 
         // Catalog & Restore (client-facing)
         $this->router->map('GET', '/clients/[i:id]/catalog/[i:archive_id]', 'ClientController@catalog');
@@ -319,7 +508,9 @@ class App
         $this->router->map('POST', '/clients/[i:id]/restore-mysql', 'ClientController@restoreMysqlSubmit');
         $this->router->map('POST', '/clients/[i:id]/restore-pg', 'ClientController@restorePgSubmit');
         $this->router->map('POST', '/clients/[i:id]/restore-mongo', 'ClientController@restoreMongoSubmit');
+        $this->router->map('POST', '/clients/[i:id]/restore-mssql', 'ClientController@restoreMssqlSubmit');
         $this->router->map('GET', '/clients/[i:id]/archive/[i:archive_id]/databases', 'ClientController@archiveDatabases');
         $this->router->map('POST', '/clients/[i:id]/download', 'ClientController@download');
+        $this->router->map('POST', '/clients/[i:id]/download-databases', 'ClientController@downloadDatabases');
     }
 }

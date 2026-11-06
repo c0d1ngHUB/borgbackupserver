@@ -7,10 +7,16 @@ use BBS\Core\Controller;
 use BBS\Controllers\StorageLocationController;
 use BBS\Services\BorgCommandBuilder;
 use BBS\Services\Encryption;
+use BBS\Services\ServerStats;
 use BBS\Services\SshKeyManager;
 
 class AdminApiController extends Controller
 {
+    /** Schedule frequencies the web plan form offers; create and update both check against this. */
+    private const VALID_FREQUENCIES = ['10min', '15min', '30min', 'hourly', 'daily', 'weekly', 'monthly', 'manual'];
+    /** Plan CPU/IO priority for borg on the client (#403). */
+    private const VALID_PRIORITIES = ['normal', 'low', 'idle'];
+
     private function getJsonInput(): array
     {
         $raw = file_get_contents('php://input');
@@ -22,23 +28,277 @@ class AdminApiController extends Controller
 
     public function listClients(): void
     {
-        $this->requireApiToken();
+        // Mobile/non-admin tokens are allowed but see only their agents.
+        $ctx = $this->requireApiAuth();
+        [$agentWhere, $agentParams] = $this->apiAgentWhereClause($ctx, 'a');
 
         $agents = $this->db->fetchAll("
             SELECT a.id, a.name, a.hostname, a.ip_address, a.os_info,
                    a.borg_version, a.agent_version, a.status, a.last_heartbeat,
-                   a.created_at, u.username as owner
+                   a.created_at, u.username as owner,
+                   a.client_profile_id, cp.name AS client_profile_name,
+                   a.snapshot_capable, a.location, a.offline_alerts,
+                   (SELECT GROUP_CONCAT(DISTINCT COALESCE(sl.label, rsc.name, 'Local') SEPARATOR '\n')
+                      FROM repositories r
+                      LEFT JOIN storage_locations sl ON sl.id = r.storage_location_id
+                      LEFT JOIN remote_ssh_configs rsc ON rsc.id = r.remote_ssh_config_id
+                     WHERE r.agent_id = a.id) AS storage_names
             FROM agents a
             LEFT JOIN users u ON u.id = a.user_id
+            LEFT JOIN client_profiles cp ON cp.id = a.client_profile_id
+            WHERE {$agentWhere}
             ORDER BY a.name
-        ");
+        ", $agentParams);
+        foreach ($agents as &$a) {
+            $a['snapshot_capable'] = $a['snapshot_capable'] === null ? null : (bool) $a['snapshot_capable'];
+            $a['location'] = (string) ($a['location'] ?? '');
+            $a['offline_alerts'] = (bool) $a['offline_alerts'];
+            // Names of the storage locations and SSH hosts holding this client's repositories (#474).
+            $a['storage_names'] = $a['storage_names'] !== null && $a['storage_names'] !== '' ? explode("\n", $a['storage_names']) : [];
+        }
+        unset($a);
 
         $this->json(['clients' => $agents]);
     }
 
+    /**
+     * POST /api/v1/clients/{id}/repositories/import/verify
+     *   {name, storage_type?, storage_location_id?, remote_ssh_config_id?, passphrase?}
+     *
+     * Opens an existing repository with the passphrase and reports its
+     * encryption mode and archive count, without saving anything.
+     */
+    public function verifyRepositoryImport(int $id): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::MANAGE_REPOS, $id);
+        $input = $this->getJsonInput();
+        $agent = $this->db->fetchOne("SELECT * FROM agents WHERE id = ?", [$id]);
+        if (!$agent) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        [$storageType, $name, $storageLocationId, $remoteSshConfigId] = $this->importArgs($input);
+        $this->apiRequireAdminForRemoteSsh($ctx, $remoteSshConfigId);
+
+        $result = (new \BBS\Services\RepositoryImportService())->verify(
+            $agent, $storageType, $name, (string) ($input['passphrase'] ?? ''), $storageLocationId, $remoteSshConfigId
+        );
+        if (!$result['success']) {
+            $this->json(['error' => $result['error']], 422);
+        }
+        $this->json([
+            'status' => 'ok',
+            'name' => $name,
+            'encryption' => $result['encryption'],
+            'archive_count' => $result['archive_count'],
+        ]);
+    }
+
+    /**
+     * POST /api/v1/clients/{id}/repositories/import
+     *   {name, storage_type?, storage_location_id?, remote_ssh_config_id?, passphrase?, encryption?}
+     *
+     * Registers an existing repository for the client and queues a catalog
+     * sync to discover its archives. Verify first, or pass encryption from
+     * the verify response; the passphrase is stored for later use.
+     */
+    public function importRepository(int $id): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::MANAGE_REPOS, $id);
+        $input = $this->getJsonInput();
+        $agent = $this->db->fetchOne("SELECT * FROM agents WHERE id = ?", [$id]);
+        if (!$agent) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        [$storageType, $name, $storageLocationId, $remoteSshConfigId] = $this->importArgs($input);
+        $this->apiRequireAdminForRemoteSsh($ctx, $remoteSshConfigId);
+        if (Config::isHosted() && $storageType !== 'local') {
+            $this->json(['error' => 'Storage type is locked to local in hosted mode.'], 422);
+        }
+        $passphrase = (string) ($input['passphrase'] ?? '');
+        $encryption = trim((string) ($input['encryption'] ?? ''));
+
+        $service = new \BBS\Services\RepositoryImportService();
+        if ($encryption === '') {
+            // Not told the mode: open the repo to find out, which also
+            // catches a wrong passphrase before anything is written.
+            $verify = $service->verify($agent, $storageType, $name, $passphrase, $storageLocationId, $remoteSshConfigId);
+            if (!$verify['success']) {
+                $this->json(['error' => $verify['error']], 422);
+            }
+            $encryption = $verify['encryption'];
+        }
+
+        $result = $service->import($agent, $storageType, $name, $encryption, $passphrase, $storageLocationId, $remoteSshConfigId);
+        if (!$result['success']) {
+            $this->json(['error' => $result['error']], str_contains($result['error'], 'already exists') ? 409 : 422);
+        }
+        $this->json([
+            'status' => 'ok',
+            'repository_id' => (int) $result['repository_id'],
+            'agent_id' => $id,
+            'name' => $name,
+            'path' => $result['path'],
+            'encryption' => $encryption,
+            'catalog_sync_job_id' => (int) $result['job_id'],
+        ], 201);
+    }
+
+    /** Common validation for the two import endpoints. */
+    private function importArgs(array $input): array
+    {
+        $storageType = (string) ($input['storage_type'] ?? (!empty($input['remote_ssh_config_id']) ? 'remote_ssh' : 'local'));
+        if (!in_array($storageType, ['local', 'remote_ssh'], true)) {
+            $this->json(['error' => 'storage_type must be local or remote_ssh'], 422);
+        }
+        $name = \BBS\Services\RepositoryImportService::sanitizeName(trim((string) ($input['name'] ?? '')));
+        if ($name === '') {
+            $this->json(['error' => 'name is required and may only contain letters, numbers, hyphens and underscores'], 422);
+        }
+        $storageLocationId = !empty($input['storage_location_id']) ? (int) $input['storage_location_id'] : null;
+        $remoteSshConfigId = !empty($input['remote_ssh_config_id']) ? (int) $input['remote_ssh_config_id'] : null;
+        if ($storageType === 'remote_ssh' && !$remoteSshConfigId) {
+            $this->json(['error' => 'remote_ssh_config_id is required for storage_type remote_ssh'], 422);
+        }
+        return [$storageType, $name, $storageLocationId, $remoteSshConfigId];
+    }
+
+    /**
+     * GET /api/v1/metrics — monitoring snapshot for external systems
+     * (health checks, dashboards, Prometheus via a JSON adapter). Timestamps
+     * are returned both as datetime strings and unix epochs so time-series
+     * tools can consume them directly.
+     */
+    /**
+     * GET /metrics — the same snapshot in Prometheus' text format.
+     *
+     * Separate from the JSON endpoint rather than a format switch on it: the
+     * JSON shape is an API contract other tools depend on, while this one has
+     * to follow the exposition format's own rules about naming and absence.
+     */
+    public function prometheus(): void
+    {
+        $this->requireMetricsAccess();
+
+        $svc = new \BBS\Services\PrometheusMetrics($this->db);
+        $result = $svc->respond();
+
+        http_response_code(200);
+        header('Content-Type: ' . \BBS\Services\PrometheusMetrics::CONTENT_TYPE);
+        // The cache is ours; a proxy holding a second copy would only make
+        // the age reported by the body wrong.
+        header('Cache-Control: no-store');
+        echo $result['body'];
+        exit;
+    }
+
+    public function metrics(): void
+    {
+        // Monitoring gate rather than requireApiToken(): a scraper is admitted
+        // by address, and by a read-only token when its range asks for one.
+        // With monitoring off this falls back to the admin token this endpoint
+        // has always required, so no existing automation changes behaviour.
+        $this->requireMetricsAccess(true);
+
+        $clients = ['total' => 0, 'online' => 0, 'offline' => 0, 'error' => 0, 'setup' => 0];
+        foreach ($this->db->fetchAll("SELECT status, COUNT(*) AS c FROM agents GROUP BY status") as $row) {
+            $clients[$row['status']] = (int) $row['c'];
+            $clients['total'] += (int) $row['c'];
+        }
+
+        $queue = ['queued' => 0, 'sent' => 0, 'running' => 0];
+        foreach ($this->db->fetchAll("SELECT status, COUNT(*) AS c FROM backup_jobs WHERE status IN ('queued','sent','running') GROUP BY status") as $row) {
+            $queue[$row['status']] = (int) $row['c'];
+        }
+
+        // All-time backup job outcomes per client
+        $jobTotals = [];
+        $jobRows = $this->db->fetchAll("
+            SELECT bj.agent_id, a.name AS client_name, bj.status, COUNT(*) AS c
+            FROM backup_jobs bj
+            JOIN agents a ON a.id = bj.agent_id
+            WHERE bj.task_type = 'backup' AND bj.status IN ('completed','failed','cancelled')
+            GROUP BY bj.agent_id, a.name, bj.status
+        ");
+        foreach ($jobRows as $row) {
+            $cid = (int) $row['agent_id'];
+            if (!isset($jobTotals[$cid])) {
+                $jobTotals[$cid] = ['client_id' => $cid, 'client' => $row['client_name'], 'completed' => 0, 'failed' => 0, 'cancelled' => 0];
+            }
+            $jobTotals[$cid][$row['status']] = (int) $row['c'];
+        }
+
+        // Per-plan last run (any terminal status) and last success
+        $planRows = $this->db->fetchAll("
+            SELECT bp.id AS plan_id, bp.name AS plan_name, bp.enabled,
+                   a.id AS client_id, a.name AS client_name,
+                   lastj.status AS last_status,
+                   lastj.completed_at AS last_run_at,
+                   lastj.duration_seconds AS last_run_duration_seconds,
+                   lasts.completed_at AS last_success_at,
+                   lasts.duration_seconds AS last_success_duration_seconds,
+                   lasts.bytes_processed AS last_success_bytes
+            FROM backup_plans bp
+            JOIN agents a ON a.id = bp.agent_id
+            LEFT JOIN (
+                SELECT backup_plan_id, status, completed_at, duration_seconds,
+                       ROW_NUMBER() OVER (PARTITION BY backup_plan_id ORDER BY completed_at DESC, id DESC) AS rn
+                FROM backup_jobs
+                WHERE task_type = 'backup' AND status IN ('completed', 'failed')
+            ) lastj ON lastj.backup_plan_id = bp.id AND lastj.rn = 1
+            LEFT JOIN (
+                SELECT backup_plan_id, completed_at, duration_seconds, bytes_processed,
+                       ROW_NUMBER() OVER (PARTITION BY backup_plan_id ORDER BY completed_at DESC, id DESC) AS rn
+                FROM backup_jobs
+                WHERE task_type = 'backup' AND status = 'completed'
+            ) lasts ON lasts.backup_plan_id = bp.id AND lasts.rn = 1
+            ORDER BY a.name, bp.name
+        ");
+        $plans = array_map(fn($r) => [
+            'plan_id' => (int) $r['plan_id'],
+            'plan' => $r['plan_name'],
+            'enabled' => (bool) $r['enabled'],
+            'client_id' => (int) $r['client_id'],
+            'client' => $r['client_name'],
+            'last_status' => $r['last_status'],
+            'last_run_at' => $r['last_run_at'],
+            'last_run_ts' => $r['last_run_at'] ? strtotime($r['last_run_at']) : null,
+            'last_run_duration_seconds' => $r['last_run_duration_seconds'] !== null ? (int) $r['last_run_duration_seconds'] : null,
+            'last_success_at' => $r['last_success_at'],
+            'last_success_ts' => $r['last_success_at'] ? strtotime($r['last_success_at']) : null,
+            'last_success_duration_seconds' => $r['last_success_duration_seconds'] !== null ? (int) $r['last_success_duration_seconds'] : null,
+            'last_success_bytes' => $r['last_success_bytes'] !== null ? (int) $r['last_success_bytes'] : null,
+        ], $planRows);
+
+        $repos = array_map(fn($r) => [
+            'id' => (int) $r['id'],
+            'client_id' => (int) $r['agent_id'],
+            'name' => $r['name'],
+            'storage_type' => $r['storage_type'],
+            'size_bytes' => (int) $r['size_bytes'],
+        ], $this->db->fetchAll("SELECT id, agent_id, name, storage_type, size_bytes FROM repositories"));
+
+        $this->json([
+            'generated_at' => date('c'),
+            'clients' => $clients,
+            'queue' => $queue,
+            'backup_jobs_total' => array_values($jobTotals),
+            'plans' => $plans,
+            'repositories' => $repos,
+        ]);
+    }
+
     public function summary(): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
+        [$agentWhere, $agentParams] = $this->apiAgentWhereClause($ctx, 'a');
 
         // Latest terminal backup job per plan, computed once via ROW_NUMBER()
         // ordered by completed_at (the previous correlated subquery did the
@@ -73,8 +333,9 @@ class AdminApiController extends Controller
                 WHERE task_type = 'backup'
                   AND status IN ('completed', 'failed')
             ) bj ON bj.backup_plan_id = bp.id AND bj.rn = 1
+            WHERE {$agentWhere}
             ORDER BY a.name, bp.name
-        ");
+        ", $agentParams);
 
         $clients = [];
         foreach ($rows as $row) {
@@ -116,14 +377,23 @@ class AdminApiController extends Controller
 
     public function getClient(int $id): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
 
         $agent = $this->db->fetchOne("
             SELECT a.id, a.name, a.hostname, a.ip_address, a.os_info,
                    a.borg_version, a.agent_version, a.status, a.last_heartbeat,
-                   a.api_key, a.api_key_encrypted, a.created_at, u.username as owner
+                   a.api_key, a.api_key_encrypted, a.created_at, u.username as owner,
+                   a.client_profile_id, cp.name AS client_profile_name,
+                   a.user_id, a.server_host_override, a.ssh_port_override,
+                   a.wol_enabled, a.wol_mac, a.mac_address, a.wol_broadcast, a.wol_timeout_minutes,
+                   a.notes, a.snapshot_capable, a.snapshot_support,
+                   a.location, a.offline_alerts
             FROM agents a
             LEFT JOIN users u ON u.id = a.user_id
+            LEFT JOIN client_profiles cp ON cp.id = a.client_profile_id
             WHERE a.id = ?
         ", [$id]);
 
@@ -131,26 +401,76 @@ class AdminApiController extends Controller
             $this->json(['error' => 'Client not found'], 404);
         }
 
-        // Decrypt stored token for API response (falls back to legacy plaintext).
-        if (empty($agent['api_key']) && !empty($agent['api_key_encrypted'])) {
-            try {
-                $agent['api_key'] = \BBS\Services\Encryption::decrypt($agent['api_key_encrypted']);
-            } catch (\Throwable $e) { /* leave blank */ }
+        // The agent api_key is its registration credential. Mobile tokens
+        // never receive it — the app has no use for it and it must not sit
+        // in a phone's response cache. Admin CLI tokens keep it (existing
+        // automation reads it).
+        if (($ctx['token_kind'] ?? 'user') === 'mobile' || ($ctx['role'] ?? '') !== 'admin') {
+            $agent['api_key'] = null;
+            unset($agent['api_key_encrypted']);
+        } else {
+            // Decrypt stored token for API response (falls back to legacy plaintext).
+            if (empty($agent['api_key']) && !empty($agent['api_key_encrypted'])) {
+                try {
+                    $agent['api_key'] = \BBS\Services\Encryption::decrypt($agent['api_key_encrypted']);
+                } catch (\Throwable $e) { /* leave blank */ }
+            }
+            unset($agent['api_key_encrypted']);
         }
-        unset($agent['api_key_encrypted']);
+        $agent['snapshot_capable'] = $agent['snapshot_capable'] === null ? null : (bool) $agent['snapshot_capable'];
+        $agent['snapshot_support'] = !empty($agent['snapshot_support']) ? json_decode($agent['snapshot_support'], true) : null;
 
         // Include repos and plans
         $repos = $this->db->fetchAll(
-            "SELECT id, name, path, encryption, storage_type, size_bytes, archive_count, created_at
+            "SELECT id, name, path, encryption, storage_type, size_bytes, archive_count, created_at, read_only
              FROM repositories WHERE agent_id = ? ORDER BY name", [$id]
         );
+        foreach ($repos as &$rr) {
+            $rr['read_only'] = (bool) $rr['read_only'];
+        }
+        unset($rr);
         $plans = $this->db->fetchAll(
             "SELECT bp.id, bp.name, bp.directories, bp.excludes, bp.advanced_options, bp.enabled,
-                    s.frequency, s.times, s.day_of_week, s.day_of_month
+                    bp.snapshot, bp.stream_db_dumps, bp.priority, bp.repository_id,
+                    bp.prune_minutes, bp.prune_hours, bp.prune_days,
+                    bp.prune_weeks, bp.prune_months, bp.prune_years,
+                    s.frequency, s.times, s.day_of_week, s.day_of_month,
+                    s.timezone, s.next_run
              FROM backup_plans bp
              LEFT JOIN schedules s ON s.backup_plan_id = bp.id
              WHERE bp.agent_id = ? ORDER BY bp.name", [$id]
         );
+        foreach ($plans as &$p) {
+            $p['id'] = (int) $p['id'];
+            $p['enabled'] = (bool) $p['enabled'];
+            $p['snapshot'] = (bool) ($p['snapshot'] ?? 0);
+            $p['stream_db_dumps'] = (bool) ($p['stream_db_dumps'] ?? 0);
+            $p['priority'] = $p['priority'] ?? 'normal';
+            $p['days_of_week'] = \BBS\Services\SchedulerService::parseDaysOfWeek($p['day_of_week'] ?? '');
+            $p['day_of_week'] = $p['days_of_week'][0] ?? null;
+            $p['repository_id'] = $p['repository_id'] !== null ? (int) $p['repository_id'] : null;
+            foreach (['prune_minutes', 'prune_hours', 'prune_days',
+                      'prune_weeks', 'prune_months', 'prune_years'] as $k) {
+                $p[$k] = (int) $p[$k];
+            }
+        }
+        unset($p);
+
+        // The Edit Client fields, typed the way the form wants them. The two
+        // read-only helpers let it show the same placeholders as the web:
+        // the agent-reported MAC, and the broadcast address it would use
+        // when none is set.
+        $agent['user_id'] = $agent['user_id'] !== null ? (int) $agent['user_id'] : null;
+        $agent['server_host_override'] = (string) ($agent['server_host_override'] ?? '');
+        $agent['ssh_port_override'] = $agent['ssh_port_override'] !== null ? (int) $agent['ssh_port_override'] : null;
+        $agent['wol_enabled'] = (bool) $agent['wol_enabled'];
+        $agent['wol_mac'] = (string) ($agent['wol_mac'] ?? '');
+        $agent['wol_broadcast'] = (string) ($agent['wol_broadcast'] ?? '');
+        $agent['wol_broadcast_default'] = \BBS\Services\WakeOnLanService::defaultBroadcast($agent['ip_address'] ?? null);
+        $agent['wol_timeout_minutes'] = (int) ($agent['wol_timeout_minutes'] ?? 5);
+        $agent['notes'] = (string) ($agent['notes'] ?? '');
+        $agent['location'] = (string) ($agent['location'] ?? '');
+        $agent['offline_alerts'] = (bool) $agent['offline_alerts'];
 
         $agent['repositories'] = $repos;
         $agent['plans'] = $plans;
@@ -168,14 +488,29 @@ class AdminApiController extends Controller
             $this->json(['error' => 'Client name is required'], 400);
         }
 
+        $location = trim((string) ($input['location'] ?? ''));
+        if (mb_strlen($location) > 100) {
+            $this->json(['error' => 'location must be 100 characters or fewer'], 422);
+        }
+
+        // Same as the web form: the default profile unless one is named (#563)
+        $profileService = new \BBS\Services\ClientProfileService();
+        $profileId = isset($input['client_profile_id']) ? (int) $input['client_profile_id'] : null;
+        if ($profileId !== null && !$profileService->find($profileId)) {
+            $this->json(['error' => 'client_profile_id does not exist'], 422);
+        }
+        $profileId = $profileId ?? $profileService->defaultProfileId();
+
         $apiKey = bin2hex(random_bytes(32));
 
         $id = $this->db->insert('agents', [
             'name' => $name,
+            'location' => $location !== '' ? $location : null,
             'api_key_hash' => hash('sha256', $apiKey),
             'api_key_encrypted' => \BBS\Services\Encryption::encrypt($apiKey),
             'status' => 'setup',
             'user_id' => null,
+            'client_profile_id' => $profileId,
         ]);
 
         // Determine SSH home path
@@ -205,7 +540,8 @@ class AdminApiController extends Controller
         if (!$sshResult) {
             @rmdir($clientDir);
             $this->db->delete('agents', 'id = ?', [$id]);
-            $this->json(['error' => 'SSH provisioning failed. Ensure bbs-ssh-helper is installed.'], 500);
+            $detail = SshKeyManager::getLastHelperError();
+            $this->json(['error' => 'SSH provisioning failed' . ($detail ? ': ' . $detail : '') . '. Ensure bbs-ssh-helper is installed.'], 500);
         }
 
         $this->db->insert('server_log', [
@@ -221,6 +557,8 @@ class AdminApiController extends Controller
         $this->json([
             'id' => (int) $id,
             'name' => $name,
+            'location' => $location,
+            'client_profile_id' => $profileId,
             'api_key' => $apiKey,
             'status' => 'setup',
             'install_command' => $host ? "curl -s https://{$host}/get-agent | sudo bash -s -- --server https://{$host} --key {$apiKey}" : null,
@@ -234,6 +572,16 @@ class AdminApiController extends Controller
         $agent = $this->db->fetchOne("SELECT * FROM agents WHERE id = ?", [$id]);
         if (!$agent) {
             $this->json(['error' => 'Client not found'], 404);
+        }
+
+        // Deleting a client cascades its repositories — locked archives
+        // (legal hold, #314) must not be removable that way.
+        $lockedCount = $this->db->fetchOne(
+            "SELECT COUNT(*) as cnt FROM archives ar
+             JOIN repositories r ON r.id = ar.repository_id
+             WHERE r.agent_id = ? AND ar.locked = 1", [$id]);
+        if ((int) ($lockedCount['cnt'] ?? 0) > 0) {
+            $this->json(['error' => 'Cannot delete — client has locked archives. Unlock them first.'], 409);
         }
 
         // Deprovision SSH user
@@ -254,6 +602,21 @@ class AdminApiController extends Controller
             $ch->exec("ALTER TABLE catalog_dirs DROP PARTITION " . (int) $id);
         } catch (\Exception $e) { /* ignore */ }
 
+        // Clear S3 sync links first: repository_s3_configs RESTRICTs
+        // plugin_config deletion, and the agent cascade reaches
+        // plugin_configs before the repository cascade clears these rows,
+        // so deleting the agent directly fails with an FK violation (#378)
+        $this->db->query(
+            "DELETE rsc FROM repository_s3_configs rsc
+             JOIN repositories r ON r.id = rsc.repository_id
+             WHERE r.agent_id = ?", [$id]
+        );
+        $this->db->query(
+            "DELETE rsc FROM repository_s3_configs rsc
+             JOIN plugin_configs pc ON pc.id = rsc.plugin_config_id
+             WHERE pc.agent_id = ?", [$id]
+        );
+
         $this->db->delete('agents', 'id = ?', [$id]);
 
         $this->json(['status' => 'ok', 'message' => "Client \"{$agent['name']}\" deleted"]);
@@ -263,26 +626,56 @@ class AdminApiController extends Controller
 
     public function listRepositories(int $id): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
 
         $agent = $this->db->fetchOne("SELECT id FROM agents WHERE id = ?", [$id]);
         if (!$agent) {
             $this->json(['error' => 'Client not found'], 404);
         }
 
+        // borg_version_last falls back to the agent's borg version as the
+        // web page does — the repo column is only filled once a job has run
+        // against it. storage_location_name is null for remote repos, and
+        // s3_config_name/s3_config_id describe the first destination by
+        // name when several are linked.
         $repos = $this->db->fetchAll(
             "SELECT r.id, r.name, r.path, r.encryption, r.storage_type, r.size_bytes, r.archive_count, r.created_at,
+                    r.read_only,
                     COALESCE(rsc.enabled, 0) AS s3_sync_enabled,
-                    rsc.last_sync_at AS s3_last_sync_at
+                    rsc.last_sync_at AS s3_last_sync_at,
+                    COALESCE(r.borg_version_last, a.borg_version) AS borg_version_last,
+                    sl.label AS storage_location_name,
+                    s3c.plugin_config_id AS s3_config_id,
+                    s3c.name AS s3_config_name,
+                    COALESCE(s3c.target_type, 's3') AS s3_config_type
              FROM repositories r
+             JOIN agents a ON a.id = r.agent_id
+             LEFT JOIN storage_locations sl ON sl.id = r.storage_location_id
              LEFT JOIN (
                  SELECT repository_id, MAX(enabled) AS enabled, MAX(last_sync_at) AS last_sync_at
                  FROM repository_s3_configs GROUP BY repository_id
              ) rsc ON rsc.repository_id = r.id
+             LEFT JOIN (
+                 SELECT rsc2.repository_id, rsc2.plugin_config_id, pc.name,
+                        JSON_UNQUOTE(JSON_EXTRACT(pc.config, '$.target_type')) AS target_type
+                 FROM repository_s3_configs rsc2
+                 JOIN plugin_configs pc ON pc.id = rsc2.plugin_config_id
+                 WHERE rsc2.id = (
+                     SELECT rsc3.id FROM repository_s3_configs rsc3
+                     JOIN plugin_configs pc3 ON pc3.id = rsc3.plugin_config_id
+                     WHERE rsc3.repository_id = rsc2.repository_id
+                     ORDER BY pc3.name, rsc3.id LIMIT 1
+                 )
+             ) s3c ON s3c.repository_id = r.id
              WHERE r.agent_id = ? ORDER BY r.name", [$id]
         );
         foreach ($repos as &$r) {
+            $r['read_only'] = (bool) $r['read_only'];
             $r['s3_sync_enabled'] = (bool) $r['s3_sync_enabled'];
+            $r['s3_config_id'] = $r['s3_config_id'] !== null ? (int) $r['s3_config_id'] : null;
         }
         unset($r);
 
@@ -291,7 +684,11 @@ class AdminApiController extends Controller
 
     public function createRepository(int $id): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::MANAGE_REPOS, $id);
         $input = $this->getJsonInput();
 
         $agent = $this->db->fetchOne("SELECT * FROM agents WHERE id = ?", [$id]);
@@ -304,9 +701,13 @@ class AdminApiController extends Controller
         $passphrase = $input['passphrase'] ?? '';
         $storageType = $input['storage_type'] ?? 'local';
         $remoteSshConfigId = !empty($input['remote_ssh_config_id']) ? (int) $input['remote_ssh_config_id'] : null;
+        $this->apiRequireAdminForRemoteSsh($ctx, $remoteSshConfigId);
 
         if (empty($name)) {
             $this->json(['error' => 'Repository name is required'], 400);
+        }
+        if (mb_strlen((string) $name) > 100) {
+            $this->json(['error' => 'Repository names can be at most 100 characters.'], 422);
         }
 
         // Hosted mode: storage choices are locked to the platform-provided
@@ -420,24 +821,56 @@ class AdminApiController extends Controller
             }
         }
 
-        $initCmd = BorgCommandBuilder::buildInitCommand($repo);
-        $env = BorgCommandBuilder::buildEnv($repo);
+        // Update .storage-paths BEFORE borg init so SSH access works even if init fails
+        if (!empty($agent['ssh_unix_user'])) {
+            SshKeyManager::updateAgentStoragePaths($this->db, $id, $agent);
+        }
+
+        // Run borg init via bbs-ssh-helper against the local path — same flow as the
+        // web UI. Never init over the repo's ssh:// path: the server has neither the
+        // agent's SSH identity nor a guaranteed loopback on the configured port (#356).
+        $initCmd = ['sudo', '/usr/local/bin/bbs-ssh-helper', 'borg-init', $repoLocalPath, $encryption];
+        $passphraseToPipe = '';
+        if ($encryption !== 'none' && !empty($passphrase)) {
+            $initCmd[] = '-';
+            $passphraseToPipe = $passphrase;
+        }
+        $exitCode = 1;
+        $stdout = '';
+        $stderr = '';
         $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
-        $proc = proc_open($initCmd, $descriptors, $pipes, null, $env);
-        $stdout = stream_get_contents($pipes[1]);
-        $stderr = stream_get_contents($pipes[2]);
-        fclose($pipes[0]);
-        fclose($pipes[1]);
-        fclose($pipes[2]);
-        $exitCode = proc_close($proc);
+        $proc = proc_open($initCmd, $descriptors, $pipes);
+        if (is_resource($proc)) {
+            if ($passphraseToPipe !== '') {
+                fwrite($pipes[0], $passphraseToPipe . "\n");
+            }
+            fclose($pipes[0]);
+            $stdout = stream_get_contents($pipes[1]);
+            $stderr = stream_get_contents($pipes[2]);
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            $exitCode = proc_close($proc);
+        }
 
         if ($exitCode !== 0) {
-            $errorMsg = trim($stderr ?: $stdout);
+            $errorMsg = trim($stdout . "\n" . $stderr);
             $this->db->insert('server_log', [
                 'agent_id' => $id,
                 'level' => 'error',
                 'message' => "borg init failed for repo \"{$safeName}\" via API: {$errorMsg}",
             ]);
+        } elseif (!empty($agent['ssh_unix_user'])) {
+            // Fix ownership: borg init runs as root, but the agent's unix user
+            // must own the repo for SSH access
+            $fixCmd = ['sudo', '/usr/local/bin/bbs-ssh-helper', 'fix-repo-perms', $repoLocalPath, $agent['ssh_unix_user']];
+            exec(implode(' ', array_map('escapeshellarg', $fixCmd)) . ' 2>&1', $fixOutput, $fixRet);
+            if ($fixRet !== 0) {
+                $this->db->insert('server_log', [
+                    'agent_id' => $id,
+                    'level' => 'warning',
+                    'message' => "fix-repo-perms failed via API: " . implode(' ', $fixOutput),
+                ]);
+            }
         }
 
         $this->db->insert('server_log', [
@@ -469,17 +902,27 @@ class AdminApiController extends Controller
 
     public function listPlans(int $id): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
 
         $agent = $this->db->fetchOne("SELECT id FROM agents WHERE id = ?", [$id]);
         if (!$agent) {
             $this->json(['error' => 'Client not found'], 404);
         }
 
+        // Retention is returned as well as accepted. Without it an editor has
+        // no current values to show, and a form rendering blanks would write
+        // zeros back on save and quietly wipe the plan's retention policy —
+        // only noticed later, when archives start disappearing.
         $plans = $this->db->fetchAll("
             SELECT bp.id, bp.name, bp.directories, bp.excludes, bp.advanced_options,
-                   bp.enabled, bp.repository_id, r.name as repository_name,
-                   s.frequency, s.times, s.day_of_week, s.day_of_month
+                   bp.enabled, bp.snapshot, bp.stream_db_dumps, bp.priority, bp.repository_id, r.name as repository_name,
+                   bp.prune_minutes, bp.prune_hours, bp.prune_days,
+                   bp.prune_weeks, bp.prune_months, bp.prune_years,
+                   s.frequency, s.times, s.day_of_week, s.day_of_month,
+                   s.timezone, s.next_run
             FROM backup_plans bp
             LEFT JOIN schedules s ON s.backup_plan_id = bp.id
             LEFT JOIN repositories r ON r.id = bp.repository_id
@@ -487,17 +930,104 @@ class AdminApiController extends Controller
             ORDER BY bp.name
         ", [$id]);
 
+        // Plugins are returned for the same reason as retention: create and
+        // update accept a `plugins` list that replaces the attached set, so
+        // an editor that can't read the current set either never lets anyone
+        // change it or detaches configs the user didn't know were there.
+        $pluginsByPlan = [];
+        if ($plans) {
+            $rows = $this->db->fetchAll("
+                SELECT bpp.backup_plan_id, bpp.plugin_config_id, bpp.plugin_id,
+                       bpp.execution_order, p.slug, p.name AS plugin_name,
+                       pc.name AS config_name
+                FROM backup_plan_plugins bpp
+                JOIN backup_plans bp ON bp.id = bpp.backup_plan_id
+                JOIN plugins p ON p.id = bpp.plugin_id
+                LEFT JOIN plugin_configs pc ON pc.id = bpp.plugin_config_id
+                WHERE bp.agent_id = ? AND bpp.enabled = 1
+                ORDER BY bpp.backup_plan_id, bpp.execution_order ASC
+            ", [$id]);
+            foreach ($rows as $r) {
+                $pluginsByPlan[(int) $r['backup_plan_id']][] = [
+                    'plugin_config_id' => $r['plugin_config_id'] !== null ? (int) $r['plugin_config_id'] : null,
+                    'plugin_id' => (int) $r['plugin_id'],
+                    'name' => $r['config_name'] ?? $r['plugin_name'],
+                    'slug' => $r['slug'],
+                    'execution_order' => (int) $r['execution_order'],
+                ];
+            }
+        }
+
+        foreach ($plans as &$p) {
+            $p['id'] = (int) $p['id'];
+            $p['enabled'] = (bool) $p['enabled'];
+            $p['snapshot'] = (bool) ($p['snapshot'] ?? 0);
+            $p['stream_db_dumps'] = (bool) ($p['stream_db_dumps'] ?? 0);
+            $p['priority'] = $p['priority'] ?? 'normal';
+            $p['days_of_week'] = \BBS\Services\SchedulerService::parseDaysOfWeek($p['day_of_week'] ?? '');
+            $p['day_of_week'] = $p['days_of_week'][0] ?? null;
+            $p['repository_id'] = $p['repository_id'] !== null ? (int) $p['repository_id'] : null;
+            // Signed: a negative keep count is borg's "no limit" (#386), so
+            // these must not be coerced to unsigned or clamped at zero.
+            foreach (['prune_minutes', 'prune_hours', 'prune_days',
+                      'prune_weeks', 'prune_months', 'prune_years'] as $k) {
+                $p[$k] = (int) $p[$k];
+            }
+            $p['plugins'] = $pluginsByPlan[$p['id']] ?? [];
+        }
+        unset($p);
+
         $this->json(['plans' => $plans]);
     }
 
     public function createPlan(int $id): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::MANAGE_PLANS, $id);
         $input = $this->getJsonInput();
 
-        $agent = $this->db->fetchOne("SELECT id FROM agents WHERE id = ?", [$id]);
+        $agent = $this->db->fetchOne("SELECT id, snapshot_capable, snapshot_support FROM agents WHERE id = ?", [$id]);
         if (!$agent) {
             $this->json(['error' => 'Client not found'], 404);
+        }
+
+        // A template supplies directories, excludes and advanced options, the
+        // same fields the web form fills from one. Any of them sent in the
+        // request overrides the template's value (#544).
+        $templateId = null;
+        if (isset($input['template_id']) && $input['template_id'] !== '') {
+            $template = $this->db->fetchOne("SELECT id, directories, excludes, advanced_options FROM backup_templates WHERE id = ?", [(int) $input['template_id']]);
+            if (!$template) {
+                $this->json(['error' => 'Backup template not found'], 404);
+            }
+            $templateId = (int) $template['id'];
+            foreach (['directories', 'excludes', 'advanced_options'] as $field) {
+                if (!array_key_exists($field, $input) && ($template[$field] ?? '') !== '') {
+                    $input[$field] = $template[$field];
+                }
+            }
+        }
+
+        // Whatever is still missing comes from the client's profile, as the web
+        // form prefills it: the profile's template (unless one was named above),
+        // its schedule and its retention (#563).
+        $profileDefaults = (new \BBS\Services\ClientProfileService())->planDefaults($id);
+        $profileFields = ['frequency', 'times', 'day_of_month',
+            'prune_minutes', 'prune_hours', 'prune_days', 'prune_weeks', 'prune_months', 'prune_years'];
+        if ($templateId === null) {
+            array_push($profileFields, 'directories', 'excludes', 'advanced_options');
+        }
+        foreach ($profileFields as $field) {
+            if (!array_key_exists($field, $input) && ($profileDefaults[$field] ?? '') !== '') {
+                $input[$field] = $profileDefaults[$field];
+            }
+        }
+        if (!array_key_exists('days_of_week', $input) && !array_key_exists('day_of_week', $input)
+            && ($profileDefaults['day_of_week'] ?? null) !== null) {
+            $input['day_of_week'] = $profileDefaults['day_of_week'];
         }
 
         $name = trim($input['name'] ?? '');
@@ -507,7 +1037,8 @@ class AdminApiController extends Controller
         $advancedOptions = trim($input['advanced_options'] ?? '--compression lz4 --exclude-caches --noatime');
         $frequency = $input['frequency'] ?? 'daily';
         $times = $input['times'] ?? '02:00';
-        $dayOfWeek = $input['day_of_week'] ?? null;
+        // days_of_week (a list) wins over the older single day_of_week
+        $dayOfWeek = \BBS\Services\SchedulerService::formatDaysOfWeek($input['days_of_week'] ?? (isset($input['day_of_week']) ? (string) $input['day_of_week'] : ''));
         $dayOfMonth = $input['day_of_month'] ?? null;
         $pruneMinutes = (int) ($input['prune_minutes'] ?? 0);
         $pruneHours = (int) ($input['prune_hours'] ?? 0);
@@ -517,21 +1048,40 @@ class AdminApiController extends Controller
         $pruneYears = (int) ($input['prune_years'] ?? 0);
 
         if (empty($name) || empty($directories) || empty($repositoryId)) {
-            $this->json(['error' => 'name, repository_id, and directories are required'], 400);
+            $this->json(['error' => 'name, repository_id, and directories (or a template_id) are required'], 400);
+        }
+        if (($fieldError = \BBS\Services\BorgCommandBuilder::validatePlanFields($advancedOptions, $directories)) !== null) {
+            $this->json(['error' => $fieldError], 422);
+        }
+        if (!empty($input['snapshot']) && ($snapError = $this->snapshotUnavailableReason($agent)) !== null) {
+            $this->json(['error' => $snapError], 422);
+        }
+        $priority = $input['priority'] ?? 'normal';
+        if (!in_array($priority, self::VALID_PRIORITIES, true)) {
+            $this->json(['error' => 'priority must be one of: ' . implode(', ', self::VALID_PRIORITIES)], 422);
         }
 
         // Verify repository belongs to this agent
         $repo = $this->db->fetchOne(
-            "SELECT id FROM repositories WHERE id = ? AND agent_id = ?",
+            "SELECT id, read_only FROM repositories WHERE id = ? AND agent_id = ?",
             [$repositoryId, $id]
         );
         if (!$repo) {
             $this->json(['error' => 'Repository not found or does not belong to this client'], 404);
         }
+        if (!empty($repo['read_only'])) {
+            $this->json(['error' => 'This repository is a read-only copy restored from an offsite sync. Backup plans and offsite sync cannot use it.'], 409);
+        }
 
-        $validFreqs = ['hourly', 'daily', 'weekly', 'monthly', 'manual'];
-        if (!in_array($frequency, $validFreqs)) {
-            $this->json(['error' => 'Invalid frequency. Valid: ' . implode(', ', $validFreqs)], 400);
+        if (!in_array($frequency, self::VALID_FREQUENCIES, true)) {
+            $this->json(['error' => 'Invalid frequency. Valid: ' . implode(', ', self::VALID_FREQUENCIES)], 400);
+        }
+
+        // Validate before anything is written, so a bad zone can't leave an
+        // orphan plan with no schedule.
+        $timezone = trim((string) ($input['timezone'] ?? ''));
+        if ($timezone !== '' && !in_array($timezone, timezone_identifiers_list(), true)) {
+            $this->json(['error' => 'timezone must be an IANA zone like Europe/Berlin'], 422);
         }
 
         $planId = $this->db->insert('backup_plans', [
@@ -541,6 +1091,9 @@ class AdminApiController extends Controller
             'directories' => $directories,
             'excludes' => $excludes ?: null,
             'advanced_options' => $advancedOptions,
+            'snapshot' => !empty($input['snapshot']) ? 1 : 0,
+            'stream_db_dumps' => !empty($input['stream_db_dumps']) ? 1 : 0,
+            'priority' => $priority,
             'prune_minutes' => $pruneMinutes,
             'prune_hours' => $pruneHours,
             'prune_days' => $pruneDays,
@@ -550,6 +1103,14 @@ class AdminApiController extends Controller
             'enabled' => 1,
         ]);
 
+        // Timezone resolution: an explicit (already validated) one wins,
+        // otherwise the client profile's — as the web form does. Without
+        // this the schedule silently ran in UTC while looking correct
+        // everywhere (#462).
+        if ($timezone === '') {
+            $timezone = (new \BBS\Services\ClientProfileService())->planTimezoneFor($id);
+        }
+
         // Create schedule
         $scheduleId = $this->db->insert('schedules', [
             'backup_plan_id' => $planId,
@@ -557,7 +1118,9 @@ class AdminApiController extends Controller
             'times' => $times,
             'day_of_week' => $dayOfWeek,
             'day_of_month' => $dayOfMonth,
+            'timezone' => $timezone,
             'enabled' => $frequency !== 'manual' ? 1 : 0,
+            'next_run' => $this->calcNextRun($frequency, $times, $dayOfWeek, $dayOfMonth, $timezone),
         ]);
 
         // Attach plugin configs if provided
@@ -582,10 +1145,15 @@ class AdminApiController extends Controller
                         'enabled' => 1,
                     ]);
                 } else {
-                    // Map format: {plugin_id: config_id}
-                    $pluginId = (int) $key;
+                    // Map format: {plugin_id: config_id}. The config must belong
+                    // to this client, and its own plugin_id wins over the key:
+                    // another client's config would hand its secrets to this
+                    // client's agent at backup time.
                     $configId = (int) $val;
-                    if ($pluginId <= 0 || $configId <= 0) continue;
+                    if ($configId <= 0) continue;
+                    $pc = $this->db->fetchOne("SELECT plugin_id FROM plugin_configs WHERE id = ? AND agent_id = ?", [$configId, $id]);
+                    if (!$pc) continue;
+                    $pluginId = (int) $pc['plugin_id'];
                     $this->db->insert('backup_plan_plugins', [
                         'backup_plan_id' => $planId,
                         'plugin_id' => $pluginId,
@@ -609,6 +1177,9 @@ class AdminApiController extends Controller
             'name' => $name,
             'repository_id' => $repositoryId,
             'directories' => $directories,
+            'excludes' => $excludes,
+            'advanced_options' => $advancedOptions,
+            'template_id' => $templateId,
             'frequency' => $frequency,
             'schedule_id' => (int) $scheduleId,
             'plugins_attached' => $order,
@@ -679,6 +1250,10 @@ class AdminApiController extends Controller
         $plugin = $this->db->fetchOne("SELECT id, slug FROM plugins WHERE slug = ?", [$pluginSlug]);
         if (!$plugin) {
             $this->json(['error' => "Unknown plugin: {$pluginSlug}"], 404);
+        }
+        $config = \BBS\Services\PluginManager::hostedConfig($pluginSlug, is_array($config) ? $config : []);
+        if (($hookProblem = \BBS\Services\PluginManager::configProblem($pluginSlug, $config, true)) !== null) {
+            $this->json(['error' => $hookProblem], 422);
         }
 
         // Check duplicate name
@@ -758,18 +1333,25 @@ class AdminApiController extends Controller
     {
         $this->requireApiToken();
 
-        $locations = $this->db->fetchAll("SELECT id, label as name, path, is_default, created_at FROM storage_locations ORDER BY label");
+        $locations = $this->db->fetchAll("SELECT id, label as name, path, capacity_bytes, max_concurrent, is_default, created_at FROM storage_locations ORDER BY label");
         $remoteConfigs = $this->db->fetchAll("
             SELECT id, name, provider, remote_host, remote_port, remote_user, remote_base_path,
-                   borg_remote_path, append_repo_name, disk_total_bytes, disk_used_bytes,
+                   borg_remote_path, append_repo_name, max_concurrent, disk_total_bytes, disk_used_bytes,
                    disk_free_bytes, disk_checked_at, created_at
             FROM remote_ssh_configs ORDER BY name
         ");
 
         // Decorate local locations with live df capacity/usage (#157).
         foreach ($locations as &$loc) {
-            $disk = \BBS\Services\ServerStats::getDiskUsage($loc['path']);
-            if ($disk) {
+            // capacityForLocation() prefers a stated capacity and returns null
+            // rather than the local cache disk's figures for a mount that
+            // can't report its own size (#415).
+            $disk = \BBS\Services\ServerStats::capacityForLocation($loc);
+            $loc['capacity_source'] = $disk['source'] ?? null;
+            $loc['capacity_unknown_reason'] = $disk === null
+                ? \BBS\Services\ServerStats::capacityUnknownReason($loc)
+                : null;
+            if ($disk && $disk['total'] > 0 && $disk['used'] !== null) {
                 $loc['total_bytes'] = (int) $disk['total'];
                 $loc['used_bytes'] = (int) $disk['used'];
                 $loc['free_bytes'] = (int) $disk['free'];
@@ -811,6 +1393,18 @@ class AdminApiController extends Controller
     }
 
     // ── Remote SSH Repos ────────────────────────────────
+
+    /**
+     * Remote SSH hosts are shared: their private key goes to the agent of
+     * every client with a repository there, and it opens the whole storage
+     * account. Only admins choose to put a client on one.
+     */
+    private function apiRequireAdminForRemoteSsh(array $ctx, ?int $remoteSshConfigId): void
+    {
+        if ($remoteSshConfigId && ($ctx['role'] ?? '') !== 'admin') {
+            $this->json(['error' => 'Only an admin can place repositories on a Remote SSH host: its key is shared by every repository on that host.'], 403);
+        }
+    }
 
     private function createRemoteSshRepository(int $id, string $name, string $encryption, string $passphrase, ?int $remoteSshConfigId): void
     {
@@ -884,7 +1478,11 @@ class AdminApiController extends Controller
 
     public function renameRepository(int $id, int $repoId): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::MANAGE_REPOS, $id);
         $input = $this->getJsonInput();
 
         $repo = $this->db->fetchOne("SELECT r.*, a.id as agent_id FROM repositories r JOIN agents a ON a.id = r.agent_id WHERE r.id = ? AND r.agent_id = ?", [$repoId, $id]);
@@ -895,6 +1493,9 @@ class AdminApiController extends Controller
         $newName = trim($input['name'] ?? '');
         if (empty($newName)) {
             $this->json(['error' => 'name is required'], 400);
+        }
+        if (mb_strlen($newName) > 100) {
+            $this->json(['error' => 'Repository names can be at most 100 characters.'], 422);
         }
 
         if (($repo['storage_type'] ?? 'local') === 'remote_ssh') {
@@ -943,26 +1544,57 @@ class AdminApiController extends Controller
 
     public function deleteRepository(int $id, int $repoId): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::MANAGE_REPOS, $id);
 
         $repo = $this->db->fetchOne("SELECT r.*, a.id as agent_id FROM repositories r JOIN agents a ON a.id = r.agent_id WHERE r.id = ? AND r.agent_id = ?", [$repoId, $id]);
         if (!$repo) {
             $this->json(['error' => 'Repository not found'], 404);
         }
 
-        $planCount = $this->db->fetchOne("SELECT COUNT(*) as cnt FROM backup_plans WHERE repository_id = ?", [$repoId]);
-        if ((int) ($planCount['cnt'] ?? 0) > 0) {
-            $this->json(['error' => 'Cannot delete — repository has backup plans attached. Delete the plans first.'], 409);
+        // Locked archives (legal hold, #314) block deletion — matches the web UI.
+        $lockedCount = $this->db->fetchOne("SELECT COUNT(*) as cnt FROM archives WHERE repository_id = ? AND locked = 1", [$repoId]);
+        if ((int) ($lockedCount['cnt'] ?? 0) > 0) {
+            $this->json([
+                'error' => 'Cannot delete — repository contains locked archives. Unlock them first.',
+                'reason' => 'locked_archives',
+                'locked_archives' => (int) ($lockedCount['cnt'] ?? 0),
+            ], 409);
+        }
+
+        // Name the plans rather than just refusing: a caller can then offer to
+        // open them instead of leaving someone guessing why nothing happened.
+        $plans = $this->db->fetchAll(
+            "SELECT id, name FROM backup_plans WHERE repository_id = ? ORDER BY name",
+            [$repoId]
+        );
+        if (!empty($plans)) {
+            $this->json([
+                'error' => sprintf('In use by %d backup plan(s)', count($plans)),
+                'reason' => 'plans_attached',
+                'plans' => array_map(fn($p) => ['id' => (int) $p['id'], 'name' => $p['name']], $plans),
+            ], 409);
         }
 
         $activeJobs = $this->db->fetchOne("SELECT COUNT(*) as cnt FROM backup_jobs WHERE repository_id = ? AND status IN ('queued', 'sent', 'running')", [$repoId]);
         if ((int) ($activeJobs['cnt'] ?? 0) > 0) {
-            $this->json(['error' => 'Cannot delete — repository has active jobs'], 409);
+            $this->json([
+                'error' => 'Cannot delete — repository has active jobs',
+                'reason' => 'active_jobs',
+            ], 409);
         }
+
+        // ?keep_data=1 (or JSON body {"keep_data": true}): unlink only — keep
+        // the borg data on disk for later re-attachment via scan/adopt (#369)
+        $input = $this->getJsonInput();
+        $keepData = !empty($_GET['keep_data']) || !empty($input['keep_data']);
 
         // Delete from disk
         $localPath = BorgCommandBuilder::getLocalRepoPath($repo);
-        if (!empty($localPath) && is_dir($localPath)) {
+        if (!$keepData && !empty($localPath) && is_dir($localPath)) {
             exec('sudo /usr/local/bin/bbs-ssh-helper delete-storage ' . escapeshellarg($localPath) . ' 2>&1', $output, $retval);
         }
 
@@ -970,39 +1602,241 @@ class AdminApiController extends Controller
 
         $agent = $this->db->fetchOne("SELECT * FROM agents WHERE id = ?", [$id]);
         if ($agent && !empty($agent['ssh_unix_user'])) {
-            // Refresh storage paths
-            $repos = $this->db->fetchAll("SELECT r.*, sl.path as location_path FROM repositories r LEFT JOIN storage_locations sl ON sl.id = r.storage_location_id WHERE r.agent_id = ?", [$id]);
-            $storagePaths = [];
-            foreach ($repos as $r) {
-                if (!empty($r['location_path'])) {
-                    $storagePaths[] = rtrim($r['location_path'], '/') . '/' . $id;
-                }
-            }
-            if (!empty($storagePaths)) {
-                $pathList = implode("\n", array_unique($storagePaths));
-                exec('sudo /usr/local/bin/bbs-ssh-helper update-storage-paths ' . escapeshellarg($agent['ssh_unix_user']) . ' ' . escapeshellarg($pathList) . ' 2>&1');
-            }
+            // Same refresh the web uses (it passed the user name as the home dir)
+            \BBS\Services\SshKeyManager::updateAgentStoragePaths($this->db, (int) $id, $agent);
         }
 
         $this->db->insert('server_log', [
             'agent_id' => $id,
             'level' => 'info',
-            'message' => "Repository \"{$repo['name']}\" deleted via API",
+            'message' => "Repository \"{$repo['name']}\" " . ($keepData ? 'unlinked (data kept on disk)' : 'deleted') . " via API",
         ]);
 
-        $this->json(['status' => 'ok', 'message' => "Repository \"{$repo['name']}\" deleted"]);
+        $this->json(['status' => 'ok', 'message' => "Repository \"{$repo['name']}\" " . ($keepData ? 'unlinked — data kept on disk' : 'deleted')]);
+    }
+
+    // ── Archives (recovery points) ───────────────────────
+
+    /**
+     * GET /api/v1/clients/{id}/repositories/{repoId}/archives
+     * List a repository's recovery points, including each one's lock state
+     * (#314). Use this to find the archive id to lock.
+     */
+    public function listArchives(int $id, int $repoId): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+
+        $repo = $this->db->fetchOne(
+            "SELECT r.id FROM repositories r WHERE r.id = ? AND r.agent_id = ?",
+            [$repoId, $id]
+        );
+        if (!$repo) {
+            $this->json(['error' => 'Repository not found'], 404);
+        }
+
+        // Plan name and duration come through the backup job, as on the web
+        // page; both are null for imported archives with no job.
+        $rows = $this->db->fetchAll(
+            "SELECT ar.id, ar.archive_name, ar.file_count, ar.original_size, ar.deduplicated_size, ar.locked, ar.created_at,
+                    ar.databases_backed_up IS NOT NULL AND ar.databases_backed_up != '' AS has_databases,
+                    bp.name AS plan_name, bj.duration_seconds
+             FROM archives ar
+             LEFT JOIN backup_jobs bj ON bj.id = ar.backup_job_id
+             LEFT JOIN backup_plans bp ON bp.id = bj.backup_plan_id
+             WHERE ar.repository_id = ? ORDER BY ar.created_at DESC",
+            [$repoId]
+        );
+        $archives = array_map(static function ($a) {
+            return [
+                // Lets a caller show only the restore points a database
+                // restore can actually use, instead of offering every archive
+                // and failing once one is chosen.
+                'has_databases'     => (bool) $a['has_databases'],
+                'id'                => (int) $a['id'],
+                'name'              => $a['archive_name'],
+                'plan_name'         => $a['plan_name'],
+                'file_count'        => (int) $a['file_count'],
+                'original_size'     => (int) $a['original_size'],
+                'deduplicated_size' => (int) $a['deduplicated_size'],
+                'duration_seconds'  => $a['duration_seconds'] !== null ? (int) $a['duration_seconds'] : null,
+                'locked'            => (bool) ((int) $a['locked']),
+                'created_at'        => $a['created_at'],
+            ];
+        }, $rows);
+
+        $this->json(['archives' => $archives]);
+    }
+
+    /**
+     * GET /api/v1/clients/{id}/repositories/{repoId}/archives/{archiveId}
+     *
+     * One recovery point with what the web archive page shows beyond the
+     * list: the plan's directories at the time of the job, files grouped by
+     * borg status, and the twenty largest files. The two catalog panels are
+     * [] when ClickHouse is unavailable or the archive isn't catalogued yet,
+     * and `catalog` says which.
+     */
+    public function archiveDetail(int $id, int $repoId, int $archiveId): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+
+        $repo = $this->db->fetchOne("SELECT id FROM repositories WHERE id = ? AND agent_id = ?", [$repoId, $id]);
+        if (!$repo) {
+            $this->json(['error' => 'Repository not found'], 404);
+        }
+
+        $archive = $this->db->fetchOne(
+            "SELECT ar.id, ar.archive_name, ar.file_count, ar.original_size, ar.deduplicated_size, ar.locked, ar.created_at,
+                    ar.databases_backed_up IS NOT NULL AND ar.databases_backed_up != '' AS has_databases,
+                    bp.name AS plan_name, COALESCE(bj.directories, bp.directories) AS directories, bj.duration_seconds, bj.started_at, bj.completed_at
+             FROM archives ar
+             LEFT JOIN backup_jobs bj ON bj.id = ar.backup_job_id
+             LEFT JOIN backup_plans bp ON bp.id = bj.backup_plan_id
+             WHERE ar.id = ? AND ar.repository_id = ?",
+            [$archiveId, $repoId]
+        );
+        if (!$archive) {
+            $this->json(['error' => 'Archive not found'], 404);
+        }
+
+        $directories = [];
+        foreach (preg_split('/\r?\n/', (string) ($archive['directories'] ?? '')) as $d) {
+            $d = trim($d);
+            if ($d !== '') $directories[] = $d;
+        }
+
+        // Same two ClickHouse queries as the web page, each in its own try so
+        // one failing doesn't empty the other. The "deleted since previous
+        // archive" anti-join is deliberately not here — it can take seconds
+        // on large archives.
+        $statusBreakdown = [];
+        $largestFiles = [];
+        try {
+            $ch = \BBS\Core\ClickHouse::getInstance();
+            if ($ch->isAvailable()) {
+                $aid = (int) $id;
+                $arid = (int) $archiveId;
+                try {
+                    $rows = $ch->fetchAll(
+                        "SELECT status, count() as cnt, sum(file_size) as total_size
+                         FROM file_catalog
+                         WHERE agent_id = {$aid} AND archive_id = {$arid} AND path != ''
+                         GROUP BY status ORDER BY cnt DESC"
+                    );
+                    foreach ($rows as $r) {
+                        $statusBreakdown[] = [
+                            'status' => $r['status'],
+                            'count' => (int) $r['cnt'],
+                            'size' => $r['total_size'] !== null ? (int) $r['total_size'] : null,
+                        ];
+                    }
+                } catch (\Exception $e) {
+                    error_log("api archiveDetail statusBreakdown failed (agent_id={$aid}, archive_id={$arid}): " . $e->getMessage());
+                }
+                try {
+                    $rows = $ch->fetchAllOrdered(
+                        "SELECT path, file_name, file_size, status
+                         FROM file_catalog
+                         WHERE agent_id = {$aid} AND archive_id = {$arid} AND path != ''
+                           AND status != toFixedString('X', 1)
+                         ORDER BY file_size DESC LIMIT 20"
+                    );
+                    foreach ($rows as $r) {
+                        $largestFiles[] = [
+                            'path' => $r['path'],
+                            'size' => (int) $r['file_size'],
+                            'status' => $r['status'],
+                        ];
+                    }
+                } catch (\Exception $e) {
+                    error_log("api archiveDetail largestFiles failed (agent_id={$aid}, archive_id={$arid}): " . $e->getMessage());
+                }
+            }
+        } catch (\Exception $e) {
+            // ClickHouse unreachable — both panels stay empty; catalog says so.
+        }
+
+        $this->json([
+            'id' => (int) $archive['id'],
+            'name' => $archive['archive_name'],
+            'plan_name' => $archive['plan_name'],
+            'created_at' => $archive['created_at'],
+            'started_at' => $archive['started_at'],
+            'completed_at' => $archive['completed_at'],
+            'duration_seconds' => $archive['duration_seconds'] !== null ? (int) $archive['duration_seconds'] : null,
+            'file_count' => (int) $archive['file_count'],
+            'original_size' => (int) $archive['original_size'],
+            'deduplicated_size' => (int) $archive['deduplicated_size'],
+            'locked' => (bool) ((int) $archive['locked']),
+            'has_databases' => (bool) $archive['has_databases'],
+            'directories' => $directories,
+            'status_breakdown' => $statusBreakdown,
+            'largest_files' => $largestFiles,
+            'catalog' => $this->catalogState($id, $archiveId),
+        ]);
+    }
+
+    /**
+     * POST /api/v1/clients/{id}/repositories/{repoId}/archives/{archiveId}/lock
+     * Lock or unlock a recovery point (#314). Body: {"locked": true|false}.
+     * A locked archive is never pruned and cannot be deleted. If the repo is
+     * busy the change is queued and applies when the running job finishes
+     * (response 202). Idempotent — locking an already-locked archive is a
+     * no-op 200.
+     */
+    public function setArchiveLock(int $id, int $repoId, int $archiveId): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::REPO_MAINTENANCE, $id);
+        $input = $this->getJsonInput();
+
+        if (!array_key_exists('locked', $input)) {
+            $this->json(['error' => 'locked is required (boolean)'], 400);
+        }
+        $desired = (bool) $input['locked'];
+
+        $result = (new \BBS\Services\ArchiveLockService())->setLock($id, $repoId, $archiveId, $desired);
+
+        $this->json([
+            'status'  => $result['ok'] ? 'ok' : 'error',
+            'result'  => $result['result'],
+            'message' => $result['message'],
+            'name'    => $result['archive_name'] ?? null,
+            'locked'  => $result['locked'] ?? ($result['result'] === 'queued' ? $desired : null),
+        ], $result['code']);
     }
 
     // ── Plan Edit/Delete/Trigger ─────────────────────────
 
     public function updatePlan(int $id, int $planId): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::MANAGE_PLANS, $id);
         $input = $this->getJsonInput();
 
         $plan = $this->db->fetchOne("SELECT * FROM backup_plans WHERE id = ? AND agent_id = ?", [$planId, $id]);
         if (!$plan) {
             $this->json(['error' => 'Plan not found'], 404);
+        }
+
+        // Reject a bad frequency before any field is written.
+        if (isset($input['frequency']) && !in_array($input['frequency'], self::VALID_FREQUENCIES, true)) {
+            $this->json(['error' => 'Invalid frequency. Valid: ' . implode(', ', self::VALID_FREQUENCIES)], 400);
+        }
+        if (isset($input['timezone']) && !in_array((string) $input['timezone'], timezone_identifiers_list(), true)) {
+            $this->json(['error' => 'timezone must be an IANA zone like Europe/Berlin'], 422);
         }
 
         // Update plan fields (only those provided)
@@ -1012,12 +1846,46 @@ class AdminApiController extends Controller
                 $planData[$field] = trim($input[$field]) ?: null;
             }
         }
+        if (isset($planData['advanced_options']) || isset($planData['directories'])) {
+            $current = $this->db->fetchOne("SELECT advanced_options, directories FROM backup_plans WHERE id = ?", [$planId]);
+            $fieldError = \BBS\Services\BorgCommandBuilder::validatePlanFields(
+                array_key_exists('advanced_options', $planData) ? $planData['advanced_options'] : ($current['advanced_options'] ?? null),
+                array_key_exists('directories', $planData) ? $planData['directories'] : ($current['directories'] ?? null)
+            );
+            if ($fieldError !== null) {
+                $this->json(['error' => $fieldError], 422);
+            }
+        }
         if (isset($input['repository_id'])) {
-            $repo = $this->db->fetchOne("SELECT id FROM repositories WHERE id = ? AND agent_id = ?", [(int) $input['repository_id'], $id]);
+            $repo = $this->db->fetchOne("SELECT id, read_only FROM repositories WHERE id = ? AND agent_id = ?", [(int) $input['repository_id'], $id]);
             if (!$repo) {
                 $this->json(['error' => 'Repository not found or does not belong to this client'], 404);
             }
+            if (!empty($repo['read_only'])) {
+                $this->json(['error' => 'This repository is a read-only copy restored from an offsite sync. Backup plans and offsite sync cannot use it.'], 409);
+            }
             $planData['repository_id'] = (int) $input['repository_id'];
+        }
+        if (isset($input['priority'])) {
+            if (!in_array($input['priority'], self::VALID_PRIORITIES, true)) {
+                $this->json(['error' => 'priority must be one of: ' . implode(', ', self::VALID_PRIORITIES)], 422);
+            }
+            $planData['priority'] = $input['priority'];
+        }
+        if (array_key_exists('stream_db_dumps', $input)) {
+            $planData['stream_db_dumps'] = !empty($input['stream_db_dumps']) ? 1 : 0;
+        }
+        if (array_key_exists('snapshot', $input)) {
+            $planData['snapshot'] = !empty($input['snapshot']) ? 1 : 0;
+            // Turning it on needs a host that can snapshot. A plan that
+            // already has it keeps it, as on the web, so the switch can
+            // still be turned off after the host changed.
+            if ($planData['snapshot'] && empty($plan['snapshot'])) {
+                $agent = $this->db->fetchOne("SELECT snapshot_capable, snapshot_support FROM agents WHERE id = ?", [$id]);
+                if (($snapError = $this->snapshotUnavailableReason($agent)) !== null) {
+                    $this->json(['error' => $snapError], 422);
+                }
+            }
         }
         foreach (['prune_minutes', 'prune_hours', 'prune_days', 'prune_weeks', 'prune_months', 'prune_years'] as $field) {
             if (isset($input[$field])) {
@@ -1038,16 +1906,22 @@ class AdminApiController extends Controller
             $schedData = [];
             if (isset($input['frequency'])) $schedData['frequency'] = $input['frequency'];
             if (isset($input['times'])) $schedData['times'] = $input['times'];
-            if (isset($input['day_of_week'])) $schedData['day_of_week'] = $input['day_of_week'];
+            if (isset($input['days_of_week']) || isset($input['day_of_week'])) {
+                $schedData['day_of_week'] = \BBS\Services\SchedulerService::formatDaysOfWeek($input['days_of_week'] ?? (string) $input['day_of_week']);
+            }
             if (isset($input['day_of_month'])) $schedData['day_of_month'] = $input['day_of_month'];
             if (isset($input['timezone'])) $schedData['timezone'] = $input['timezone'];
 
             if (isset($input['frequency'])) {
                 $schedData['enabled'] = ($input['frequency'] !== 'manual') ? 1 : 0;
-                // Calculate next_run
-                $freq = $input['frequency'];
+            }
+            // Any schedule field change moves the next occurrence — a new
+            // timezone or time must not wait for a frequency to be re-sent
+            // before it takes effect (#462).
+            if (!empty($schedData)) {
+                $freq = $input['frequency'] ?? $schedule['frequency'];
                 $times = $input['times'] ?? $schedule['times'] ?? '02:00';
-                $dow = $input['day_of_week'] ?? $schedule['day_of_week'];
+                $dow = array_key_exists('day_of_week', $schedData) ? $schedData['day_of_week'] : $schedule['day_of_week'];
                 $dom = $input['day_of_month'] ?? $schedule['day_of_month'];
                 $tz = $input['timezone'] ?? $schedule['timezone'] ?? 'UTC';
                 $schedData['next_run'] = $this->calcNextRun($freq, $times, $dow, $dom, $tz);
@@ -1074,9 +1948,12 @@ class AdminApiController extends Controller
                         'execution_order' => $order++, 'enabled' => 1,
                     ]);
                 } else {
-                    $pluginId = (int) $key;
+                    // Map format: the config must belong to this client (see createPlan)
                     $configId = (int) $val;
-                    if ($pluginId <= 0 || $configId <= 0) continue;
+                    if ($configId <= 0) continue;
+                    $pc = $this->db->fetchOne("SELECT plugin_id FROM plugin_configs WHERE id = ? AND agent_id = ?", [$configId, $id]);
+                    if (!$pc) continue;
+                    $pluginId = (int) $pc['plugin_id'];
                     $this->db->insert('backup_plan_plugins', [
                         'backup_plan_id' => $planId, 'plugin_id' => $pluginId,
                         'plugin_config_id' => $configId, 'config' => '{}',
@@ -1089,9 +1966,31 @@ class AdminApiController extends Controller
         $this->json(['status' => 'ok', 'message' => 'Plan updated']);
     }
 
+    /**
+     * Why a plan on this client cannot back up from a snapshot, or null
+     * when it can. Uses the capability the agent reported with its system
+     * info (agent 2.95.0+).
+     */
+    private function snapshotUnavailableReason(?array $agent): ?string
+    {
+        if (!empty($agent['snapshot_capable'])) {
+            return null;
+        }
+        if ($agent === null || $agent['snapshot_capable'] === null) {
+            return 'snapshot is not available: the agent has not reported its filesystems yet (agent 2.95.0 or newer required)';
+        }
+        $support = json_decode($agent['snapshot_support'] ?? '', true);
+        $reason = $support['reason'] ?? 'no snapshot-capable volumes found';
+        return 'snapshot is not available on this client: ' . $reason;
+    }
+
     public function deletePlan(int $id, int $planId): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::MANAGE_PLANS, $id);
 
         $plan = $this->db->fetchOne("SELECT * FROM backup_plans WHERE id = ? AND agent_id = ?", [$planId, $id]);
         if (!$plan) {
@@ -1111,7 +2010,12 @@ class AdminApiController extends Controller
 
     public function pausePlan(int $id, int $planId): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Plan not found'], 404);
+        }
+        // Same as the web schedule toggle: pausing stops this client's backups
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::MANAGE_PLANS, $id);
 
         $plan = $this->db->fetchOne("SELECT * FROM backup_plans WHERE id = ? AND agent_id = ?", [$planId, $id]);
         if (!$plan) {
@@ -1130,7 +2034,12 @@ class AdminApiController extends Controller
 
     public function resumePlan(int $id, int $planId): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Plan not found'], 404);
+        }
+        // Same as the web schedule toggle: pausing stops this client's backups
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::MANAGE_PLANS, $id);
 
         $plan = $this->db->fetchOne("SELECT * FROM backup_plans WHERE id = ? AND agent_id = ?", [$planId, $id]);
         if (!$plan) {
@@ -1149,7 +2058,11 @@ class AdminApiController extends Controller
 
     public function triggerPlan(int $id, int $planId): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Plan not found'], 404);
+        }
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::TRIGGER_BACKUP, $id);
 
         $plan = $this->db->fetchOne("SELECT * FROM backup_plans WHERE id = ? AND agent_id = ?", [$planId, $id]);
         if (!$plan) {
@@ -1183,18 +2096,232 @@ class AdminApiController extends Controller
 
     // ── Client Edit ──────────────────────────────────────
 
-    public function updateClient(int $id): void
+    /**
+     * POST /api/v1/clients/{id}/rotate-key
+     *
+     * Issues a new key and stops accepting the old one, at once. The client
+     * cannot report until its own configuration carries the new key, so the
+     * response says where that lives.
+     */
+    /**
+     * POST /api/v1/repositories/{repoId}/passphrase
+     * Body: {"passphrase": "..."}  — omit to have one generated.
+     *
+     * Refuses while any job is queued, sent or running against the repository.
+     */
+    public function changeRepositoryPassphrase(int $repoId): void
+    {
+        $ctx = $this->requireApiAuth();
+        $input = $this->getJsonInput();
+
+        $repo = $this->db->fetchOne("SELECT * FROM repositories WHERE id = ?", [$repoId]);
+        if (!$repo || !$this->apiCanAccessAgent($ctx, (int) $repo['agent_id'])) {
+            // Same 404 for "no such repo" and "not yours": a scoped user
+            // cannot probe which repository ids exist.
+            $this->json(['error' => 'Repository not found'], 404);
+        }
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::MANAGE_REPOS, (int) $repo['agent_id']);
+
+        $svc = new \BBS\Services\RepositoryPassphraseService();
+        $passphrase = trim((string) ($input['passphrase'] ?? ''));
+        $generated = false;
+        if ($passphrase === '') {
+            $passphrase = $svc->suggest();
+            $generated = true;
+        }
+
+        $result = $svc->change($repo, $passphrase);
+
+        if (!$result['success']) {
+            $this->json([
+                'error' => $result['message'],
+                'output' => $result['output'],
+                // True means borg took the change but it was not saved. The
+                // passphrase is in the message and nowhere else.
+                'orphaned' => $result['orphaned'],
+            ], $result['orphaned'] ? 500 : 422);
+        }
+
+        $this->json([
+            'status' => 'ok',
+            'repository_id' => (int) $repo['id'],
+            // Returned only when we made it up — a caller that supplied one
+            // already has it.
+            'passphrase' => $generated ? $passphrase : null,
+            'message' => $result['message'],
+        ]);
+    }
+
+    public function rotateClientKey(int $id): void
     {
         $this->requireApiToken();
-        $input = $this->getJsonInput();
+
+        $agent = $this->db->fetchOne("SELECT id, name, platform FROM agents WHERE id = ?", [$id]);
+        if (!$agent) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+
+        $svc = new \BBS\Services\AgentKeyService();
+        $key = $svc->rotate($id, 'API');
+        [$location, $instructions] = $svc->reconfigureHint($agent);
+
+        $this->json([
+            'status' => 'ok',
+            'client_id' => (int) $agent['id'],
+            'api_key' => $key,
+            'previous_key_revoked' => true,
+            'reconfigure_location' => $location,
+            'reconfigure_instructions' => $instructions,
+        ]);
+    }
+
+    /**
+     * POST /api/v1/clients/{id}/reprovision-ssh
+     *
+     * The web's "Repair SSH access": a new SSH key pair, and the client's Unix
+     * user and authorized_keys rebuilt on the server, for borg connections
+     * that fail with "Permission denied (publickey)" (#537). Returns nothing
+     * secret — the agent fetches its new private key when it restarts.
+     * Admin token, like rotate-key.
+     */
+    public function reprovisionClientSsh(int $id): void
+    {
+        $this->requireApiToken();
 
         $agent = $this->db->fetchOne("SELECT * FROM agents WHERE id = ?", [$id]);
         if (!$agent) {
             $this->json(['error' => 'Client not found'], 404);
         }
 
+        $blocked = SshKeyManager::reprovisionBlockedReason($id);
+        if ($blocked !== null) {
+            $this->json(['error' => $blocked], 409);
+        }
+
+        $result = SshKeyManager::reprovisionClient($agent, 'API');
+        if (!$result) {
+            $this->json(['error' => 'SSH access repair failed: ' . (SshKeyManager::getLastHelperError() ?? 'unknown error')], 500);
+        }
+
+        $this->json([
+            'status' => 'ok',
+            'client_id' => (int) $agent['id'],
+            'ssh_unix_user' => $result['unix_user'],
+            'ssh_home_dir' => $result['home_dir'],
+            'previous_key_revoked' => true,
+            'restart_instructions' => SshKeyManager::restartAgentHint($agent),
+        ]);
+    }
+
+    public function updateClient(int $id): void
+    {
+        $ctx = $this->requireApiAuth();
+        $input = $this->getJsonInput();
+
+        $agent = $this->db->fetchOne("SELECT * FROM agents WHERE id = ?", [$id]);
+        if (!$agent || !$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+
+        // An assigned user may rename a client they can see and set its
+        // location, matching the web. Everything else — profile, ownership,
+        // alerts — changes how the fleet is run and stays with the admin role.
+        if (($ctx['role'] ?? '') !== 'admin') {
+            $extra = array_diff(array_keys($input), ['name', 'location']);
+            if (!empty($extra)) {
+                $this->json(['error' => "Only a client's name and location can be changed without the admin role."], 403);
+            }
+        }
+
         $data = [];
         if (isset($input['name'])) $data['name'] = trim($input['name']);
+        if (array_key_exists('location', $input)) {
+            $loc = trim((string) ($input['location'] ?? ''));
+            if (mb_strlen($loc) > 100) {
+                $this->json(['error' => 'location must be 100 characters or fewer'], 422);
+            }
+            $data['location'] = $loc !== '' ? $loc : null;
+        }
+        if (array_key_exists('offline_alerts', $input)) {
+            if (!is_bool($input['offline_alerts']) && !in_array($input['offline_alerts'], [0, 1, '0', '1'], true)) {
+                $this->json(['error' => 'offline_alerts must be true or false'], 422);
+            }
+            $data['offline_alerts'] = $input['offline_alerts'] ? 1 : 0;
+        }
+
+        // Moving a client between profiles changes how patient BBS is with it
+        // and what its next new plan starts from. It deliberately does not
+        // rewrite the plans it already has — that is what the profile's apply
+        // endpoint is for.
+        if (array_key_exists('client_profile_id', $input)) {
+            $svc = new \BBS\Services\ClientProfileService();
+            $pid = $input['client_profile_id'] !== null ? (int) $input['client_profile_id'] : null;
+            if ($pid !== null && !$svc->find($pid)) {
+                $this->json(['error' => 'client_profile_id does not exist'], 422);
+            }
+            $data['client_profile_id'] = $pid ?? $svc->defaultProfileId();
+        }
+
+        // The rest of the web's Edit Client panel. Each field is validated
+        // before anything is written, so a 422 leaves the client untouched.
+        if (array_key_exists('user_id', $input)) {
+            $uid = ($input['user_id'] === null || $input['user_id'] === '') ? null : (int) $input['user_id'];
+            if ($uid !== null && !$this->db->fetchOne("SELECT id FROM users WHERE id = ?", [$uid])) {
+                $this->json(['error' => 'user_id does not exist'], 422);
+            }
+            $data['user_id'] = $uid;
+        }
+        if (array_key_exists('server_host_override', $input)) {
+            $host = trim((string) ($input['server_host_override'] ?? ''));
+            if ($host !== '' && !\BBS\Core\Config::isValidHost($host, false)) {
+                $this->json(['error' => 'server_host_override must be a hostname or IP with no scheme, port or path'], 422);
+            }
+            $data['server_host_override'] = $host !== '' ? $host : null;
+        }
+        if (array_key_exists('ssh_port_override', $input)) {
+            $raw = $input['ssh_port_override'];
+            if ($raw === null || $raw === '') {
+                $data['ssh_port_override'] = null;
+            } elseif (!is_numeric($raw) || (int) $raw < 1 || (int) $raw > 65535) {
+                $this->json(['error' => 'ssh_port_override must be 1–65535 or null'], 422);
+            } else {
+                $data['ssh_port_override'] = (int) $raw;
+            }
+        }
+        if (array_key_exists('wol_enabled', $input)) {
+            $data['wol_enabled'] = filter_var($input['wol_enabled'], FILTER_VALIDATE_BOOLEAN) ? 1 : 0;
+        }
+        if (array_key_exists('wol_mac', $input)) {
+            $raw = trim((string) ($input['wol_mac'] ?? ''));
+            $mac = $raw !== '' ? \BBS\Services\WakeOnLanService::normalizeMac($raw) : null;
+            if ($raw !== '' && $mac === null) {
+                $this->json(['error' => 'wol_mac must be a MAC address like aa:bb:cc:dd:ee:ff'], 422);
+            }
+            $data['wol_mac'] = $mac;
+        }
+        if (array_key_exists('wol_broadcast', $input)) {
+            $bc = trim((string) ($input['wol_broadcast'] ?? ''));
+            if ($bc !== '' && !filter_var($bc, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                $this->json(['error' => 'wol_broadcast must be an IPv4 address or empty for the default'], 422);
+            }
+            $data['wol_broadcast'] = $bc !== '' ? $bc : null;
+        }
+        if (array_key_exists('wol_timeout_minutes', $input)) {
+            $t = $input['wol_timeout_minutes'];
+            if (!is_numeric($t) || (int) $t < 1 || (int) $t > 60) {
+                $this->json(['error' => 'wol_timeout_minutes must be 1–60'], 422);
+            }
+            $data['wol_timeout_minutes'] = (int) $t;
+        }
+        if (array_key_exists('notes', $input)) {
+            $notes = trim((string) ($input['notes'] ?? ''));
+            if (mb_strlen($notes) > 5000) {
+                $this->json(['error' => 'notes must be 5000 characters or fewer'], 422);
+            }
+            $data['notes'] = $notes !== '' ? $notes : null;
+            $data['notes_updated_by'] = $notes !== '' ? ($ctx['id'] ?? null) : null;
+            $data['notes_updated_at'] = $notes !== '' ? date('Y-m-d H:i:s') : null;
+        }
 
         if (empty($data)) {
             $this->json(['error' => 'No fields to update'], 400);
@@ -1202,14 +2329,43 @@ class AdminApiController extends Controller
 
         $this->db->update('agents', $data, 'id = ?', [$id]);
 
-        $this->json(['status' => 'ok', 'message' => 'Client updated']);
+        // Repo paths bake the server host in at creation time — when the
+        // override changes, rewrite this client's local repo paths to the new
+        // effective host, as the web does (#367).
+        if (array_key_exists('server_host_override', $data)
+            && $data['server_host_override'] !== ($agent['server_host_override'] ?? null)) {
+            $effectiveHost = $data['server_host_override'];
+            if ($effectiveHost === null) {
+                $serverHost = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
+                $effectiveHost = $serverHost['value'] ?? '';
+            }
+            $updated = \BBS\Services\SshKeyManager::rewriteAgentRepoHosts($this->db, $id, $effectiveHost);
+            if ($updated > 0) {
+                $this->db->insert('server_log', [
+                    'agent_id' => $id,
+                    'level' => 'info',
+                    'message' => "Server host override changed — updated {$updated} repository path(s)",
+                ]);
+            }
+        }
+
+        // A newly assigned owner gets access and all permissions by default,
+        // revocable in the user's profile (#337).
+        if (!empty($data['user_id']) && $data['user_id'] !== (int) ($agent['user_id'] ?? 0)) {
+            (new \BBS\Services\PermissionService())->grantOwnerDefaults($data['user_id'], $id);
+        }
+
+        $this->json(['status' => 'ok', 'message' => 'Client updated', 'updated' => array_values(array_diff(array_keys($data), ['notes_updated_by', 'notes_updated_at']))]);
     }
 
     // ── Jobs & Queue ─────────────────────────────────────
 
     public function listJobs(int $id): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
 
         $agent = $this->db->fetchOne("SELECT id FROM agents WHERE id = ?", [$id]);
         if (!$agent) {
@@ -1223,15 +2379,28 @@ class AdminApiController extends Controller
         $where = "bj.agent_id = ?";
         $params = [$id];
 
+        // Accepts one status or a comma-separated list ("completed,failed").
+        // A caller plotting finished jobs shouldn't have to over-fetch and
+        // discard: results are ordered by queued_at, so a long backlog would
+        // otherwise return queued rows ahead of the completed ones it wants.
         if ($status) {
-            $where .= " AND bj.status = ?";
-            $params[] = $status;
+            $valid = ['queued', 'sent', 'running', 'completed', 'failed', 'cancelled'];
+            $wanted = array_values(array_intersect(
+                array_map('trim', explode(',', (string) $status)),
+                $valid
+            ));
+            if (empty($wanted)) {
+                $this->json(['error' => 'status must be one or more of: ' . implode(', ', $valid)], 400);
+            }
+            $where .= " AND bj.status IN (" . implode(',', array_fill(0, count($wanted), '?')) . ")";
+            $params = array_merge($params, $wanted);
         }
 
         $jobs = $this->db->fetchAll("
             SELECT bj.id, bj.task_type, bj.status, bj.files_total, bj.files_processed,
                    bj.bytes_total, bj.bytes_processed, bj.duration_seconds,
                    bj.status_message, bj.queued_at, bj.started_at, bj.completed_at,
+                   bj.had_warnings,
                    bp.name as plan_name, r.name as repository_name
             FROM backup_jobs bj
             LEFT JOIN backup_plans bp ON bp.id = bj.backup_plan_id
@@ -1240,6 +2409,16 @@ class AdminApiController extends Controller
             ORDER BY bj.queued_at DESC
             LIMIT {$limit} OFFSET {$offset}
         ", $params);
+
+        // Cast, because PDO hands back "0" for a tinyint and a caller writing
+        // the obvious `if (job.had_warnings)` would treat that as true. This
+        // is the endpoint used to watch an install from outside, so a job that
+        // finished with warnings has to be visible without fetching each job
+        // on its own (#435). getJob() and the queue history already do this.
+        foreach ($jobs as &$job) {
+            $job['had_warnings'] = (int) $job['had_warnings'];
+        }
+        unset($job);
 
         $total = $this->db->fetchOne("SELECT COUNT(*) as cnt FROM backup_jobs bj WHERE {$where}", $params);
 
@@ -1253,7 +2432,10 @@ class AdminApiController extends Controller
 
     public function getJob(int $id, int $jobId): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Job not found'], 404);
+        }
 
         $job = $this->db->fetchOne("
             SELECT bj.*, bp.name as plan_name, r.name as repository_name
@@ -1267,12 +2449,27 @@ class AdminApiController extends Controller
             $this->json(['error' => 'Job not found'], 404);
         }
 
-        $this->json($job);
+        $this->json($job + ['dry_run_log' => $this->dryRunLogPayload($job)]);
+    }
+
+    /** For a dry run: {size, expires_at} while its full file list is kept, else null (#414). */
+    private function dryRunLogPayload(array $job): ?array
+    {
+        if (($job['task_type'] ?? '') !== 'backup_dry_run') {
+            return null;
+        }
+        $agent = $this->db->fetchOne("SELECT id, ssh_home_dir FROM agents WHERE id = ?", [$job['agent_id']]);
+        $info = \BBS\Services\DryRunLogService::info($job, $agent ?: null);
+        return $info ? [
+            'size' => $info['size'],
+            'expires_at' => gmdate('Y-m-d\TH:i:s\Z', $info['mtime'] + \BBS\Services\DryRunLogService::KEEP_SECONDS),
+        ] : null;
     }
 
     public function getQueue(): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
+        [$agentWhere, $agentParams] = $this->apiAgentWhereClause($ctx, 'a');
 
         $jobs = $this->db->fetchAll("
             SELECT bj.id, bj.task_type, bj.status, bj.status_message,
@@ -1284,11 +2481,379 @@ class AdminApiController extends Controller
             JOIN agents a ON a.id = bj.agent_id
             LEFT JOIN backup_plans bp ON bp.id = bj.backup_plan_id
             LEFT JOIN repositories r ON r.id = bj.repository_id
-            WHERE bj.status IN ('queued', 'sent', 'running')
+            WHERE bj.status IN ('queued', 'sent', 'running') AND {$agentWhere}
             ORDER BY bj.queued_at ASC
-        ");
+        ", $agentParams);
 
-        $this->json(['queue' => $jobs, 'count' => count($jobs)]);
+        // Recent history (?recent=N, default 10, cap 50) — the finished
+        // jobs the web queue page shows below the in-flight section.
+        // Cross-client ordering has to happen in SQL; the per-client jobs
+        // endpoint can't answer this without a request per client.
+        $recentN = isset($_GET['recent']) ? max(1, min(50, (int) $_GET['recent'])) : 10;
+        $recent = $this->db->fetchAll("
+            SELECT bj.id, bj.task_type, bj.status, bj.status_message,
+                   bj.queued_at, bj.started_at, bj.completed_at,
+                   bj.duration_seconds, bj.had_warnings,
+                   a.name as client_name, a.id as client_id,
+                   bp.name as plan_name, r.name as repository_name
+            FROM backup_jobs bj
+            JOIN agents a ON a.id = bj.agent_id
+            LEFT JOIN backup_plans bp ON bp.id = bj.backup_plan_id
+            LEFT JOIN repositories r ON r.id = bj.repository_id
+            WHERE bj.status IN ('completed', 'failed') AND {$agentWhere}
+            ORDER BY bj.completed_at DESC
+            LIMIT {$recentN}
+        ", $agentParams);
+        foreach ($recent as &$r) {
+            $r['id'] = (int) $r['id'];
+            $r['client_id'] = (int) $r['client_id'];
+            $r['duration_seconds'] = $r['duration_seconds'] !== null ? (int) $r['duration_seconds'] : null;
+            $r['had_warnings'] = (int) $r['had_warnings'];
+        }
+        unset($r);
+
+        // Queue slots are server-wide capacity (global); stats are scoped
+        // to the caller's agents like everything else.
+        $activeCount = $this->db->count('backup_jobs', "status IN ('sent', 'running')");
+        $maxQueue = (int) ($this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'max_queue'")['value'] ?? 4);
+
+        $stats = ['queued' => 0, 'running' => 0, 'completed_24h' => 0, 'failed_24h' => 0, 'avg_seconds_24h' => 0];
+        foreach ($this->db->fetchAll("
+            SELECT bj.status, COUNT(*) AS c FROM backup_jobs bj
+            JOIN agents a ON a.id = bj.agent_id
+            WHERE bj.status IN ('queued', 'sent', 'running') AND {$agentWhere}
+            GROUP BY bj.status", $agentParams) as $row) {
+            if ($row['status'] === 'running') {
+                $stats['running'] += (int) $row['c'];
+            } else {
+                $stats['queued'] += (int) $row['c']; // queued + sent
+            }
+        }
+        foreach ($this->db->fetchAll("
+            SELECT bj.status, COUNT(*) AS c FROM backup_jobs bj
+            JOIN agents a ON a.id = bj.agent_id
+            WHERE bj.status IN ('completed', 'failed') AND bj.completed_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+              AND {$agentWhere}
+            GROUP BY bj.status", $agentParams) as $row) {
+            $stats[$row['status'] . '_24h'] = (int) $row['c'];
+        }
+        $avg = $this->db->fetchOne("
+            SELECT ROUND(AVG(TIMESTAMPDIFF(SECOND, bj.started_at, bj.completed_at))) AS avg_sec
+            FROM backup_jobs bj
+            JOIN agents a ON a.id = bj.agent_id
+            WHERE bj.status = 'completed' AND bj.completed_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+              AND bj.started_at IS NOT NULL AND {$agentWhere}
+        ", $agentParams);
+        $stats['avg_seconds_24h'] = (int) ($avg['avg_sec'] ?? 0);
+
+        $this->json([
+            'queue' => $jobs,
+            'count' => count($jobs),
+            'recent' => $recent,
+            'slots' => ['active' => $activeCount, 'max' => $maxQueue],
+            'stats' => $stats,
+        ]);
+    }
+
+    /**
+     * GET /api/v1/dashboard — one round trip for a status screen,
+     * scoped to the caller's agents .
+     */
+    public function dashboard(): void
+    {
+        $ctx = $this->requireApiAuth();
+        [$agentWhere, $agentParams] = $this->apiAgentWhereClause($ctx, 'a');
+
+        $clients = ['total' => 0, 'online' => 0, 'offline' => 0, 'error' => 0, 'setup' => 0];
+        foreach ($this->db->fetchAll(
+            "SELECT a.status, COUNT(*) AS c FROM agents a WHERE {$agentWhere} GROUP BY a.status",
+            $agentParams
+        ) as $row) {
+            $clients[$row['status']] = (int) $row['c'];
+            $clients['total'] += (int) $row['c'];
+        }
+
+        $jobs = ['running' => 0, 'queued' => 0, 'failed_24h' => 0, 'completed_24h' => 0];
+        foreach ($this->db->fetchAll("
+            SELECT bj.status, COUNT(*) AS c FROM backup_jobs bj
+            JOIN agents a ON a.id = bj.agent_id
+            WHERE bj.status IN ('queued', 'sent', 'running') AND {$agentWhere}
+            GROUP BY bj.status", $agentParams) as $row) {
+            if ($row['status'] === 'queued') {
+                $jobs['queued'] += (int) $row['c'];
+            } else {
+                $jobs['running'] += (int) $row['c']; // running + sent
+            }
+        }
+        foreach ($this->db->fetchAll("
+            SELECT bj.status, COUNT(*) AS c FROM backup_jobs bj
+            JOIN agents a ON a.id = bj.agent_id
+            WHERE bj.status IN ('failed', 'completed') AND bj.completed_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+              AND {$agentWhere}
+            GROUP BY bj.status", $agentParams) as $row) {
+            $jobs[$row['status'] . '_24h'] = (int) $row['c'];
+        }
+
+        $storage = ['used_bytes' => 0, 'total_bytes' => 0, 'locations' => 0];
+        $storage['locations'] = (int) ($this->db->fetchOne("SELECT COUNT(*) AS c FROM storage_locations")['c'] ?? 0);
+        $defaultLoc = $this->db->fetchOne("SELECT id, path, capacity_bytes FROM storage_locations WHERE is_default = 1");
+        if ($defaultLoc) {
+            // capacityForLocation(), so a default location on a mount that
+            // can't report its own size shows nothing rather than the local
+            // cache disk's figures (#415).
+            $disk = \BBS\Services\ServerStats::capacityForLocation($defaultLoc);
+            if ($disk && $disk['used'] !== null) {
+                $storage['used_bytes'] = (int) $disk['used'];
+                $storage['total_bytes'] = (int) $disk['total'];
+            }
+        }
+
+        $active = $this->db->fetchAll("
+            SELECT bj.id, a.name AS client, a.id AS client_id, r.name AS repo,
+                   bj.task_type, bj.status,
+                   bj.bytes_processed, bj.bytes_total,
+                   bj.files_processed, bj.files_total, bj.started_at
+            FROM backup_jobs bj
+            JOIN agents a ON a.id = bj.agent_id
+            LEFT JOIN repositories r ON r.id = bj.repository_id
+            WHERE bj.status IN ('queued', 'sent', 'running') AND {$agentWhere}
+            ORDER BY bj.queued_at ASC
+        ", $agentParams);
+        foreach ($active as &$aj) {
+            foreach (['id', 'client_id', 'bytes_processed', 'bytes_total', 'files_processed', 'files_total'] as $k) {
+                $aj[$k] = (int) $aj[$k];
+            }
+        }
+        unset($aj);
+
+        // Unread notifications visible to this user: their own, plus
+        // unowned ones for agents in their scope (admins see everything).
+        if (($ctx['role'] ?? '') === 'admin') {
+            $unread = $this->db->fetchOne(
+                "SELECT COUNT(*) AS c FROM notifications WHERE read_at IS NULL AND resolved_at IS NULL"
+            );
+        } else {
+            $unread = $this->db->fetchOne("
+                SELECT COUNT(*) AS c FROM notifications n
+                LEFT JOIN agents a ON a.id = n.agent_id
+                WHERE n.read_at IS NULL AND n.resolved_at IS NULL
+                  AND (n.user_id = ? OR (n.user_id IS NULL AND n.agent_id IS NOT NULL AND {$agentWhere}))",
+                array_merge([(int) $ctx['id']], $agentParams));
+        }
+
+        // ── Backup Summary ──────────────────────────────────────────────
+        // Scoped like everything else here: a non-admin sees the totals for
+        // the clients they can reach, not the install's.
+        $arch = $this->db->fetchOne("
+            SELECT COUNT(*) AS recovery_points,
+                   COALESCE(SUM(ar.original_size), 0) AS original_bytes,
+                   COALESCE(SUM(ar.deduplicated_size), 0) AS deduplicated_bytes,
+                   MAX(ar.created_at) AS last_backup_at
+            FROM archives ar
+            JOIN repositories r ON r.id = ar.repository_id
+            JOIN agents a ON a.id = r.agent_id
+            WHERE {$agentWhere}", $agentParams) ?: [];
+
+        // "On disk" is what the repositories actually occupy, which is not the
+        // same as the sum of archive dedup sizes — compaction and pruning move
+        // one without the other. The web's tile reads repository size, so this
+        // does too.
+        $onDisk = (int) ($this->db->fetchOne("
+            SELECT COALESCE(SUM(r.size_bytes), 0) AS b
+            FROM repositories r JOIN agents a ON a.id = r.agent_id
+            WHERE {$agentWhere}", $agentParams)['b'] ?? 0);
+
+        $origBytes = (int) ($arch['original_bytes'] ?? 0);
+        $dedupBytes = (int) ($arch['deduplicated_bytes'] ?? 0);
+        $savings = 0.0;
+        if ($origBytes > 0) {
+            $savings = round((1 - $dedupBytes / $origBytes) * 100, 1);
+            // Clamped exactly as the web does (#191): rounding can reach 100
+            // while dedup is still non-zero, and "100% saved" reads as a bug.
+            if ($savings >= 100 && $dedupBytes > 0) {
+                $savings = 99.9;
+            }
+        }
+
+        $archives = [
+            'recovery_points' => (int) ($arch['recovery_points'] ?? 0),
+            'original_bytes' => $origBytes,
+            'deduplicated_bytes' => $dedupBytes,
+            'on_disk_bytes' => $onDisk,
+            'dedup_savings_percent' => $savings,
+            'last_backup_at' => $arch['last_backup_at'] ?? null,
+        ];
+
+        // ── Jobs (last 24h), one bucket per hour ────────────────────────
+        // Always 24 buckets including the empty ones: a chart with gaps is a
+        // different shape from a chart with zeroes, and every client
+        // reconstructing the missing hours would be re-deriving them against a
+        // clock it does not share with this server.
+        $rows = $this->db->fetchAll("
+            SELECT DATE_FORMAT(bj.completed_at, '%Y-%m-%d %H:00:00') AS hour,
+                   bj.task_type, bj.status, COUNT(*) AS c
+            FROM backup_jobs bj
+            JOIN agents a ON a.id = bj.agent_id
+            WHERE bj.completed_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+              AND bj.status IN ('completed', 'failed')
+              AND {$agentWhere}
+            GROUP BY hour, bj.task_type, bj.status", $agentParams);
+
+        $restoreTypes = ['restore', 'restore_mysql', 'restore_pg', 'restore_mongo', 'restore_mssql'];
+        $buckets = [];
+        foreach ($rows as $row) {
+            $h = $row['hour'];
+            $buckets[$h] ??= ['backup' => 0, 'restore' => 0, 's3_sync' => 0, 'failed' => 0];
+            $n = (int) $row['c'];
+            // A failed job is counted once, in `failed` only — the four series
+            // stack, so counting it in its type as well would overstate the bar.
+            if ($row['status'] === 'failed') {
+                $buckets[$h]['failed'] += $n;
+                continue;
+            }
+            if ($row['task_type'] === 'backup') {
+                $buckets[$h]['backup'] += $n;
+            } elseif (in_array($row['task_type'], $restoreTypes, true)) {
+                $buckets[$h]['restore'] += $n;
+            } elseif ($row['task_type'] === 's3_sync') {
+                $buckets[$h]['s3_sync'] += $n;
+            }
+        }
+
+        $jobs24h = [];
+        $hourDt = new \DateTime('now', new \DateTimeZone('UTC'));
+        for ($i = 23; $i >= 0; $i--) {
+            $h = (clone $hourDt)->modify("-{$i} hours")->format('Y-m-d H:00:00');
+            $jobs24h[] = ['hour' => $h] + ($buckets[$h] ?? ['backup' => 0, 'restore' => 0, 's3_sync' => 0, 'failed' => 0]);
+        }
+
+        $maint = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'maintenance_mode'");
+
+        // Feeds the account menu's upgrade item. Admin-only like the web
+        // badge — null for anyone else, and the client hides the item. Both
+        // numbers are sent honestly; the web shows the server update in
+        // preference to the agent count, and clients follow the same rule.
+        $updates = null;
+        if (($ctx['role'] ?? '') === 'admin') {
+            $updateService = new \BBS\Services\UpdateService();
+            $updates = [
+                'server_available' => $updateService->isUpdateAvailable(),
+                'agents_outdated' => $updateService->countOutdatedAgents(),
+            ];
+        }
+
+        $this->json([
+            'archives' => $archives,
+            'jobs_24h' => $jobs24h,
+            'clients' => $clients,
+            'jobs' => $jobs,
+            'storage' => $storage,
+            'active' => $active,
+            'notifications_unread' => (int) ($unread['c'] ?? 0),
+            'maintenance_mode' => ($maint['value'] ?? '0') === '1',
+            'updates' => $updates,
+            'generated_at' => date('c'),
+        ]);
+    }
+
+    /**
+     * GET /api/v1/server-stats
+     *
+     * Its own endpoint rather than more keys on /dashboard, for the same
+     * reason the web split them: this is the part worth polling on a short
+     * timer, and it shells out to read the system.
+     *
+     * Numbers, not formatted strings. The web endpoint formats server-side
+     * because its JavaScript only swaps text; a client that draws meters needs
+     * the figures.
+     */
+    public function serverStats(): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (($ctx['role'] ?? '') !== 'admin') {
+            $this->json(['error' => 'Admin access required'], 403);
+        }
+
+        $cpu = ServerStats::getCpuLoad();
+        $mem = ServerStats::getMemory();
+        $net = ServerStats::getNetworkThroughput();
+
+        // Byte figures per mount, rather than getPartitions()'s df-formatted
+        // strings ("4.0T"), which a client cannot do arithmetic on.
+        $partitions = [];
+        foreach (ServerStats::getPartitions() as $p) {
+            $mount = $p['mount'] ?? null;
+            if (!$mount) {
+                continue;
+            }
+            $du = ServerStats::getDiskUsage($mount);
+            $partitions[] = [
+                'mount' => $mount,
+                'used_bytes' => $du ? (int) $du['used'] : null,
+                'total_bytes' => $du ? (int) $du['total'] : null,
+                'percent' => (int) ($p['percent'] ?? ($du['percent'] ?? 0)),
+            ];
+        }
+
+        // Which mount the health card features. Same fallback the web uses —
+        // sent rather than described, so a client doesn't reimplement it and
+        // arrive somewhere else.
+        $featured = null;
+        if (\BBS\Core\Config::isHosted()) {
+            $row = $this->db->fetchOne("SELECT path FROM storage_locations WHERE is_default = 1");
+            if ($row && !empty($row['path'])) {
+                $featured = rtrim($row['path'], '/') ?: '/';
+            }
+        }
+        $mounts = array_column($partitions, 'mount');
+        if ($featured === null || !in_array($featured, $mounts, true)) {
+            foreach (['/var/bbs', '/'] as $candidate) {
+                if (in_array($candidate, $mounts, true)) {
+                    $featured = $candidate;
+                    break;
+                }
+            }
+        }
+        // A hosted default mount that df didn't list still gets measured, so
+        // the card has something to feature.
+        if ($featured !== null && !in_array($featured, $mounts, true)) {
+            $du = ServerStats::getDiskUsage($featured);
+            if ($du) {
+                $partitions[] = [
+                    'mount' => $featured,
+                    'used_bytes' => (int) $du['used'],
+                    'total_bytes' => (int) $du['total'],
+                    'percent' => (int) $du['percent'],
+                ];
+            } else {
+                $featured = $mounts[0] ?? null;
+            }
+        }
+
+        $this->json([
+            'cpu' => [
+                'percent' => (float) ($cpu['percent'] ?? 0),
+                'load_1min' => (float) ($cpu['1min'] ?? 0),
+                'cores' => (int) ($cpu['cores'] ?? 1),
+            ],
+            // null rather than 0 when memory cannot be read at all, same rule
+            // as network below: no machine has 0 bytes of RAM, so zeros could
+            // only ever mean a failed read — and they render as a believable
+            // empty gauge (#485).
+            'memory' => [
+                'percent' => $mem ? (float) $mem['percent'] : null,
+                'used_bytes' => $mem ? (int) $mem['used'] : null,
+                'total_bytes' => $mem ? (int) $mem['total'] : null,
+            ],
+            // null rather than 0 when throughput cannot be read at all, so
+            // "idle" and "unavailable" stay distinguishable.
+            'network' => [
+                'rx_bytes_per_sec' => $net ? (int) $net['rx_bps'] : null,
+                'tx_bytes_per_sec' => $net ? (int) $net['tx_bps'] : null,
+            ],
+            'partitions' => $partitions,
+            'featured_mount' => $featured,
+        ]);
     }
 
     // ── Helpers ──────────────────────────────────────────
@@ -1332,13 +2897,7 @@ class AdminApiController extends Controller
         }
 
         if ($frequency === 'weekly' && $dayOfWeek !== null) {
-            $days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-            $dayName = $days[(int) $dayOfWeek] ?? 'Monday';
-            $parts = explode(':', $firstTime);
-            $next = new \DateTime("next {$dayName}", $tz);
-            $next->setTime((int)($parts[0] ?? 0), (int)($parts[1] ?? 0));
-            $next->setTimezone($utcTz);
-            return $next->format('Y-m-d H:i:s');
+            return \BBS\Services\SchedulerService::nextWeeklyRun($dayOfWeek, $firstTime, $tz);
         }
 
         if ($frequency === 'monthly') {
@@ -1381,6 +2940,11 @@ class AdminApiController extends Controller
      */
     public function createStorageLocation(): void
     {
+        // Registering a storage path widens what the root helper will touch;
+        // on a hosted server only the platform may do it (as on the web)
+        if (\BBS\Core\Config::isHosted()) {
+            $this->requirePlatformApiToken();
+        }
         $this->requireApiToken();
         $input = $this->getJsonInput();
 
@@ -1390,6 +2954,18 @@ class AdminApiController extends Controller
 
         if ($label === '' || $path === '') {
             $this->json(['error' => 'label and path are required'], 400);
+        }
+        // Per-storage job limit (#154): null or 0 means none of its own, and
+        // more than the global Max Concurrent Jobs is refused.
+        $maxConcurrent = null;
+        if (array_key_exists('max_concurrent', $input) && $input['max_concurrent'] !== null && $input['max_concurrent'] !== '') {
+            if (!is_numeric($input['max_concurrent'])) {
+                $this->json(['error' => 'max_concurrent must be a positive integer, or null'], 422);
+            }
+            $maxConcurrent = \BBS\Services\QueueManager::parseStorageCap((string) $input['max_concurrent'], $capError);
+            if ($capError !== null) {
+                $this->json(['error' => $capError], 422);
+            }
         }
         if ($path[0] !== '/') {
             $this->json(['error' => 'path must be absolute'], 400);
@@ -1415,6 +2991,7 @@ class AdminApiController extends Controller
         $newId = $this->db->insert('storage_locations', [
             'label' => $label,
             'path' => $path,
+            'max_concurrent' => $maxConcurrent,
             'is_default' => $isDefault ? 1 : 0,
         ]);
 
@@ -1422,8 +2999,9 @@ class AdminApiController extends Controller
         // repo operations under the new path.
         (new StorageLocationController())->updateAllowedPaths();
 
-        $row = $this->db->fetchOne("SELECT id, label, path, is_default FROM storage_locations WHERE id = ?", [$newId]);
+        $row = $this->db->fetchOne("SELECT id, label, path, max_concurrent, is_default FROM storage_locations WHERE id = ?", [$newId]);
         $row['is_default'] = (bool) $row['is_default'];
+        $row['max_concurrent'] = $row['max_concurrent'] !== null ? (int) $row['max_concurrent'] : null;
         $this->json($row, 201);
     }
 
@@ -1435,20 +3013,29 @@ class AdminApiController extends Controller
      */
     public function getStorageCapacity(): void
     {
-        $this->requireApiToken();
+        // Aggregate disk numbers only — same data the dashboard storage
+        // widget shows every signed-in user, so no admin gate.
+        $this->requireApiAuth();
 
-        $loc = $this->db->fetchOne("SELECT path FROM storage_locations WHERE is_default = 1");
+        $loc = $this->db->fetchOne("SELECT id, path, capacity_bytes FROM storage_locations WHERE is_default = 1");
         if (!$loc) {
             $this->json(['error' => 'No default storage location configured'], 404);
         }
-        $disk = \BBS\Services\ServerStats::getDiskUsage($loc['path']);
-        if (!$disk) {
-            $this->json(['error' => 'Could not read disk usage for default storage'], 500);
+        $disk = \BBS\Services\ServerStats::capacityForLocation($loc);
+        if (!$disk || $disk['used'] === null) {
+            // A mount that can't report its own size and hasn't been told it:
+            // say why rather than returning the cache disk's numbers (#415).
+            $this->json([
+                'error' => 'Capacity is unknown for the default storage location',
+                'reason' => \BBS\Services\ServerStats::capacityUnknownReason($loc)
+                    ?: 'Could not read disk usage for default storage',
+            ], 409);
         }
         $this->json([
             'provisioned_bytes' => (int) $disk['total'],
             'used_bytes' => (int) $disk['used'],
             'free_bytes' => (int) $disk['free'],
+            'capacity_source' => $disk['source'],
         ]);
     }
 
@@ -1480,10 +3067,14 @@ class AdminApiController extends Controller
         }
 
         $publicKeys = [
-            's3_endpoint'    => 'endpoint',
-            's3_region'      => 'region',
-            's3_bucket'      => 'bucket',
-            's3_path_prefix' => 'path_prefix',
+            's3_endpoint'        => 'endpoint',
+            's3_region'          => 'region',
+            's3_bucket'          => 'bucket',
+            's3_path_prefix'     => 'path_prefix',
+            's3_storage_class'   => 'storage_class',
+            's3_sse_mode'        => 'sse_mode',
+            's3_sse_kms_key_id'  => 'sse_kms_key_id',
+            's3_bandwidth_limit' => 'bandwidth_limit',
         ];
         $secretKeys = [
             's3_access_key'  => 'access_key',
@@ -1495,10 +3086,24 @@ class AdminApiController extends Controller
             $row = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = ?", [$settingKey]);
             $out[$responseKey] = $row['value'] ?? null;
         }
+        // The four option fields are strings the web form defaults to "";
+        // null would read as "unknown" rather than "provider default".
+        foreach (['storage_class', 'sse_mode', 'sse_kms_key_id', 'bandwidth_limit'] as $k) {
+            $out[$k] = (string) ($out[$k] ?? '');
+        }
+        $row = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 's3_sync_server_backups'");
+        $out['sync_server_backups'] = ($row['value'] ?? '0') === '1';
+
         if ($includeSecrets) {
+            // Stored encrypted when saved from the web (or via this API
+            // now); older API saves were plaintext, which decrypt() rejects.
             foreach ($secretKeys as $settingKey => $responseKey) {
                 $row = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = ?", [$settingKey]);
-                $out[$responseKey] = $row['value'] ?? null;
+                $val = $row['value'] ?? null;
+                if (!empty($val)) {
+                    try { $val = \BBS\Services\Encryption::decrypt($val); } catch (\Exception $e) {}
+                }
+                $out[$responseKey] = $val;
             }
         }
 
@@ -1538,21 +3143,72 @@ class AdminApiController extends Controller
         }
         $input = $this->getJsonInput();
 
-        $fields = ['s3_endpoint', 's3_region', 's3_bucket', 's3_access_key', 's3_secret_key', 's3_path_prefix'];
-        $map = [
-            's3_endpoint'    => $input['endpoint']    ?? null,
-            's3_region'      => $input['region']      ?? null,
-            's3_bucket'      => $input['bucket']      ?? null,
-            's3_access_key'  => $input['access_key']  ?? null,
-            's3_secret_key'  => $input['secret_key']  ?? null,
-            's3_path_prefix' => $input['path_prefix'] ?? '',
-        ];
-
-        foreach (['s3_endpoint', 's3_region', 's3_bucket', 's3_access_key', 's3_secret_key'] as $required) {
-            if ($map[$required] === null || $map[$required] === '') {
-                $this->json(['error' => "Missing required field: " . str_replace('s3_', '', $required)], 400);
+        $endpoint = trim((string) ($input['endpoint'] ?? ''));
+        $region   = trim((string) ($input['region'] ?? ''));
+        $bucket   = trim((string) ($input['bucket'] ?? ''));
+        foreach (['endpoint' => $endpoint, 'region' => $region, 'bucket' => $bucket] as $k => $v) {
+            if ($v === '') {
+                $this->json(['error' => "Missing required field: {$k}"], 400);
             }
         }
+
+        // Same endpoint check as the web form: scheme optional, host required.
+        if (!preg_match('#^https?://#i', $endpoint)) {
+            $endpoint = 'https://' . $endpoint;
+        }
+        $parsed = parse_url($endpoint);
+        if (empty($parsed['host']) || !preg_match('/\.[a-z]{2,}$/i', $parsed['host'])) {
+            $this->json(['error' => 'endpoint must be a valid URL (e.g. https://s3.us-east-1.amazonaws.com)'], 400);
+        }
+
+        $storageClasses = ['', 'STANDARD', 'STANDARD_IA', 'ONEZONE_IA', 'INTELLIGENT_TIERING', 'GLACIER_IR', 'DEEP_ARCHIVE'];
+        $sseModes = ['', 'AES256', 'aws:kms'];
+        if (array_key_exists('storage_class', $input) && !in_array((string) $input['storage_class'], $storageClasses, true)) {
+            $this->json(['error' => 'Invalid storage_class. Valid: ' . implode(', ', array_filter($storageClasses)) . ' or "" for the provider default'], 400);
+        }
+        if (array_key_exists('sse_mode', $input) && !in_array((string) $input['sse_mode'], $sseModes, true)) {
+            $this->json(['error' => 'Invalid sse_mode. Valid: AES256, aws:kms or "" for none'], 400);
+        }
+
+        // Keys: blank or omitted means keep what is stored. A token can't
+        // read them back, so changing the bucket shouldn't cost re-typing
+        // both secrets. They are only required when nothing is stored yet.
+        $accessKey = (string) ($input['access_key'] ?? '');
+        $secretKey = (string) ($input['secret_key'] ?? '');
+        foreach (['access_key' => $accessKey, 'secret_key' => $secretKey] as $k => $v) {
+            if ($v === '') {
+                $stored = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = ?", ["s3_{$k}"]);
+                if (empty($stored['value'])) {
+                    $this->json(['error' => "Missing required field: {$k} (no {$k} is stored yet)"], 400);
+                }
+            }
+        }
+
+        $map = [
+            's3_endpoint' => $endpoint,
+            's3_region'   => $region,
+            's3_bucket'   => $bucket,
+        ];
+        // Optional fields: written only when sent, so a caller that only
+        // knows the core fields doesn't blank the rest.
+        $optional = [
+            'path_prefix'     => 's3_path_prefix',
+            'storage_class'   => 's3_storage_class',
+            'sse_mode'        => 's3_sse_mode',
+            'sse_kms_key_id'  => 's3_sse_kms_key_id',
+            'bandwidth_limit' => 's3_bandwidth_limit',
+        ];
+        foreach ($optional as $inKey => $settingKey) {
+            if (array_key_exists($inKey, $input)) {
+                $map[$settingKey] = trim((string) ($input[$inKey] ?? ''));
+            }
+        }
+        if (array_key_exists('sync_server_backups', $input)) {
+            $map['s3_sync_server_backups'] = $input['sync_server_backups'] ? '1' : '0';
+        }
+        // Encrypted at rest, as the web form stores them.
+        if ($accessKey !== '') $map['s3_access_key'] = \BBS\Services\Encryption::encrypt($accessKey);
+        if ($secretKey !== '') $map['s3_secret_key'] = \BBS\Services\Encryption::encrypt($secretKey);
 
         foreach ($map as $key => $value) {
             $existing = $this->db->fetchOne("SELECT `key` FROM settings WHERE `key` = ?", [$key]);
@@ -1564,6 +3220,28 @@ class AdminApiController extends Controller
         }
 
         $this->json(['status' => 'ok', 'fields' => array_keys($map)]);
+    }
+
+    /**
+     * POST /api/v1/s3-credentials/test
+     * Runs the web page's connection test against the stored credentials.
+     */
+    public function testS3Credentials(): void
+    {
+        if (\BBS\Core\Config::isHosted()) {
+            $this->requirePlatformApiToken();
+        } else {
+            $this->requireApiToken();
+        }
+        // Optional body fields (endpoint, region, bucket, path_prefix,
+        // access_key, secret_key) are laid over the stored credentials for
+        // the test only — check a change before saving it (#441).
+        $s3 = new \BBS\Services\S3SyncService();
+        $result = $s3->testConnection($s3->globalCredentialsWithOverrides($this->getJsonInput()));
+        if (!empty($result['success'])) {
+            $this->json(['status' => 'ok', 'message' => 'Bucket reachable']);
+        }
+        $this->json(['status' => 'error', 'error' => $result['error'] ?? 'Connection failed'], 400);
     }
 
     /**
@@ -1581,7 +3259,8 @@ class AdminApiController extends Controller
             $this->requireApiToken();
         }
 
-        $keys = ['s3_endpoint', 's3_region', 's3_bucket', 's3_access_key', 's3_secret_key', 's3_path_prefix'];
+        $keys = ['s3_endpoint', 's3_region', 's3_bucket', 's3_access_key', 's3_secret_key', 's3_path_prefix',
+                 's3_storage_class', 's3_sse_mode', 's3_sse_kms_key_id', 's3_bandwidth_limit', 's3_sync_server_backups'];
         foreach ($keys as $key) {
             $this->db->delete('settings', '`key` = ?', [$key]);
         }
@@ -1590,6 +3269,117 @@ class AdminApiController extends Controller
         );
 
         $this->json(['status' => 'ok', 'disabled_repositories' => $disabled ?? 0]);
+    }
+
+    // ── Server backups in off-site storage ─────────────────────────
+    // The server's backup of itself (database, configuration, SSH keys),
+    // as held in the S3 bucket. Not offered in hosted mode, where the
+    // platform looks after this.
+
+    private function requireServerBackupAccess(): void
+    {
+        if (\BBS\Core\Config::isHosted()) {
+            $this->json(['error' => 'Not available in hosted mode'], 404);
+        }
+        $this->requireApiToken();
+    }
+
+    /**
+     * GET /api/v1/server-backups
+     * {"backups": [{"name": "bbs-backup-2026-08-27_174304.tar.gz", "size": 1900000, "date": "2026-08-27 17:43:05"}]}
+     */
+    public function listServerBackups(): void
+    {
+        $this->requireServerBackupAccess();
+        $result = (new \BBS\Services\ServerBackupService())->listInS3();
+        if (empty($result['success'])) {
+            $this->json(['error' => $result['error'] ?? 'Failed to list backups'], 400);
+        }
+        $backups = [];
+        foreach ($result['backups'] as $b) {
+            $ts = $b['modified'] !== '' ? strtotime($b['modified']) : false;
+            $backups[] = [
+                'name' => $b['filename'],
+                'size' => (int) $b['size'],
+                'date' => $ts !== false ? date('Y-m-d H:i:s', $ts) : $b['modified'],
+            ];
+        }
+        $this->json(['backups' => $backups]);
+    }
+
+    /**
+     * POST /api/v1/server-backups
+     * Takes a server backup now and, when off-site sync of server backups
+     * is on, pushes it to the bucket. Runs to completion — there is no job
+     * for this — so allow a few minutes on a large install.
+     */
+    public function createServerBackup(): void
+    {
+        $this->requireServerBackupAccess();
+        set_time_limit(0);
+        ignore_user_abort(true);
+
+        $service = new \BBS\Services\ServerBackupService();
+        $result = $service->run();
+        if (!$result['success']) {
+            $this->db->insert('server_log', [
+                'level' => 'error',
+                'message' => 'On-demand server backup failed: ' . $result['message'],
+            ]);
+            $this->json(['status' => 'error', 'error' => $result['message']], 500);
+        }
+
+        $sync = $service->syncToS3();
+        $this->db->insert('server_log', [
+            'level' => 'info',
+            'message' => 'Server backup created on demand'
+                . ($result['filename'] ? ": {$result['filename']}" : '')
+                . ($sync['skipped'] ? '' : ' — ' . $sync['message']),
+        ]);
+
+        $this->json([
+            'status' => 'ok',
+            'name' => $result['filename'],
+            'synced' => !$sync['skipped'] && $sync['success'],
+            'sync_message' => $sync['skipped'] ? null : $sync['message'],
+            'message' => $result['message'],
+        ], 201);
+    }
+
+    /**
+     * POST /api/v1/server-backups/restore   {"name": "bbs-backup-….tar.gz", "confirm": "RESTORE"}
+     * Replaces this install's database, configuration and SSH keys with
+     * the named backup, switches maintenance mode on, and resets the admin
+     * password — which is returned once, here. The confirmation phrase is
+     * required because there is no undo.
+     */
+    public function restoreServerBackup(): void
+    {
+        $this->requireServerBackupAccess();
+        $input = $this->getJsonInput();
+
+        $name = trim((string) ($input['name'] ?? ($input['filename'] ?? '')));
+        if ($name === '') {
+            $this->json(['error' => 'name is required'], 400);
+        }
+        if (($input['confirm'] ?? '') !== 'RESTORE') {
+            $this->json(['error' => 'Restore replaces the database, configuration and SSH keys. Send "confirm": "RESTORE" to proceed.'], 400);
+        }
+
+        set_time_limit(0);
+        ignore_user_abort(true);
+
+        $result = (new \BBS\Services\ServerBackupService())->restoreFromS3($name);
+        if (!$result['success']) {
+            $code = ($result['error'] ?? '') === 'Invalid backup filename' ? 400 : 500;
+            $this->json(['status' => 'error', 'error' => $result['error'], 'output' => $result['output'] ?? null], $code);
+        }
+        $this->json([
+            'status' => 'ok',
+            'username' => $result['username'],
+            'password' => $result['password'],
+            'maintenance_mode' => true,
+        ]);
     }
 
     // ── Platform token rotation ─────────────────────────────────────
@@ -1643,7 +3433,7 @@ class AdminApiController extends Controller
      * POST /api/v1/maintenance
      * Toggle maintenance mode. Body: {"enabled": true|false}.
      * When enabled, the scheduler stops creating new jobs and the queue
-     * skips agent dispatch (server-side promotions still run).
+     * promotes nothing, server-side jobs included. Running jobs finish.
      */
     public function setMaintenance(): void
     {
@@ -1706,6 +3496,186 @@ class AdminApiController extends Controller
     }
 
     /**
+     * Resolves a repository for the /api/v1/repositories/{id}/s3-* routes:
+     * the row joined to what the restore needs from the agent, with the
+     * caller's visibility of that agent already checked.
+     */
+    private function s3RepoForCaller(array $ctx, int $repoId): array
+    {
+        $repo = $this->db->fetchOne("
+            SELECT r.*, a.name AS agent_name, a.ssh_unix_user, a.server_host_override
+            FROM repositories r
+            JOIN agents a ON a.id = r.agent_id
+            WHERE r.id = ?
+        ", [$repoId]);
+        if (!$repo || !$this->apiCanAccessAgent($ctx, (int) $repo['agent_id'])) {
+            $this->json(['error' => 'Repository not found'], 404);
+        }
+        return $repo;
+    }
+
+    /**
+     * POST /api/v1/repositories/{id}/s3-sync   {"plugin_config_id": 5}
+     * Links an S3 destination to the repository (re-enabling it if the link
+     * already exists). A repo may replicate to several destinations, so this
+     * adds rather than replaces; use DELETE to drop one.
+     */
+    public function attachRepositoryS3(int $repoId): void
+    {
+        $ctx = $this->requireApiAuth();
+        $repo = $this->s3RepoForCaller($ctx, $repoId);
+        $agentId = (int) $repo['agent_id'];
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::MANAGE_REPOS, $agentId);
+        $input = $this->getJsonInput();
+
+        $pluginConfigId = (int) ($input['plugin_config_id'] ?? 0);
+        if ($pluginConfigId <= 0) {
+            $this->json(['error' => 'plugin_config_id is required'], 400);
+        }
+        if (($repo['storage_type'] ?? 'local') !== 'local') {
+            $this->json(['error' => 'Only local repositories can be copied offsite'], 400);
+        }
+        if (!empty($repo['read_only'])) {
+            $this->json(['error' => 'This repository is a read-only copy restored from an offsite sync. Backup plans and offsite sync cannot use it.'], 409);
+        }
+
+        $pluginConfig = $this->db->fetchOne(
+            "SELECT pc.id, pc.name FROM plugin_configs pc
+             JOIN plugins p ON p.id = pc.plugin_id
+             WHERE pc.id = ? AND pc.agent_id = ? AND p.slug = 's3_sync'",
+            [$pluginConfigId, $agentId]
+        );
+        if (!$pluginConfig) {
+            $this->json(['error' => 'S3 configuration not found for this client'], 404);
+        }
+
+        $existing = $this->db->fetchOne(
+            "SELECT id FROM repository_s3_configs WHERE repository_id = ? AND plugin_config_id = ?",
+            [$repoId, $pluginConfigId]
+        );
+        if ($existing) {
+            $this->db->update('repository_s3_configs', ['enabled' => 1], 'id = ?', [$existing['id']]);
+        } else {
+            $this->db->insert('repository_s3_configs', [
+                'repository_id' => $repoId,
+                'plugin_config_id' => $pluginConfigId,
+                'enabled' => 1,
+            ]);
+        }
+        $this->db->insert('server_log', [
+            'agent_id' => $agentId,
+            'level' => 'info',
+            'message' => "Offsite sync enabled for repository \"{$repo['name']}\" to destination \"{$pluginConfig['name']}\"",
+        ]);
+
+        $this->json([
+            'id' => (int) $repo['id'],
+            'name' => $repo['name'],
+            's3_sync_enabled' => true,
+            's3_config_id' => (int) $pluginConfig['id'],
+            's3_config_name' => $pluginConfig['name'],
+        ], $existing ? 200 : 201);
+    }
+
+    /**
+     * POST /api/v1/repositories/{id}/s3-sync/run — {"plugin_config_id": N}
+     * Queues an offsite sync to that destination now (#501). 202 with the
+     * job id; 409 when one is already queued or running for it.
+     */
+    public function runRepositoryS3Sync(int $repoId): void
+    {
+        $ctx = $this->requireApiAuth();
+        $repo = $this->s3RepoForCaller($ctx, $repoId);
+        $agentId = (int) $repo['agent_id'];
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::MANAGE_REPOS, $agentId);
+        $input = $this->getJsonInput();
+        $result = (new \BBS\Services\S3SyncService())->queueSync($agentId, $repoId, (int) ($input['plugin_config_id'] ?? 0));
+        if (!$result['ok']) {
+            $this->json(['error' => $result['error'], 'job_id' => $result['job_id']], $result['code']);
+        }
+        $this->json(['status' => 'queued', 'job_id' => $result['job_id'], 'note' => $result['note']], 202);
+    }
+
+    /**
+     * DELETE /api/v1/repositories/{id}/s3-sync[?plugin_config_id=N]
+     * Removes one destination when given, all of them otherwise. Data in
+     * the bucket is left alone either way.
+     */
+    public function detachRepositoryS3(int $repoId): void
+    {
+        $ctx = $this->requireApiAuth();
+        $repo = $this->s3RepoForCaller($ctx, $repoId);
+        $agentId = (int) $repo['agent_id'];
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::MANAGE_REPOS, $agentId);
+        $input = $this->getJsonInput();
+
+        $pluginConfigId = (int) ($input['plugin_config_id'] ?? ($_GET['plugin_config_id'] ?? 0));
+        $destLabel = '';
+        if ($pluginConfigId > 0) {
+            $dest = $this->db->fetchOne(
+                "SELECT name FROM plugin_configs WHERE id = ? AND agent_id = ?",
+                [$pluginConfigId, $agentId]
+            );
+            $destLabel = $dest ? " to \"{$dest['name']}\"" : '';
+            $removed = $this->db->delete('repository_s3_configs', 'repository_id = ? AND plugin_config_id = ?', [$repoId, $pluginConfigId]);
+        } else {
+            $removed = $this->db->delete('repository_s3_configs', 'repository_id = ?', [$repoId]);
+        }
+        if ((int) $removed === 0) {
+            $this->json(['error' => 'Repository has no matching S3 destination'], 404);
+        }
+
+        $this->db->insert('server_log', [
+            'agent_id' => $agentId,
+            'level' => 'info',
+            'message' => "Offsite sync{$destLabel} disabled for repository \"{$repo['name']}\" (the copy at the destination is kept)",
+        ]);
+
+        $remaining = $this->db->fetchOne("SELECT MAX(enabled) AS enabled FROM repository_s3_configs WHERE repository_id = ?", [$repoId]);
+        $this->json([
+            'id' => (int) $repo['id'],
+            'name' => $repo['name'],
+            's3_sync_enabled' => (bool) ($remaining['enabled'] ?? 0),
+            'removed' => (int) $removed,
+        ]);
+    }
+
+    /**
+     * POST /api/v1/repositories/{id}/s3-restore
+     *   {"mode": "replace"}                              over the existing repository
+     *   {"mode": "copy", "name": "Repo-copy"}            into a new one (name optional)
+     *   plus "plugin_config_id" when several destinations are linked.
+     * 202 with the job id, like maintenance.
+     */
+    public function restoreRepositoryS3(int $repoId): void
+    {
+        $ctx = $this->requireApiAuth();
+        $repo = $this->s3RepoForCaller($ctx, $repoId);
+        $agentId = (int) $repo['agent_id'];
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::REPO_MAINTENANCE, $agentId);
+        $input = $this->getJsonInput();
+
+        $result = (new \BBS\Services\S3RestoreService())->queue(
+            $agentId, $repo,
+            (string) ($input['mode'] ?? 'replace'),
+            $input['name'] ?? ($input['copy_name'] ?? null),
+            (int) ($input['plugin_config_id'] ?? 0)
+        );
+        if (!$result['ok']) {
+            $this->json(['error' => $result['error']], $result['code']);
+        }
+        $this->json([
+            'status' => 'queued',
+            'job_id' => $result['job_id'],
+            'mode' => $result['mode'],
+            'repository_id' => $result['repository_id'],
+            'repository_name' => $result['repository_name'],
+            // A copy is created read-only (#523)
+            'read_only' => $result['mode'] === 'copy',
+        ], 202);
+    }
+
+    /**
      * GET /api/v1/repositories
      * List every repository across every client. Pass ?include_secrets=1
      * to also return the decrypted passphrase per repo — meant for
@@ -1725,16 +3695,31 @@ class AdminApiController extends Controller
         $rows = $this->db->fetchAll(
             "SELECT r.id, r.agent_id, a.name AS agent_name,
                     r.name, r.path, r.encryption, r.storage_type,
-                    r.size_bytes, r.archive_count, r.created_at,
+                    r.size_bytes, r.archive_count, r.created_at, r.read_only,
                     r.passphrase_encrypted,
                     COALESCE(rsc.enabled, 0) AS s3_sync_enabled,
-                    rsc.last_sync_at AS s3_last_sync_at
+                    rsc.last_sync_at AS s3_last_sync_at,
+                    s3c.plugin_config_id AS s3_config_id,
+                    s3c.name AS s3_config_name,
+                    COALESCE(s3c.target_type, 's3') AS s3_config_type
              FROM repositories r
              LEFT JOIN agents a ON a.id = r.agent_id
              LEFT JOIN (
                  SELECT repository_id, MAX(enabled) AS enabled, MAX(last_sync_at) AS last_sync_at
                  FROM repository_s3_configs GROUP BY repository_id
              ) rsc ON rsc.repository_id = r.id
+             LEFT JOIN (
+                 SELECT rsc2.repository_id, rsc2.plugin_config_id, pc.name,
+                        JSON_UNQUOTE(JSON_EXTRACT(pc.config, '$.target_type')) AS target_type
+                 FROM repository_s3_configs rsc2
+                 JOIN plugin_configs pc ON pc.id = rsc2.plugin_config_id
+                 WHERE rsc2.id = (
+                     SELECT rsc3.id FROM repository_s3_configs rsc3
+                     JOIN plugin_configs pc3 ON pc3.id = rsc3.plugin_config_id
+                     WHERE rsc3.repository_id = rsc2.repository_id
+                     ORDER BY pc3.name, rsc3.id LIMIT 1
+                 )
+             ) s3c ON s3c.repository_id = r.id
              ORDER BY a.name, r.name"
         );
 
@@ -1751,8 +3736,11 @@ class AdminApiController extends Controller
                 'size_bytes'      => (int) $r['size_bytes'],
                 'archive_count'   => (int) $r['archive_count'],
                 'created_at'      => $r['created_at'],
+                'read_only'       => (bool) $r['read_only'],
                 's3_sync_enabled' => (bool) $r['s3_sync_enabled'],
                 's3_last_sync_at' => $r['s3_last_sync_at'],
+                's3_config_id'    => $r['s3_config_id'] !== null ? (int) $r['s3_config_id'] : null,
+                's3_config_name'  => $r['s3_config_name'],
             ];
             if ($includeSecrets) {
                 $repo['passphrase'] = null;
@@ -1799,6 +3787,7 @@ class AdminApiController extends Controller
             'email'         => $row['email'],
             'role'          => $row['role'],
             'all_clients'   => (bool) $row['all_clients'],
+            'can_create_clients' => (bool) ($row['can_create_clients'] ?? false),
             'auth_provider' => $row['auth_provider'] ?? 'local',
             'oidc_status'   => $row['oidc_status'] ?? 'active',
             'totp_enabled'  => (bool) ($row['totp_enabled'] ?? false),
@@ -1872,7 +3861,7 @@ class AdminApiController extends Controller
 
     /**
      * PUT /api/v1/users/{id}
-     * Body: any of email / password / role / all_clients / timezone / time_format.
+     * Body: any of email / password / role / all_clients / can_create_clients / timezone / time_format.
      * username changes are NOT supported via this endpoint (creates session
      * inconsistency for the in-flight user; do it via the UI if you really
      * need to). Pass reset_totp:true to clear the user's 2FA secret.
@@ -1920,6 +3909,9 @@ class AdminApiController extends Controller
         }
         if (isset($input['all_clients'])) {
             $updates['all_clients'] = $input['all_clients'] ? 1 : 0;
+        }
+        if (isset($input['can_create_clients'])) {
+            $updates['can_create_clients'] = $input['can_create_clients'] ? 1 : 0;
         }
         if (isset($input['timezone'])) {
             $updates['timezone'] = (string) $input['timezone'];
@@ -1978,7 +3970,7 @@ class AdminApiController extends Controller
      */
     public function listLog(): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
 
         $level   = $_GET['level'] ?? null;
         $agentId = isset($_GET['agent_id']) ? (int) $_GET['agent_id'] : null;
@@ -1988,6 +3980,13 @@ class AdminApiController extends Controller
 
         $where  = [];
         $params = [];
+        // Non-admin callers only see log entries for agents they can access
+        // (server-wide rows with no agent are admin-only).
+        if (($ctx['role'] ?? '') !== 'admin') {
+            [$agentWhere, $agentParams] = $this->apiAgentWhereClause($ctx, 'a');
+            $where[] = "(a.id IS NOT NULL AND {$agentWhere})";
+            $params = array_merge($params, $agentParams);
+        }
         if ($level !== null && in_array($level, ['info', 'warning', 'error'], true)) {
             $where[] = "l.level = ?";
             $params[] = $level;
@@ -2003,7 +4002,7 @@ class AdminApiController extends Controller
         $whereSql = !empty($where) ? ('WHERE ' . implode(' AND ', $where)) : '';
 
         $total = (int) ($this->db->fetchOne(
-            "SELECT COUNT(*) AS c FROM server_log l {$whereSql}",
+            "SELECT COUNT(*) AS c FROM server_log l LEFT JOIN agents a ON a.id = l.agent_id {$whereSql}",
             $params
         )['c'] ?? 0);
 
@@ -2035,7 +4034,8 @@ class AdminApiController extends Controller
      */
     public function listSchedules(): void
     {
-        $this->requireApiToken();
+        $ctx = $this->requireApiAuth();
+        [$agentWhere, $agentParams] = $this->apiAgentWhereClause($ctx, 'a');
 
         $rows = $this->db->fetchAll(
             "SELECT bp.id AS plan_id, bp.name AS plan_name, bp.enabled AS plan_enabled,
@@ -2054,7 +4054,9 @@ class AdminApiController extends Controller
              JOIN agents a ON a.id = bp.agent_id
              JOIN repositories r ON r.id = bp.repository_id
              LEFT JOIN schedules s ON s.backup_plan_id = bp.id
-             ORDER BY a.name, bp.name"
+             WHERE {$agentWhere}
+             ORDER BY a.name, bp.name",
+            $agentParams
         );
 
         foreach ($rows as &$r) {
@@ -2063,11 +4065,2051 @@ class AdminApiController extends Controller
             $r['repository_id']   = (int) $r['repository_id'];
             $r['plan_enabled']    = (bool) $r['plan_enabled'];
             $r['schedule_enabled']= isset($r['schedule_enabled']) ? (bool) $r['schedule_enabled'] : null;
-            $r['day_of_week']     = isset($r['day_of_week']) && $r['day_of_week'] !== null
-                                    ? (int) $r['day_of_week'] : null;
+            // day_of_week stays a single int (the first day) for older app
+            // builds; days_of_week carries the full list.
+            $r['days_of_week']    = \BBS\Services\SchedulerService::parseDaysOfWeek($r['day_of_week'] ?? '');
+            $r['day_of_week']     = $r['days_of_week'][0] ?? null;
         }
         unset($r);
 
         $this->json(['schedules' => $rows]);
+    }
+
+    /**
+     * GET /api/v1/schedules/day?date=YYYY-MM-DD&client_id=N
+     *
+     * A schedules screen: one day of concrete occurrences for the
+     * whole server — what already ran and what is still coming — plus the
+     * Mon–Sun day-picker counts for the surrounding week.
+     *
+     * This is ScheduleController::week() cut to a single day and returned as
+     * JSON. The caller does no timezone arithmetic: minute_of_day, time_label
+     * and now_minute are all pre-resolved into the caller's timezone, because
+     * the app's runtime ships a trimmed Intl with no usable TimeZone support.
+     */
+    public function schedulesDay(): void
+    {
+        $ctx = $this->requireApiAuth();
+
+        // The caller's display preferences drive every pre-formatted field.
+        // $ctx carries no session, so read them off the user row.
+        $prefs = $this->db->fetchOne(
+            "SELECT timezone, time_format FROM users WHERE id = ?",
+            [(int) $ctx['id']]
+        ) ?: [];
+        $tzName = $prefs['timezone'] ?: 'America/New_York';
+        try {
+            $viewerTz = new \DateTimeZone($tzName);
+        } catch (\Exception $e) {
+            $tzName = 'UTC';
+            $viewerTz = new \DateTimeZone('UTC');
+        }
+        $timeFormat = ($prefs['time_format'] ?? '12h') === '24h' ? '24h' : '12h';
+        $is24h = $timeFormat === '24h';
+        $utc = new \DateTimeZone('UTC');
+
+        $today = (new \DateTime('now', $viewerTz))->format('Y-m-d');
+        $date = isset($_GET['date']) ? trim((string) $_GET['date']) : '';
+        if ($date === '') {
+            $date = $today;
+        }
+        $parsed = \DateTime::createFromFormat('!Y-m-d', $date, $viewerTz);
+        if (!$parsed || $parsed->format('Y-m-d') !== $date) {
+            $this->json(['error' => 'date must be a valid YYYY-MM-DD value'], 400);
+        }
+
+        $clientId = isset($_GET['client_id']) && $_GET['client_id'] !== ''
+            ? (int) $_GET['client_id'] : null;
+
+        // Monday–Sunday week containing $date, in the caller's timezone.
+        $weekStart = (clone $parsed)->modify('monday this week');
+        $weekDates = [];
+        for ($i = 0; $i < 7; $i++) {
+            $weekDates[] = (clone $weekStart)->modify("+{$i} days")->format('Y-m-d');
+        }
+
+        [$agentWhere, $agentParams] = $this->apiAgentWhereClause($ctx, 'a');
+
+        $schedules = $this->db->fetchAll("
+            SELECT s.id, s.backup_plan_id, s.frequency, s.times, s.day_of_week,
+                   s.day_of_month, s.timezone,
+                   bp.name AS plan_name, bp.repository_id,
+                   r.name AS repository_name,
+                   a.id AS agent_id, a.name AS agent_name
+            FROM schedules s
+            JOIN backup_plans bp ON bp.id = s.backup_plan_id
+            JOIN agents a ON a.id = bp.agent_id
+            LEFT JOIN repositories r ON r.id = bp.repository_id
+            WHERE s.enabled = 1 AND bp.enabled = 1 AND {$agentWhere}
+            ORDER BY a.name, bp.name
+        ", $agentParams);
+
+        // Median duration per plan from the last 10 successful backups, same
+        // bounded query the web week view uses.
+        $planIds = array_values(array_unique(array_map(
+            fn($s) => (int) $s['backup_plan_id'], $schedules
+        )));
+        $durations = [];
+        if (!empty($planIds)) {
+            $placeholders = implode(',', array_fill(0, count($planIds), '?'));
+            $rows = $this->db->fetchAll("
+                SELECT backup_plan_id, duration_seconds
+                FROM (
+                    SELECT backup_plan_id, duration_seconds,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY backup_plan_id
+                               ORDER BY completed_at DESC
+                           ) AS rn
+                    FROM backup_jobs
+                    WHERE backup_plan_id IN ({$placeholders})
+                      AND status = 'completed' AND task_type = 'backup'
+                      AND duration_seconds IS NOT NULL AND duration_seconds > 0
+                      AND completed_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+                ) ranked
+                WHERE rn <= 10
+            ", $planIds);
+            $byPlan = [];
+            foreach ($rows as $r) {
+                $byPlan[(int) $r['backup_plan_id']][] = (int) $r['duration_seconds'];
+            }
+            foreach ($byPlan as $pid => $ds) {
+                sort($ds);
+                $durations[$pid] = $ds[(int) (count($ds) / 2)];
+            }
+        }
+
+        // Expand every non-interval schedule into concrete occurrences.
+        // Occurrences are bucketed by their date in the CALLER's timezone, so
+        // a schedule running in another timezone lands on the day the user
+        // actually sees it — including when the conversion crosses midnight.
+        $intervalFreqs = ['10min', '15min', '30min', 'hourly'];
+        $byDate = array_fill_keys($weekDates, []);
+        $intervalSchedules = [];
+        $clients = [];
+
+        // Walk a day either side of the week so a timezone shift can pull an
+        // occurrence into the window from the adjacent day.
+        $scanStart = (clone $weekStart)->modify('-1 day');
+
+        foreach ($schedules as $s) {
+            $agentId = (int) $s['agent_id'];
+            $clients[$agentId] = $s['agent_name'];
+
+            if (in_array($s['frequency'], $intervalFreqs, true)) {
+                if ($clientId === null || $agentId === $clientId) {
+                    $intervalSchedules[] = [
+                        'plan_id' => (int) $s['backup_plan_id'],
+                        'plan_name' => $s['plan_name'],
+                        'client_id' => $agentId,
+                        'client_name' => $s['agent_name'],
+                        'frequency' => $s['frequency'],
+                    ];
+                }
+                continue;
+            }
+
+            $timeList = array_values(array_filter(array_map('trim', explode(',', $s['times'] ?? ''))));
+            if (empty($timeList)) {
+                continue;
+            }
+
+            try {
+                $schedTz = new \DateTimeZone($s['timezone'] ?: 'UTC');
+            } catch (\Exception $e) {
+                $schedTz = $utc;
+            }
+
+            $planId = (int) $s['backup_plan_id'];
+            $durSec = $durations[$planId] ?? 15 * 60;
+
+            for ($d = 0; $d < 9; $d++) {
+                $day = (clone $scanStart)->modify("+{$d} days");
+                // Frequency is evaluated against the schedule's own calendar day.
+                $dayInSchedTz = \DateTime::createFromFormat(
+                    '!Y-m-d', $day->format('Y-m-d'), $schedTz
+                );
+                if (!$dayInSchedTz || !$this->scheduleFiresOn($s, $dayInSchedTz)) {
+                    continue;
+                }
+
+                foreach ($timeList as $t) {
+                    $parts = explode(':', $t);
+                    $occ = (clone $dayInSchedTz)->setTime((int) ($parts[0] ?? 0), (int) ($parts[1] ?? 0));
+                    $local = (clone $occ)->setTimezone($viewerTz);
+                    $localDate = $local->format('Y-m-d');
+                    if (!isset($byDate[$localDate])) {
+                        continue;
+                    }
+
+                    $minuteOfDay = ((int) $local->format('G')) * 60 + (int) $local->format('i');
+                    $byDate[$localDate][] = [
+                        'key' => $planId . '@' . $localDate . 'T' . $local->format('H:i'),
+                        'plan_id' => $planId,
+                        'plan_name' => $s['plan_name'],
+                        'client_id' => $agentId,
+                        'client_name' => $s['agent_name'],
+                        'repository_name' => $s['repository_name'],
+                        'frequency' => $s['frequency'],
+                        'minute_of_day' => $minuteOfDay,
+                        'time_label' => $is24h ? $local->format('H:i') : $local->format('g:i A'),
+                        'scheduled_at' => (clone $occ)->setTimezone($utc)->format('Y-m-d H:i:s'),
+                        'estimated_duration_seconds' => (int) $durSec,
+                        'duration_estimated' => !isset($durations[$planId]),
+                        'state' => 'upcoming',
+                        'had_warnings' => 0,
+                        'job_id' => null,
+                        'started_at' => null,
+                        'completed_at' => null,
+                        'duration_seconds' => null,
+                    ];
+                }
+            }
+        }
+
+        // Day-picker chips count the whole week and are deliberately NOT
+        // narrowed by client_id — the chips must not move as the filter does.
+        $days = [];
+        foreach ($weekDates as $wd) {
+            $days[] = [
+                'date' => $wd,
+                'weekday' => \DateTime::createFromFormat('!Y-m-d', $wd, $viewerTz)->format('D'),
+                'count' => count($byDate[$wd]),
+                'is_today' => $wd === $today,
+            ];
+        }
+
+        $occurrences = $byDate[$date] ?? [];
+        if ($clientId !== null) {
+            $occurrences = array_values(array_filter(
+                $occurrences,
+                fn($o) => $o['client_id'] === $clientId
+            ));
+        }
+        usort($occurrences, fn($a, $b) => $a['minute_of_day'] <=> $b['minute_of_day']);
+
+        $occurrences = $this->attachJobsToOccurrences($occurrences, $date, $viewerTz);
+
+        $clientList = [];
+        foreach ($clients as $id => $name) {
+            $clientList[] = ['id' => $id, 'name' => $name];
+        }
+        usort($clientList, fn($a, $b) => strcasecmp($a['name'], $b['name']));
+
+        $isToday = $date === $today;
+        $nowLocal = new \DateTime('now', $viewerTz);
+
+        $this->json([
+            'date' => $date,
+            'timezone' => $tzName,
+            'time_format' => $timeFormat,
+            'is_today' => $isToday,
+            'now_minute' => $isToday
+                ? ((int) $nowLocal->format('G')) * 60 + (int) $nowLocal->format('i')
+                : null,
+            'days' => $days,
+            'clients' => $clientList,
+            'occurrences' => $occurrences,
+            'interval_schedules' => $intervalSchedules,
+        ]);
+    }
+
+    /**
+     * Does a daily/weekly/monthly schedule fire on this calendar day?
+     * $day is midnight of the candidate day in the schedule's own timezone.
+     */
+    private function scheduleFiresOn(array $schedule, \DateTime $day): bool
+    {
+        switch ($schedule['frequency']) {
+            case 'daily':
+                return true;
+            case 'weekly':
+                // Schema stores day_of_week as 0=Sunday, matching PHP's `w`.
+                return in_array((int) $day->format('w'), \BBS\Services\SchedulerService::parseDaysOfWeek($schedule['day_of_week'] ?? '') ?: [1], true);
+            case 'monthly':
+                return (int) ($schedule['day_of_month'] ?? 0) === (int) $day->format('j');
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Resolve each occurrence's state by matching it to a real backup job.
+     *
+     * Same "nearest block" idea the web week view uses: a job belongs to the
+     * occurrence of its plan whose scheduled time is closest to when the job
+     * was queued or started. Pairs are assigned closest-first so two runs of
+     * the same plan on one day can't both claim the same block.
+     */
+    private function attachJobsToOccurrences(array $occurrences, string $date, \DateTimeZone $viewerTz): array
+    {
+        if (empty($occurrences)) {
+            return $occurrences;
+        }
+
+        $planIds = array_values(array_unique(array_map(fn($o) => $o['plan_id'], $occurrences)));
+        $placeholders = implode(',', array_fill(0, count($planIds), '?'));
+
+        // The day in the caller's timezone, as the naive UTC bounds the
+        // backup_jobs timestamps are stored in.
+        $dayStart = \DateTime::createFromFormat('!Y-m-d', $date, $viewerTz);
+        $dayEnd = (clone $dayStart)->modify('+1 day');
+        $fromUtc = (clone $dayStart)->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d H:i:s');
+        $toUtc = (clone $dayEnd)->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d H:i:s');
+
+        $jobs = $this->db->fetchAll(
+            "SELECT id, backup_plan_id, status, had_warnings, queued_at, started_at,
+                    completed_at, duration_seconds
+             FROM backup_jobs
+             WHERE backup_plan_id IN ({$placeholders})
+               AND task_type = 'backup'
+               AND COALESCE(started_at, queued_at) >= ?
+               AND COALESCE(started_at, queued_at) < ?
+             ORDER BY id ASC",
+            array_merge($planIds, [$fromUtc, $toUtc])
+        );
+
+        if (empty($jobs)) {
+            return $this->markUnmatchedStates($occurrences);
+        }
+
+        // Score every plausible (occurrence, job) pair, then assign the
+        // closest pairs first so each side is used at most once.
+        $pairs = [];
+        foreach ($jobs as $ji => $job) {
+            $jobTs = strtotime($job['started_at'] ?: $job['queued_at'] ?: '') ?: 0;
+            foreach ($occurrences as $oi => $occ) {
+                if ($occ['plan_id'] !== (int) $job['backup_plan_id']) {
+                    continue;
+                }
+                $pairs[] = [
+                    'distance' => abs($jobTs - (strtotime($occ['scheduled_at'] . ' UTC') ?: 0)),
+                    'job' => $ji,
+                    'occ' => $oi,
+                ];
+            }
+        }
+        usort($pairs, fn($a, $b) => $a['distance'] <=> $b['distance']);
+
+        $usedJobs = [];
+        $usedOccs = [];
+        foreach ($pairs as $pair) {
+            if (isset($usedJobs[$pair['job']]) || isset($usedOccs[$pair['occ']])) {
+                continue;
+            }
+            $usedJobs[$pair['job']] = true;
+            $usedOccs[$pair['occ']] = true;
+
+            $job = $jobs[$pair['job']];
+            $status = $job['status'];
+            $occurrences[$pair['occ']] = array_merge($occurrences[$pair['occ']], [
+                // 'sent' is an in-flight queue state the app doesn't model.
+                'state' => $status === 'sent' ? 'queued' : $status,
+                'job_id' => (int) $job['id'],
+                'had_warnings' => (int) $job['had_warnings'],
+                'started_at' => $job['started_at'],
+                'completed_at' => $job['completed_at'],
+                'duration_seconds' => $job['duration_seconds'] !== null
+                    ? (int) $job['duration_seconds'] : null,
+            ]);
+        }
+
+        return $this->markUnmatchedStates($occurrences);
+    }
+
+    /**
+     * Occurrences with no job are either still to come or were never run.
+     */
+    private function markUnmatchedStates(array $occurrences): array
+    {
+        $now = time();
+        foreach ($occurrences as &$occ) {
+            if ($occ['job_id'] !== null) {
+                continue;
+            }
+            $scheduledTs = strtotime($occ['scheduled_at'] . ' UTC') ?: 0;
+            $occ['state'] = $scheduledTs > $now ? 'upcoming' : 'missed';
+        }
+        unset($occ);
+
+        return $occurrences;
+    }
+
+    // ── Notifications ─────────────────────────────────────
+
+    /**
+     * GET /api/v1/notifications?limit=N&offset=N
+     * Same visibility rules as the web bell: global notifications, the
+     * caller's own, and agent-scoped ones for agents they can access.
+     */
+    public function listNotifications(): void
+    {
+        $ctx = $this->requireApiAuth();
+        $limit = isset($_GET['limit']) ? max(1, min(200, (int) $_GET['limit'])) : 50;
+        $offset = isset($_GET['offset']) ? max(0, (int) $_GET['offset']) : 0;
+
+        $service = new \BBS\Services\NotificationService();
+        $rows = $service->getAll($limit, $offset, (int) $ctx['id']);
+        foreach ($rows as &$n) {
+            $n['id'] = (int) $n['id'];
+            $n['agent_id'] = $n['agent_id'] !== null ? (int) $n['agent_id'] : null;
+            $n['occurrence_count'] = (int) $n['occurrence_count'];
+            $n['read'] = $n['read_at'] !== null;
+            $n['resolved'] = $n['resolved_at'] !== null;
+        }
+        unset($n);
+
+        $this->json([
+            'notifications' => $rows,
+            'unread' => $service->unreadCount((int) $ctx['id']),
+            'limit' => $limit,
+            'offset' => $offset,
+        ]);
+    }
+
+    /** POST /api/v1/notifications/{id}/read */
+    public function markNotificationRead(int $id): void
+    {
+        $ctx = $this->requireApiAuth();
+        $service = new \BBS\Services\NotificationService();
+        $service->markRead($id, (int) $ctx['id']);
+        $this->json(['status' => 'ok', 'unread' => $service->unreadCount((int) $ctx['id'])]);
+    }
+
+    /** POST /api/v1/notifications/read-all */
+    public function markAllNotificationsRead(): void
+    {
+        $ctx = $this->requireApiAuth();
+        $service = new \BBS\Services\NotificationService();
+        $service->markAllRead((int) $ctx['id']);
+        $this->json(['status' => 'ok', 'unread' => 0]);
+    }
+
+    // ── Jobs by id / queue actions ────────────────────────
+
+    /**
+     * GET /api/v1/jobs/{id} — job detail + live progress without needing
+     * the client id first (the queue list links straight here).
+     *
+     * The job row stays FLAT at the top level (the shape shipped in
+     * v2.73.0 — nesting it would be a breaking change); the detail extras
+     * ride as sibling keys: logs, queue {active,max,position},
+     * current_file, prune_stats. Mirrors QueueController::detailJson().
+     */
+    /** A dry run job and its client the caller can see, or a 404. */
+    private function apiDryRunJob(array $ctx, int $jobId): array
+    {
+        $job = $this->db->fetchOne(
+            "SELECT id, agent_id, task_type FROM backup_jobs WHERE id = ? AND task_type = 'backup_dry_run'",
+            [$jobId]
+        );
+        if (!$job || !$this->apiCanAccessAgent($ctx, (int) $job['agent_id'])) {
+            $this->json(['error' => 'Dry run job not found'], 404);
+        }
+        $agent = $this->db->fetchOne("SELECT id, ssh_home_dir FROM agents WHERE id = ?", [$job['agent_id']]);
+        return [$job, $agent ?: null];
+    }
+
+    /**
+     * GET /api/v1/queue/{id}/dry-run-log
+     * The dry run's full file list as text/plain, one "included <path>" or
+     * "excluded <path>" per line (#414). 404 once deleted or a day old.
+     */
+    public function getDryRunLog(int $id): void
+    {
+        $ctx = $this->requireApiAuth();
+        [$job, $agent] = $this->apiDryRunJob($ctx, $id);
+        $fh = \BBS\Services\DryRunLogService::open($job, $agent);
+        if (!$fh) {
+            $this->json(['error' => 'No file list for this dry run. Lists are kept for one day.'], 404);
+        }
+        \BBS\Services\DryRunLogService::send($fh, $id);
+    }
+
+    /**
+     * DELETE /api/v1/queue/{id}/dry-run-log
+     * Deletes that list and nothing else. Needs Trigger Backup.
+     */
+    public function deleteDryRunLog(int $id): void
+    {
+        $ctx = $this->requireApiAuth();
+        [$job, $agent] = $this->apiDryRunJob($ctx, $id);
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::TRIGGER_BACKUP, (int) $job['agent_id']);
+        $deleted = \BBS\Services\DryRunLogService::delete($job, $agent);
+        if ($deleted) {
+            $this->db->insert('server_log', [
+                'agent_id' => $job['agent_id'],
+                'backup_job_id' => $id,
+                'level' => 'info',
+                'message' => 'Dry run file list deleted via API',
+            ]);
+        }
+        $this->json(['deleted' => $deleted]);
+    }
+
+    public function getJobById(int $jobId): void
+    {
+        $ctx = $this->requireApiAuth();
+
+        $job = $this->db->fetchOne("
+            SELECT bj.*, a.name AS client_name, a.id AS client_id,
+                   a.status AS client_status, a.last_heartbeat AS client_last_heartbeat,
+                   bp.name AS plan_name, r.name AS repository_name
+            FROM backup_jobs bj
+            JOIN agents a ON a.id = bj.agent_id
+            LEFT JOIN backup_plans bp ON bp.id = bj.backup_plan_id
+            LEFT JOIN repositories r ON r.id = bj.repository_id
+            WHERE bj.id = ?
+        ", [$jobId]);
+
+        if (!$job || !$this->apiCanAccessAgent($ctx, (int) $job['agent_id'])) {
+            $this->json(['error' => 'Job not found'], 404);
+        }
+
+        // Activity log for this job
+        $logs = $this->db->fetchAll("
+            SELECT id, level, message, created_at FROM server_log
+            WHERE backup_job_id = ?
+            ORDER BY created_at ASC, id ASC
+        ", [$jobId]);
+        foreach ($logs as &$l) {
+            $l['id'] = (int) $l['id'];
+        }
+        unset($l);
+
+        // Queue slots are a server-wide resource, so active/max are global;
+        // position is this job's place in the queued line.
+        $activeCount = $this->db->count('backup_jobs', "status IN ('sent', 'running')");
+        $maxQueue = (int) ($this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'max_queue'")['value'] ?? 4);
+        $queuePosition = null;
+        if ($job['status'] === 'queued') {
+            $pos = $this->db->fetchOne(
+                "SELECT COUNT(*) as cnt FROM backup_jobs WHERE status = 'queued' AND queued_at <= ?",
+                [$job['queued_at']]
+            );
+            $queuePosition = (int) $pos['cnt'];
+        }
+
+        // Current file for a running backup — tail of the agent's catalog log
+        $currentFile = null;
+        if ($job['status'] === 'running' && $job['task_type'] === 'backup') {
+            $jobAgent = $this->db->fetchOne("SELECT ssh_home_dir FROM agents WHERE id = ?", [$job['agent_id']]);
+            if ($jobAgent && !empty($jobAgent['ssh_home_dir'])) {
+                $catalogPath = $jobAgent['ssh_home_dir'] . '/.catalog-logs/catalog-' . $jobId . '.jsonl';
+                if (file_exists($catalogPath)) {
+                    $currentFile = $this->currentCatalogFile($catalogPath);
+                }
+            }
+        }
+
+        $pruneStats = null;
+        if ($job['task_type'] === 'prune') {
+            $pruneStats = \BBS\Controllers\QueueController::parsePruneStats($logs);
+        }
+
+        $this->json($job + [
+            'logs' => $logs,
+            'queue' => ['active' => $activeCount, 'max' => $maxQueue, 'position' => $queuePosition],
+            'current_file' => $currentFile,
+            'prune_stats' => $pruneStats,
+            'dry_run_log' => $this->dryRunLogPayload($job),
+        ]);
+    }
+
+    /**
+     * POST /api/v1/queue/{id}/cancel — mirrors the web queue's cancel,
+     * including the automatic break-lock cleanup job.
+     */
+    public function cancelQueueJob(int $id): void
+    {
+        $ctx = $this->requireApiAuth();
+
+        $job = $this->db->fetchOne("SELECT * FROM backup_jobs WHERE id = ?", [$id]);
+        if (!$job || !$this->apiCanAccessAgent($ctx, (int) $job['agent_id'])) {
+            $this->json(['error' => 'Job not found'], 404);
+        }
+        if (!in_array($job['status'], ['queued', 'sent', 'running'])) {
+            $this->json(['error' => 'Job cannot be cancelled (status: ' . $job['status'] . ')'], 409);
+        }
+        if (!$this->apiHasPermission($ctx, \BBS\Services\PermissionService::TRIGGER_BACKUP, (int) $job['agent_id'])) {
+            $this->json(['error' => 'You do not have permission to cancel jobs on this client'], 403);
+        }
+
+        $this->db->update('backup_jobs', [
+            'status' => 'cancelled',
+            'error_log' => 'Cancelled by user',
+            'completed_at' => date('Y-m-d H:i:s'),
+        ], 'id = ?', [$id]);
+
+        $this->db->insert('server_log', [
+            'agent_id' => $job['agent_id'],
+            'backup_job_id' => $id,
+            'level' => 'warning',
+            'message' => "Job #{$id} cancelled by user (API)",
+        ]);
+
+        // Auto-queue a break-lock to clean up any stale borg lock
+        if ($job['repository_id'] && in_array($job['task_type'], ['backup', 'restore', 'restore_mysql', 'restore_pg', 'restore_mongo', 'restore_mssql'])) {
+            $this->db->insert('backup_jobs', [
+                'agent_id' => $job['agent_id'],
+                'repository_id' => $job['repository_id'],
+                'task_type' => 'break_lock',
+                'status' => 'queued',
+            ]);
+        }
+
+        $this->json(['status' => 'ok', 'message' => "Job #{$id} cancelled"]);
+    }
+
+    /**
+     * POST /api/v1/queue/{id}/retry — requeue a failed job.
+     */
+    public function retryQueueJob(int $id): void
+    {
+        $ctx = $this->requireApiAuth();
+
+        $job = $this->db->fetchOne("SELECT * FROM backup_jobs WHERE id = ?", [$id]);
+        if (!$job || !$this->apiCanAccessAgent($ctx, (int) $job['agent_id'])) {
+            $this->json(['error' => 'Job not found'], 404);
+        }
+        if ($job['status'] !== 'failed') {
+            $this->json(['error' => 'Only failed jobs can be retried'], 409);
+        }
+        if (!$this->apiHasPermission($ctx, \BBS\Services\PermissionService::forTaskType((string) $job['task_type']), (int) $job['agent_id'])) {
+            $this->json(['error' => 'You do not have permission to retry jobs on this client'], 403);
+        }
+
+        $newJobId = $this->db->insert('backup_jobs', [
+            'agent_id' => $job['agent_id'],
+            'backup_plan_id' => $job['backup_plan_id'],
+            'repository_id' => $job['repository_id'],
+            'task_type' => $job['task_type'],
+            'status' => 'queued',
+            'queued_at' => date('Y-m-d H:i:s'),
+            'restore_archive_id' => $job['restore_archive_id'],
+            'restore_paths' => $job['restore_paths'],
+            'restore_destination' => $job['restore_destination'],
+            'restore_databases' => $job['restore_databases'],
+        ]);
+
+        $this->db->insert('server_log', [
+            'agent_id' => $job['agent_id'],
+            'backup_job_id' => $newJobId,
+            'level' => 'info',
+            'message' => "Job #{$newJobId} queued (retry of #{$id}, API)",
+        ]);
+
+        $this->json(['status' => 'ok', 'job_id' => (int) $newJobId, 'message' => "Job #{$id} retried as #{$newJobId}"]);
+    }
+
+    // ── Catalog browse + restore ──────────────────────────
+
+    /**
+     * GET /api/v1/clients/{id}/repositories/{repoId}/archives/{archiveId}/files
+     * Paginated catalog browse. Query: path (default /), limit (default 200,
+     * max 1000), cursor (opaque, from the previous page). Directories are
+     * returned on the first page only; files paginate via keyset cursor —
+     * archives hold millions of rows, so no OFFSET scans.
+     */
+    public function listArchiveFiles(int $id, int $repoId, int $archiveId): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+
+        $archive = $this->db->fetchOne("
+            SELECT ar.id FROM archives ar
+            JOIN repositories r ON r.id = ar.repository_id
+            WHERE ar.id = ? AND ar.repository_id = ? AND r.agent_id = ?
+        ", [$archiveId, $repoId, $id]);
+        if (!$archive) {
+            $this->json(['error' => 'Archive not found'], 404);
+        }
+
+        $ch = \BBS\Core\ClickHouse::getInstance();
+        if (!$ch->isAvailable()) {
+            // Reported as state rather than an error: "unavailable" and "this
+            // archive has nothing in it" must not look the same to a caller.
+            $this->json([
+                'path' => (string) ($_GET['path'] ?? ''),
+                'dirs' => [], 'files' => [], 'next_cursor' => null,
+                'catalog' => ['status' => 'unavailable', 'synced_at' => null],
+            ]);
+        }
+
+        $prefix = $_GET['path'] ?? '/';
+        if ($prefix !== '/' && !str_ends_with($prefix, '/')) {
+            $prefix .= '/';
+        }
+        $parentDir = $prefix === '/' ? '/' : rtrim($prefix, '/');
+        $limit = isset($_GET['limit']) ? max(1, min(1000, (int) $_GET['limit'])) : 200;
+        $cursor = $_GET['cursor'] ?? '';
+        $afterName = '';
+        if ($cursor !== '') {
+            $decoded = base64_decode($cursor, true);
+            if ($decoded === false) {
+                $this->json(['error' => 'Invalid cursor'], 400);
+            }
+            $afterName = $decoded;
+        }
+
+        // Directories only on the first page — they're bounded per level.
+        $directories = [];
+        if ($afterName === '') {
+            $dirs = $ch->fetchAll("
+                SELECT name, dir_path, file_count, total_size
+                FROM catalog_dirs
+                WHERE agent_id = ? AND archive_id = ? AND parent_dir = ?
+                ORDER BY name
+            ", [$id, $archiveId, $parentDir]);
+            foreach ($dirs as $d) {
+                $directories[] = [
+                    'name' => $d['name'],
+                    'path' => $d['dir_path'] . '/',
+                    'file_count' => (int) $d['file_count'],
+                    'total_size' => (int) $d['total_size'],
+                ];
+            }
+        }
+
+        // Keyset pagination on file_name (part of the table's ORDER BY key).
+        // Fetch limit+1 to know whether another page exists.
+        $fetch = $limit + 1;
+        $files = $ch->fetchAll("
+            SELECT path AS file_path, file_name, file_size, status,
+                   toString(mtime) AS mtime
+            FROM file_catalog
+            WHERE agent_id = ? AND archive_id = ? AND parent_dir = ? AND status != 'D'
+              AND file_name > ?
+            ORDER BY file_name
+            LIMIT {$fetch}
+        ", [$id, $archiveId, $parentDir, $afterName]);
+
+        $nextCursor = null;
+        if (count($files) > $limit) {
+            $files = array_slice($files, 0, $limit);
+            $nextCursor = base64_encode(end($files)['file_name']);
+        }
+        foreach ($files as &$f) {
+            $f['file_size'] = (int) $f['file_size'];
+        }
+        unset($f);
+
+        $this->json([
+            'path' => $prefix,
+            'dirs' => $directories,
+            'files' => $files,
+            'next_cursor' => $nextCursor,
+            // An archive with no catalog rows has either not been catalogued
+            // yet or genuinely holds nothing; a caller showing an empty list
+            // for the first case reads as "this backup is empty", which is
+            // alarming and wrong.
+            'catalog' => $this->catalogState($id, $archiveId),
+        ]);
+    }
+
+    /**
+     * Whether this archive's file catalog is ready, still building, or absent.
+     */
+    private function catalogState(int $agentId, int $archiveId): array
+    {
+        try {
+            $ch = \BBS\Core\ClickHouse::getInstance();
+            $row = $ch->fetchOne(
+                "SELECT count() AS c FROM file_catalog
+                 WHERE agent_id = {$agentId} AND archive_id = {$archiveId}"
+            );
+            if ((int) ($row['c'] ?? 0) > 0) {
+                return ['status' => 'ready', 'synced_at' => null];
+            }
+        } catch (\Exception $e) {
+            return ['status' => 'unavailable', 'synced_at' => null];
+        }
+
+        // Nothing catalogued. A queued or running catalog job means it is on
+        // its way; otherwise it has simply never been built.
+        $pending = $this->db->fetchOne(
+            "SELECT id FROM backup_jobs
+             WHERE agent_id = ? AND task_type IN ('catalog_sync', 'catalog_rebuild', 'catalog_rebuild_full')
+               AND status IN ('queued', 'sent', 'running')
+             ORDER BY id DESC LIMIT 1",
+            [$agentId]
+        );
+
+        return [
+            'status' => 'pending',
+            'synced_at' => null,
+            'job_id' => $pending ? (int) $pending['id'] : null,
+        ];
+    }
+
+    /**
+     * POST /api/v1/clients/{id}/restore
+     * Body: {"archive_id": N, "paths": ["/etc", ...], "destination": "/tmp/x"}.
+     * Empty paths = full archive. Mirrors the web restore flow including the
+     * up-front files_total resolution for progress bars.
+     */
+    public function restoreFiles(int $id): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::RESTORE, $id);
+        if (!$this->apiHasPermission($ctx, \BBS\Services\PermissionService::RESTORE, $id)) {
+            $this->json(['error' => 'You do not have permission to restore on this client'], 403);
+        }
+
+        $input = $this->getJsonInput();
+        $archiveId = (int) ($input['archive_id'] ?? 0);
+        $selectedFiles = is_array($input['paths'] ?? null) ? $input['paths'] : [];
+        $destination = trim($input['destination'] ?? '');
+
+        if (!$archiveId) {
+            $this->json(['error' => 'archive_id is required'], 400);
+        }
+
+        $archive = $this->db->fetchOne("
+            SELECT ar.*, r.path AS repo_path
+            FROM archives ar
+            JOIN repositories r ON r.id = ar.repository_id
+            WHERE ar.id = ? AND r.agent_id = ?
+        ", [$archiveId, $id]);
+        if (!$archive) {
+            $this->json(['error' => 'Archive not found'], 404);
+        }
+
+        // Resolve expected file count for the queue's progress bar (same
+        // logic as the web restore — see ClientController::restoreSubmit).
+        $filesTotal = null;
+        if (empty($selectedFiles)) {
+            $filesTotal = (int) ($archive['file_count'] ?? 0) ?: null;
+        } else {
+            try {
+                $ch = \BBS\Core\ClickHouse::getInstance();
+                if ($ch->isAvailable()) {
+                    $paths = array_values(array_filter(array_map(
+                        fn($p) => '/' . trim((string) $p, '/'),
+                        $selectedFiles
+                    ), fn($p) => $p !== '/'));
+                    $roots = array_filter($paths, function ($p) use ($paths) {
+                        foreach ($paths as $other) {
+                            if ($other !== $p && str_starts_with($p, $other . '/')) return false;
+                        }
+                        return true;
+                    });
+
+                    $conds = [];
+                    $params = [$id, $archiveId];
+                    foreach ($roots as $p) {
+                        $conds[] = '(path = ? OR startsWith(path, ?))';
+                        $params[] = $p;
+                        $params[] = $p . '/';
+                    }
+                    if ($conds) {
+                        $row = $ch->fetchOne(
+                            "SELECT count() AS cnt FROM file_catalog
+                             WHERE agent_id = ? AND archive_id = ? AND (" . implode(' OR ', $conds) . ")",
+                            $params
+                        );
+                        $filesTotal = (int) ($row['cnt'] ?? 0) ?: null;
+                    }
+                }
+            } catch (\Exception $e) {
+                // Catalog unavailable — byte-based progress still applies
+            }
+        }
+
+        $jobId = $this->db->insert('backup_jobs', [
+            'agent_id' => $id,
+            'backup_plan_id' => null,
+            'repository_id' => $archive['repository_id'],
+            'task_type' => 'restore',
+            'status' => 'queued',
+            'queued_at' => date('Y-m-d H:i:s'),
+            'restore_archive_id' => $archiveId,
+            'restore_paths' => json_encode($selectedFiles),
+            'restore_destination' => $destination ?: null,
+            'files_total' => $filesTotal,
+        ]);
+
+        $this->db->insert('server_log', [
+            'agent_id' => $id,
+            'backup_job_id' => $jobId,
+            'level' => 'info',
+            'message' => empty($selectedFiles)
+                ? "Restore queued via API: full archive {$archive['archive_name']}"
+                : "Restore queued via API: " . count($selectedFiles) . " paths from archive {$archive['archive_name']}",
+        ]);
+
+        $this->json(['status' => 'ok', 'job_id' => (int) $jobId]);
+    }
+
+    // ── Push registration ─────────────────────────────────
+
+    /**
+     * POST /api/v1/push/register — {device_id, apns_token, platform}.
+     * Upserts per (user, device); re-registration refreshes the token.
+     */
+    /**
+     * GET /health — unauthenticated liveness.
+     *
+     * For uptime monitors and container health checks: no credentials, no
+     * detail, and cheap enough to poll often. Anything that would tell an
+     * anonymous caller about the state of this install lives on the
+     * authenticated endpoint below.
+     *
+     * 200 when serving, 503 when not.
+     */
+    public function healthLive(): void
+    {
+        $result = (new \BBS\Services\HealthService())->liveness();
+        $this->json($result, $result['status'] === 'ok' ? 200 : 503);
+    }
+
+    /**
+     * GET /api/v1/health — the full picture, for a monitoring system.
+     *
+     * 200 for ok and warning, 503 for critical, so a check that only reads the
+     * status code still alerts on the things that stop backups happening.
+     */
+    public function health(): void
+    {
+        // Admin-only, like the web's health JSON: the full picture names every
+        // overdue client and describes scheduler and storage state, which a
+        // token scoped to one agent has no business reading. The app hiding
+        // the screen is presentation; this is the enforcement.
+        $this->requireMetricsAccess(true);
+        $result = (new \BBS\Services\HealthService())->check();
+        $this->json($result, $result['status'] === \BBS\Services\HealthService::CRITICAL ? 503 : 200);
+    }
+
+    // ── Restore: search, download, database restore ─────────────────
+
+    /**
+     * POST /api/v1/clients/{id}/download
+     * Body: {"archive_id": N, "paths": ["/etc/nginx", ...]}
+     *
+     * Streams the selection back as a .tar.gz, the same way the web page
+     * does — same extraction, same staging, same disk pre-flight, because it
+     * is the same service underneath.
+     *
+     * Errors come back as JSON, but only before streaming starts. Once the
+     * body is flowing the status is already sent, so a mid-transfer failure
+     * can only truncate the download; the file itself is verified by the
+     * extraction before a byte is written.
+     */
+    public function downloadArchive(int $id): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::RESTORE, $id);
+        if (!$this->apiHasPermission($ctx, \BBS\Services\PermissionService::RESTORE, $id)) {
+            $this->json(['error' => 'You do not have permission to restore on this client'], 403);
+        }
+
+        $input = $this->getJsonInput();
+        $archiveId = (int) ($input['archive_id'] ?? ($_GET['archive_id'] ?? 0));
+        $paths = is_array($input['paths'] ?? null) ? $input['paths'] : [];
+        if (!$archiveId) {
+            $this->json(['error' => 'archive_id is required'], 400);
+        }
+
+        $agent = $this->db->fetchOne("SELECT * FROM agents WHERE id = ?", [$id]);
+        $archive = (new \BBS\Controllers\ClientController())->loadArchiveForDownload($archiveId, $id);
+        if (!$agent || !$archive) {
+            $this->json(['error' => 'Archive not found'], 404);
+        }
+
+        try {
+            (new \BBS\Services\ArchiveDownloadService())->stream($agent, $archive, $paths);
+        } catch (\BBS\Services\InsufficientSpaceException $e) {
+            // Reported with the figures so a caller can say how much is needed
+            // rather than only that it failed.
+            $this->json([
+                'error' => $e->getMessage(),
+                'reason' => 'insufficient_space',
+                'needed_bytes' => $e->neededBytes,
+                'free_bytes' => $e->freeBytes,
+            ], 507);
+        } catch (\Exception $e) {
+            $this->json(['error' => 'Download failed: ' . $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * GET /api/v1/clients/{id}/catalog/search?q=&archive_id=&limit=
+     *
+     * Search is how anyone finds a file on a small screen — nobody taps
+     * through fourteen levels of /var/www/vhosts. Reads the pre-built
+     * ClickHouse catalog, so it is a lookup rather than a walk of the archive.
+     *
+     * `archive_id` optional: omitted searches every restore point, which
+     * answers "which backup still has this file?".
+     */
+    public function catalogSearch(int $id): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+
+        $q = trim((string) ($_GET['q'] ?? ''));
+        if ($q === '') {
+            $this->json(['error' => 'q is required'], 400);
+        }
+        $limit = max(1, min(200, (int) ($_GET['limit'] ?? 100)));
+        $archiveId = isset($_GET['archive_id']) ? (int) $_GET['archive_id'] : 0;
+
+        $ch = \BBS\Core\ClickHouse::getInstance();
+        if (!$ch->isAvailable()) {
+            $this->json(['results' => [], 'truncated' => false,
+                         'catalog' => ['status' => 'unavailable']]);
+        }
+
+        if ($archiveId > 0) {
+            $owns = $this->db->fetchOne(
+                "SELECT ar.id FROM archives ar JOIN repositories r ON r.id = ar.repository_id
+                 WHERE ar.id = ? AND r.agent_id = ?",
+                [$archiveId, $id]
+            );
+            if (!$owns) {
+                $this->json(['error' => 'Archive not found'], 404);
+            }
+        }
+
+        // Fetch one more than asked so "truncated" is accurate rather than a
+        // guess from a full page.
+        $fetch = $limit + 1;
+        $like = '%' . str_replace(['\\', "'", '%', '_'], ['\\\\', "\\'", '\\%', '\\_'], $q) . '%';
+        $scope = $archiveId > 0 ? " AND archive_id = {$archiveId}" : '';
+
+        $rows = $ch->fetchAll(
+            "SELECT path, file_name, file_size, archive_id, toString(mtime) AS mtime
+             FROM file_catalog
+             WHERE agent_id = {$id} AND status != 'D'{$scope}
+               AND (file_name LIKE ? OR path LIKE ?)
+             ORDER BY path
+             LIMIT {$fetch}",
+            [$like, $like]
+        );
+
+        $truncated = count($rows) > $limit;
+        $rows = array_slice($rows, 0, $limit);
+
+        // Name the restore point each hit came from — with no archive filter,
+        // "which backup has it" is the whole question.
+        $archiveNames = [];
+        $ids = array_values(array_unique(array_map(fn($r) => (int) $r['archive_id'], $rows)));
+        if (!empty($ids)) {
+            $ph = implode(',', array_fill(0, count($ids), '?'));
+            foreach ($this->db->fetchAll(
+                "SELECT id, archive_name FROM archives WHERE id IN ({$ph})", $ids
+            ) as $a) {
+                $archiveNames[(int) $a['id']] = $a['archive_name'];
+            }
+        }
+
+        $results = array_map(fn($r) => [
+            'file_path' => $r['path'],
+            'file_name' => $r['file_name'],
+            'file_size' => (int) $r['file_size'],
+            'mtime' => $r['mtime'],
+            'archive_id' => (int) $r['archive_id'],
+            'archive_name' => $archiveNames[(int) $r['archive_id']] ?? null,
+        ], $rows);
+
+        $this->json(['results' => $results, 'truncated' => $truncated,
+                     'catalog' => ['status' => 'ready']]);
+    }
+
+    /**
+     * GET /api/v1/clients/{id}/repositories/{repoId}/archives/{archiveId}/databases
+     *
+     * What a restore point actually contains. Without this a caller can pick
+     * an archive but has nothing to offer for "which databases", which is the
+     * step between choosing a restore point and starting the restore.
+     *
+     * Groups mirror the stored shape: several database configurations —
+     * including two of the same engine — restore independently.
+     */
+    public function listArchiveDatabases(int $id, int $repoId, int $archiveId): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+
+        $archive = $this->db->fetchOne(
+            "SELECT ar.id, ar.archive_name, ar.databases_backed_up, ar.created_at
+             FROM archives ar JOIN repositories r ON r.id = ar.repository_id
+             WHERE ar.id = ? AND ar.repository_id = ? AND r.agent_id = ?",
+            [$archiveId, $repoId, $id]
+        );
+        if (!$archive) {
+            $this->json(['error' => 'Archive not found'], 404);
+        }
+
+        $groups = (new \BBS\Services\ArchiveDatabaseService())
+            ->groups($id, $archiveId, $archive['databases_backed_up']);
+
+        // Which connector each group came from, so a caller can pre-select the
+        // right one rather than making someone match it up by name.
+        $out = [];
+        $all = [];
+        foreach ($groups as $g) {
+            $databases = array_values($g['databases'] ?? []);
+            foreach ($databases as $d) {
+                $all[$d] = true;
+            }
+            $out[] = [
+                'connector_id' => $g['config_id'] !== null ? (int) $g['config_id'] : null,
+                'connector_name' => $g['config_name'] ?? null,
+                'engine' => $g['engine'] ?? null,
+                'databases' => $databases,
+                'per_database' => (bool) ($g['per_database'] ?? true),
+                'compress' => (bool) ($g['compress'] ?? true),
+                // Naive UTC, like every other datetime here.
+                'dumped_at' => (object) array_map(fn($m) => $m ?: null, $g['mtimes'] ?? []),
+            ];
+        }
+
+        $this->json([
+            'archive_id' => (int) $archive['id'],
+            'archive_name' => $archive['archive_name'],
+            'backed_up_at' => $archive['created_at'],
+            'has_databases' => !empty($all),
+            'databases' => array_keys($all),
+            'groups' => $out,
+        ]);
+    }
+
+    /**
+     * GET /api/v1/clients/{id}/db-connectors
+     *
+     * The database plugin configurations a restore can target. Credentials
+     * are configuration secrets, so only what is needed to choose one is
+     * returned — never the password.
+     */
+    public function listDbConnectors(int $id): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+
+        $rows = $this->db->fetchAll(
+            "SELECT pc.id, pc.name, pc.config, p.slug
+             FROM plugin_configs pc JOIN plugins p ON p.id = pc.plugin_id
+             WHERE pc.agent_id = ? AND p.slug IN ('mysql_dump', 'pg_dump', 'mongo_dump', 'mssql_dump')
+             ORDER BY p.slug, pc.name",
+            [$id]
+        );
+
+        $typeBySlug = ['mysql_dump' => 'mysql', 'pg_dump' => 'postgres', 'mongo_dump' => 'mongo', 'mssql_dump' => 'mssql'];
+        $connectors = [];
+        foreach ($rows as $r) {
+            $cfg = json_decode($r['config'] ?? '{}', true) ?: [];
+            $connectors[] = [
+                'id' => (int) $r['id'],
+                'name' => $r['name'],
+                'type' => $typeBySlug[$r['slug']] ?? $r['slug'],
+                'host' => $cfg['host'] ?? null,
+                'port' => isset($cfg['port']) ? (int) $cfg['port'] : null,
+                'database' => $cfg['database'] ?? null,
+            ];
+        }
+
+        $this->json(['connectors' => $connectors]);
+    }
+
+    /**
+     * POST /api/v1/clients/{id}/restore-db
+     * Body: {connector_id, archive_id, databases: [{name, mode, target_name?}]}
+     *
+     * One endpoint rather than three: the connector's type decides which task
+     * the agent runs, so a caller isn't switching on a string just to pick a
+     * URL.
+     */
+    public function restoreDatabase(int $id): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::RESTORE, $id);
+        if (!$this->apiHasPermission($ctx, \BBS\Services\PermissionService::RESTORE, $id)) {
+            $this->json(['error' => 'You do not have permission to restore on this client'], 403);
+        }
+
+        $input = $this->getJsonInput();
+        $connectorId = (int) ($input['connector_id'] ?? 0);
+        $archiveId = (int) ($input['archive_id'] ?? 0);
+        $databases = is_array($input['databases'] ?? null) ? $input['databases'] : [];
+
+        if (!$connectorId || !$archiveId || empty($databases)) {
+            $this->json(['error' => 'connector_id, archive_id and databases are required'], 400);
+        }
+
+        $connector = $this->db->fetchOne(
+            "SELECT pc.id, pc.name, p.slug FROM plugin_configs pc
+             JOIN plugins p ON p.id = pc.plugin_id
+             WHERE pc.id = ? AND pc.agent_id = ?
+               AND p.slug IN ('mysql_dump', 'pg_dump', 'mongo_dump', 'mssql_dump')",
+            [$connectorId, $id]
+        );
+        if (!$connector) {
+            $this->json(['error' => 'Database connector not found for this client'], 404);
+        }
+
+        $archive = $this->db->fetchOne(
+            "SELECT ar.id, ar.archive_name, ar.repository_id, ar.databases_backed_up
+             FROM archives ar JOIN repositories r ON r.id = ar.repository_id
+             WHERE ar.id = ? AND r.agent_id = ?",
+            [$archiveId, $id]
+        );
+        if (!$archive) {
+            $this->json(['error' => 'Archive not found'], 404);
+        }
+        if (empty($archive['databases_backed_up'])) {
+            $this->json(['error' => 'That restore point contains no database dumps'], 409);
+        }
+
+        // Same shape the web builds, including the rename target sanitising.
+        $restoreDatabases = [];
+        foreach ($databases as $entry) {
+            $name = is_array($entry) ? ($entry['name'] ?? '') : (string) $entry;
+            $mode = is_array($entry) ? ($entry['mode'] ?? 'replace') : 'replace';
+            if ($name === '' || !in_array($mode, ['replace', 'rename'], true)) {
+                continue;
+            }
+            $item = ['database' => $name, 'mode' => $mode];
+            if ($mode === 'rename' && !empty($entry['target_name'])) {
+                $item['target_name'] = preg_replace('/[^a-zA-Z0-9_]/', '', $entry['target_name']);
+            }
+            $restoreDatabases[] = $item;
+        }
+        if (empty($restoreDatabases)) {
+            $this->json(['error' => 'No valid databases selected'], 422);
+        }
+
+        $taskType = match ($connector['slug']) {
+            'mysql_dump' => 'restore_mysql',
+            'pg_dump' => 'restore_pg',
+            'mongo_dump' => 'restore_mongo',
+            'mssql_dump' => 'restore_mssql',
+        };
+
+        $jobId = $this->db->insert('backup_jobs', [
+            'agent_id' => $id,
+            'repository_id' => $archive['repository_id'],
+            'task_type' => $taskType,
+            'status' => 'queued',
+            'restore_archive_id' => $archiveId,
+            'restore_databases' => json_encode($restoreDatabases),
+            'plugin_config_id' => $connectorId,
+        ]);
+
+        $names = implode(', ', array_column($restoreDatabases, 'database'));
+        $this->db->insert('server_log', [
+            'agent_id' => $id,
+            'backup_job_id' => $jobId,
+            'level' => 'info',
+            'message' => "Database restore queued: {$names} from archive {$archive['archive_name']}",
+        ]);
+
+        $this->json(['job_id' => (int) $jobId, 'task_type' => $taskType, 'status' => 'queued'], 202);
+    }
+
+    // ── Client detail: install, plugin config writes, repo check, stats ──
+
+    /**
+     * GET /api/v1/clients/{id}/install — the agent install command.
+     *
+     * This is the one endpoint that returns an agent's api_key to a mobile
+     * token. It is an install-time enrolment credential, already shown in the
+     * web UI to any admin who opens the client page, and withholding it here
+     * would make the install screen useless without protecting anything the
+     * web does not already expose.
+     *
+     * That is a deliberate exception, kept narrow: admin-only, only when asked
+     * for explicitly, and nowhere else. getClient() still strips api_key for
+     * mobile tokens, and no list endpoint returns it.
+     */
+    public function clientInstall(int $id): void
+    {
+        $this->requireApiAdmin();
+
+        $agent = $this->db->fetchOne("SELECT * FROM agents WHERE id = ?", [$id]);
+        if (!$agent) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+
+        $apiKey = $this->resolveAgentApiKey($agent);
+        $appUrl = rtrim(\BBS\Core\Config::get('APP_URL', ''), '/');
+        if ($appUrl === '') {
+            $hostRow = $this->db->fetchOne("SELECT `value` FROM settings WHERE `key` = 'server_host'");
+            $host = $hostRow['value'] ?? '';
+            $appUrl = $host !== '' ? 'https://' . $host : '';
+        }
+
+        $platform = strtolower((string) ($agent['platform'] ?? ''));
+        $osInfo = strtolower((string) ($agent['os_info'] ?? ''));
+        $isWindows = str_contains($platform, 'win') || str_contains($osInfo, 'windows');
+        $osHint = $isWindows ? 'windows' : (str_contains($osInfo, 'darwin') || str_contains($osInfo, 'mac') ? 'macos' : 'linux');
+
+        // Assembled here so a caller never builds it from parts and gets a
+        // flag wrong.
+        if ($appUrl === '' || !$apiKey) {
+            $command = null;
+        } elseif ($isWindows) {
+            $command = sprintf(
+                'powershell -ExecutionPolicy Bypass -Command "irm %s/get-agent-windows | iex" -Server %s -Key %s',
+                $appUrl, $appUrl, $apiKey
+            );
+        } else {
+            $command = sprintf(
+                'curl -s %s/get-agent | sudo bash -s -- --server %s --key %s',
+                $appUrl, $appUrl, $apiKey
+            );
+        }
+
+        $this->json([
+            'command' => $command,
+            'api_key' => $apiKey,
+            'server_url' => $appUrl ?: null,
+            'os_hint' => $osHint,
+            'status' => $agent['status'],
+        ]);
+    }
+
+    /**
+     * The stored key, whichever form this install keeps it in.
+     */
+    private function resolveAgentApiKey(array $agent): ?string
+    {
+        if (!empty($agent['api_key'])) {
+            return $agent['api_key'];
+        }
+        if (!empty($agent['api_key_encrypted'])) {
+            try {
+                return Encryption::decrypt($agent['api_key_encrypted']);
+            } catch (\Exception $e) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * PUT /api/v1/clients/{id}/plugin-configs/{configId}
+     *
+     * Unlike the install key, plugin secrets are not an exception: a value is
+     * accepted on write and never returned, and an omitted field keeps what is
+     * stored rather than clearing it.
+     */
+    public function updatePluginConfig(int $id, int $configId): void
+    {
+        $this->requireApiToken();
+        $input = $this->getJsonInput();
+
+        $existing = $this->db->fetchOne(
+            "SELECT pc.*, p.slug FROM plugin_configs pc
+             JOIN plugins p ON p.id = pc.plugin_id
+             WHERE pc.id = ? AND pc.agent_id = ?",
+            [$configId, $id]
+        );
+        if (!$existing) {
+            $this->json(['error' => 'Plugin configuration not found for this client'], 404);
+        }
+
+        $data = [];
+        if (array_key_exists('name', $input)) {
+            $name = trim((string) $input['name']);
+            if ($name === '') {
+                $this->json(['error' => 'name cannot be empty'], 422);
+            }
+            $clash = $this->db->fetchOne(
+                "SELECT id FROM plugin_configs WHERE agent_id = ? AND plugin_id = ? AND name = ? AND id != ?",
+                [$id, $existing['plugin_id'], $name, $configId]
+            );
+            if ($clash) {
+                $this->json(['error' => "A config named \"{$name}\" already exists for this plugin"], 409);
+            }
+            $data['name'] = $name;
+        }
+
+        if (isset($input['config']) && is_array($input['config'])) {
+            $stored = json_decode($existing['config'] ?? '{}', true) ?: [];
+            $schema = (new \BBS\Services\PluginManager())->getPluginSchema($existing['slug']);
+            foreach ($input['config'] as $field => $value) {
+                if (!empty($schema[$field]['sensitive'])) {
+                    // Empty means "leave it alone", not "clear it".
+                    if ($value === '' || $value === null) {
+                        continue;
+                    }
+                    $stored[$field] = Encryption::encrypt((string) $value);
+                    continue;
+                }
+                $stored[$field] = $value;
+            }
+            $stored = \BBS\Services\PluginManager::hostedConfig($existing['slug'], $stored);
+            if (($hookProblem = \BBS\Services\PluginManager::configProblem($existing['slug'], $stored, true)) !== null) {
+                $this->json(['error' => $hookProblem], 422);
+            }
+            $data['config'] = json_encode($stored);
+        }
+
+        if (!empty($data)) {
+            $this->db->update('plugin_configs', $data, 'id = ?', [$configId]);
+        }
+
+        $this->json(['config' => $this->pluginConfigPayload($configId)]);
+    }
+
+    /**
+     * DELETE /api/v1/clients/{id}/plugin-configs/{configId}
+     */
+    public function deletePluginConfig(int $id, int $configId): void
+    {
+        $this->requireApiToken();
+
+        $existing = $this->db->fetchOne(
+            "SELECT id FROM plugin_configs WHERE id = ? AND agent_id = ?",
+            [$configId, $id]
+        );
+        if (!$existing) {
+            $this->json(['error' => 'Plugin configuration not found for this client'], 404);
+        }
+
+        // Same guard as the web: a config a repository still syncs through
+        // cannot be removed out from under it.
+        $inUse = $this->db->fetchAll(
+            "SELECT r.id, r.name FROM repository_s3_configs rsc
+             JOIN repositories r ON r.id = rsc.repository_id
+             WHERE rsc.plugin_config_id = ?",
+            [$configId]
+        );
+        if (!empty($inUse)) {
+            $this->json([
+                'error' => sprintf('In use by %d repository/repositories', count($inUse)),
+                'reason' => 'repositories_attached',
+                'repositories' => array_map(fn($r) => ['id' => (int) $r['id'], 'name' => $r['name']], $inUse),
+            ], 409);
+        }
+
+        $this->db->delete('backup_plan_plugins', 'plugin_config_id = ?', [$configId]);
+        $this->db->delete('plugin_configs', 'id = ?', [$configId]);
+        http_response_code(204);
+        exit;
+    }
+
+    /**
+     * POST /api/v1/clients/{id}/plugin-configs/{configId}/test
+     *
+     * S3 configurations are tested here and answer immediately; everything
+     * else has to run on the client, so it queues a job and the caller polls
+     * it like any other.
+     */
+    public function testPluginConfig(int $id, int $configId): void
+    {
+        $this->requireApiToken();
+
+        $config = $this->db->fetchOne(
+            "SELECT pc.*, p.slug FROM plugin_configs pc
+             JOIN plugins p ON p.id = pc.plugin_id
+             WHERE pc.id = ? AND pc.agent_id = ?",
+            [$configId, $id]
+        );
+        if (!$config) {
+            $this->json(['error' => 'Plugin configuration not found for this client'], 404);
+        }
+
+        if ($config['slug'] === 's3_sync') {
+            $configData = json_decode($config['config'] ?? '{}', true) ?: [];
+            $s3 = new \BBS\Services\S3SyncService();
+            $result = $s3->testConnection($s3->resolveDestination($configData));
+            if (empty($result['success'])) {
+                $this->json(['status' => 'failed', 'error' => $result['error'] ?? 'Connection failed'], 502);
+            }
+            $this->json(['status' => 'completed', 'message' => 'Connection successful']);
+        }
+
+        $jobId = $this->db->insert('backup_jobs', [
+            'agent_id' => $id,
+            'task_type' => 'plugin_test',
+            'status' => 'queued',
+            'plugin_config_id' => $configId,
+        ]);
+        $this->db->insert('server_log', [
+            'agent_id' => $id,
+            'backup_job_id' => $jobId,
+            'level' => 'info',
+            'message' => "Plugin test queued (job #{$jobId}, config #{$configId})",
+        ]);
+
+        $this->json(['status' => 'queued', 'job_id' => (int) $jobId], 202);
+    }
+
+    /** One plugin config, with secrets reported as set/unset rather than returned. */
+    private function pluginConfigPayload(int $configId): array
+    {
+        $row = $this->db->fetchOne(
+            "SELECT pc.id, pc.name, pc.config, pc.created_at, p.slug, p.name AS plugin_name
+             FROM plugin_configs pc JOIN plugins p ON p.id = pc.plugin_id
+             WHERE pc.id = ?",
+            [$configId]
+        );
+        if (!$row) {
+            return [];
+        }
+        $config = json_decode($row['config'] ?? '{}', true) ?: [];
+        $schema = (new \BBS\Services\PluginManager())->getPluginSchema($row['slug']);
+        foreach ($schema as $field => $def) {
+            if (!empty($def['sensitive'])) {
+                $config[$field . '_set'] = !empty($config[$field]);
+                unset($config[$field]);
+            }
+        }
+        return [
+            'id' => (int) $row['id'],
+            'name' => $row['name'],
+            'plugin' => $row['slug'],
+            'plugin_name' => $row['plugin_name'],
+            'config' => $config,
+            'created_at' => $row['created_at'],
+        ];
+    }
+
+    /**
+     * POST /api/v1/clients/{id}/repositories/{repoId}/check
+     * Kept as its own route now that maintenance covers every action.
+     */
+    public function checkRepository(int $id, int $repoId): void
+    {
+        $this->queueRepositoryMaintenance($id, $repoId, 'check');
+    }
+
+    /**
+     * POST /api/v1/clients/{id}/repositories/{repoId}/maintenance
+     * Body: {"action": "check|compact|repair|break_lock|catalog_rebuild|catalog_rebuild_full"}
+     *
+     * The same set the web offers. compact is the one worth having away from a
+     * desk — it is what actually reclaims disk after a prune — and break_lock
+     * is the usual way out of an interrupted backup.
+     */
+    public function repositoryMaintenance(int $id, int $repoId): void
+    {
+        $input = $this->getJsonInput();
+        $action = trim((string) ($input['action'] ?? ($_GET['action'] ?? '')));
+        $this->queueRepositoryMaintenance($id, $repoId, $action);
+    }
+
+    /**
+     * POST /api/v1/clients/{id}/repositories/{repoId}/catalog/sync
+     *
+     * Requests the file catalog for this repository be rebuilt — the action to
+     * offer when browsing reports its catalog as pending.
+     */
+    public function syncRepositoryCatalog(int $id, int $repoId): void
+    {
+        $input = $this->getJsonInput();
+        // Default to filling in what is missing; full re-reads every archive.
+        $full = !empty($input['full']) || !empty($_GET['full']);
+        $this->queueRepositoryMaintenance($id, $repoId, $full ? 'catalog_rebuild_full' : 'catalog_rebuild');
+    }
+
+    /**
+     * Shared by the maintenance routes: same actions, permission and
+     * duplicate-suppression as the web page.
+     */
+    private function queueRepositoryMaintenance(int $id, int $repoId, string $action): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        if (!$this->apiHasPermission($ctx, \BBS\Services\PermissionService::REPO_MAINTENANCE, $id)) {
+            $this->json(['error' => 'Repository maintenance permission required'], 403);
+        }
+
+        // "Rebuild Full" dispatches as catalog_sync, which wipes the archive
+        // records, re-reads them from borg with sizes, then queues the rebuild.
+        $taskType = match ($action) {
+            'check' => 'repo_check',
+            'compact' => 'compact',
+            'repair' => 'repo_repair',
+            'break_lock' => 'break_lock',
+            'catalog_rebuild' => 'catalog_rebuild',
+            'catalog_rebuild_full' => 'catalog_sync',
+            default => null,
+        };
+        if ($taskType === null) {
+            $this->json([
+                'error' => 'Unknown action',
+                'valid_actions' => ['check', 'compact', 'repair', 'break_lock',
+                                    'catalog_rebuild', 'catalog_rebuild_full'],
+            ], 400);
+        }
+
+        $label = match ($action) {
+            'check' => 'Check',
+            'compact' => 'Compact',
+            'repair' => 'Repair',
+            'break_lock' => 'Break Lock',
+            'catalog_rebuild' => 'Rebuild Catalog (Missing)',
+            'catalog_rebuild_full' => 'Rebuild Catalog (Full)',
+        };
+
+        $repo = $this->db->fetchOne(
+            "SELECT id, name, read_only FROM repositories WHERE id = ? AND agent_id = ?",
+            [$repoId, $id]
+        );
+        if (!$repo) {
+            $this->json(['error' => 'Repository not found'], 404);
+        }
+        if (($refusal = \BBS\Services\QueueManager::readOnlyRefusal($repo, $taskType)) !== null) {
+            $this->json(['error' => $refusal, 'reason' => 'read_only'], 409);
+        }
+
+        // One of each kind at a time; different kinds may queue together.
+        $pending = $this->db->fetchOne(
+            "SELECT id FROM backup_jobs WHERE repository_id = ? AND task_type = ?
+               AND status IN ('queued', 'sent', 'running')",
+            [$repoId, $taskType]
+        );
+        if ($pending) {
+            $this->json([
+                'status' => 'already_queued',
+                'job_id' => (int) $pending['id'],
+                'action' => $action,
+                'message' => "A {$label} job is already queued or running for this repository",
+            ], 409);
+        }
+
+        $jobId = $this->db->insert('backup_jobs', [
+            'agent_id' => $id,
+            'repository_id' => $repoId,
+            'task_type' => $taskType,
+            'status' => 'queued',
+        ]);
+        $this->db->insert('server_log', [
+            'agent_id' => $id,
+            'backup_job_id' => $jobId,
+            'level' => 'info',
+            'message' => "{$label} job #{$jobId} queued for repository \"{$repo['name']}\"",
+        ]);
+
+        $this->json([
+            'status' => 'queued',
+            'job_id' => (int) $jobId,
+            'action' => $action,
+            'task_type' => $taskType,
+        ], 202);
+    }
+
+    /**
+     * DELETE /api/v1/clients/{id}/repositories/{repoId}/archives/{archiveId}
+     *
+     * Removes one recovery point. Locked archives are refused — a legal hold
+     * has to be lifted deliberately, not stepped over by whichever client
+     * happens to be asking.
+     */
+    public function deleteArchive(int $id, int $repoId, int $archiveId): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::REPO_MAINTENANCE, $id);
+        if (!$this->apiHasPermission($ctx, \BBS\Services\PermissionService::MANAGE_REPOS, $id)) {
+            $this->json(['error' => 'Repository management permission required'], 403);
+        }
+
+        $archive = $this->db->fetchOne(
+            "SELECT ar.id, ar.archive_name, ar.locked, r.read_only FROM archives ar
+             JOIN repositories r ON r.id = ar.repository_id
+             WHERE ar.id = ? AND ar.repository_id = ? AND r.agent_id = ?",
+            [$archiveId, $repoId, $id]
+        );
+        if (!$archive) {
+            $this->json(['error' => 'Archive not found'], 404);
+        }
+        if (($refusal = \BBS\Services\QueueManager::readOnlyRefusal($archive, 'archive_delete')) !== null) {
+            $this->json(['error' => $refusal, 'reason' => 'read_only'], 409);
+        }
+        if (!empty($archive['locked'])) {
+            $this->json([
+                'error' => 'This recovery point is locked — unlock it first',
+                'reason' => 'locked',
+            ], 409);
+        }
+
+        $pending = $this->db->fetchOne(
+            "SELECT id FROM backup_jobs WHERE repository_id = ? AND task_type = 'archive_delete'
+               AND status IN ('queued', 'sent', 'running')",
+            [$repoId]
+        );
+        if ($pending) {
+            $this->json([
+                'status' => 'already_queued',
+                'job_id' => (int) $pending['id'],
+                'message' => 'A deletion is already queued or running for this repository',
+            ], 409);
+        }
+
+        // The worker resolves the archive by id (restore_archive_id). The
+        // name in status_message is only shown until the job starts and
+        // replaces it with progress (#527).
+        $jobId = $this->db->insert('backup_jobs', [
+            'agent_id' => $id,
+            'repository_id' => $repoId,
+            'task_type' => 'archive_delete',
+            'status' => 'queued',
+            'restore_archive_id' => $archive['id'],
+            'status_message' => $archive['archive_name'],
+        ]);
+        $this->db->insert('server_log', [
+            'agent_id' => $id,
+            'backup_job_id' => $jobId,
+            'level' => 'info',
+            'message' => "Recovery point deletion queued: \"{$archive['archive_name']}\" (job #{$jobId})",
+        ]);
+
+        $this->json(['status' => 'queued', 'job_id' => (int) $jobId], 202);
+    }
+
+    /**
+     * GET /api/v1/clients/{id}/stats — the figures the web client page shows.
+     *
+     * A caller can derive these from /jobs, but then the two products can
+     * disagree about the same client whenever the windowing differs. Computed
+     * here so they don't.
+     */
+    public function clientStats(int $id): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+
+        $next = $this->db->fetchOne(
+            "SELECT s.next_run, bp.name AS plan_name
+             FROM schedules s JOIN backup_plans bp ON bp.id = s.backup_plan_id
+             WHERE bp.agent_id = ? AND s.enabled = 1 AND bp.enabled = 1 AND s.next_run IS NOT NULL
+             ORDER BY s.next_run ASC LIMIT 1",
+            [$id]
+        );
+
+        // Last 30 completed backups, the same sample the web page averages.
+        $durations = $this->db->fetchAll(
+            "SELECT duration_seconds FROM backup_jobs
+             WHERE agent_id = ? AND task_type = 'backup' AND status = 'completed'
+               AND duration_seconds IS NOT NULL AND duration_seconds > 0
+             ORDER BY completed_at DESC LIMIT 30",
+            [$id]
+        );
+        $avg = count($durations)
+            ? (int) round(array_sum(array_column($durations, 'duration_seconds')) / count($durations))
+            : null;
+
+        $outcomes = $this->db->fetchAll(
+            "SELECT status, COUNT(*) c FROM backup_jobs
+             WHERE agent_id = ? AND task_type = 'backup' AND status IN ('completed', 'failed')
+               AND completed_at > DATE_SUB(NOW(), INTERVAL 30 DAY)
+             GROUP BY status",
+            [$id]
+        );
+        $succeeded = $failed = 0;
+        foreach ($outcomes as $o) {
+            if ($o['status'] === 'completed') $succeeded = (int) $o['c'];
+            else $failed = (int) $o['c'];
+        }
+
+        $errors7d = (int) ($this->db->fetchOne(
+            "SELECT COUNT(*) c FROM backup_jobs
+             WHERE agent_id = ? AND status = 'failed'
+               AND completed_at > DATE_SUB(NOW(), INTERVAL 7 DAY)",
+            [$id]
+        )['c'] ?? 0);
+
+        $this->json([
+            'next_backup' => $next ? ['at' => $next['next_run'], 'plan_name' => $next['plan_name']] : null,
+            'avg_duration_seconds' => $avg,
+            'sample_size' => count($durations),
+            'success_rate' => ['succeeded' => $succeeded, 'total' => $succeeded + $failed],
+            'errors_7d' => $errors7d,
+        ]);
+    }
+
+    public function registerPush(): void
+    {
+        $ctx = $this->requireApiAuth();
+        $input = $this->getJsonInput();
+
+        $deviceId = substr(trim($input['device_id'] ?? ''), 0, 64);
+        // apns_token is the original field name, kept as an alias so clients
+        // written against it keep working.
+        $token = substr(trim($input['push_token'] ?? ($input['apns_token'] ?? '')), 0, 512);
+        $platform = substr(trim($input['platform'] ?? 'ios'), 0, 16);
+        $deviceName = substr(trim($input['device_name'] ?? ''), 0, 100) ?: null;
+
+        if ($deviceId === '' || $token === '') {
+            $this->json(['error' => 'device_id and push_token are required'], 400);
+        }
+
+        // Preferences are materialised now rather than left null: the delivery
+        // filter reads them as JSON, and a null would quietly match nothing.
+        $events = \BBS\Services\PushService::DEFAULT_EVENTS;
+        if (isset($input['events']) && is_array($input['events'])) {
+            foreach ($events as $key => $default) {
+                if (array_key_exists($key, $input['events'])) {
+                    $events[$key] = (bool) $input['events'][$key];
+                }
+            }
+        }
+
+        $userId = (int) $ctx['id'];
+
+        // A device belongs to one account at a time. The app holds a single
+        // session, so registering here means any previous owner's row for this
+        // handset is stale — clear it rather than leave it delivering to an
+        // account the phone can no longer open.
+        $this->db->delete('push_tokens', 'device_id = ? AND user_id != ?', [$deviceId, $userId]);
+
+        $this->db->query(
+            "INSERT INTO push_tokens (user_id, device_id, push_token, platform, device_name, events, enabled)
+             VALUES (?, ?, ?, ?, ?, ?, 1)
+             ON DUPLICATE KEY UPDATE
+                user_id = VALUES(user_id),
+                push_token = VALUES(push_token),
+                platform = VALUES(platform),
+                device_name = VALUES(device_name),
+                events = VALUES(events)",
+            [$userId, $deviceId, $token, $platform, $deviceName, json_encode($events)]
+        );
+
+        (new \BBS\Services\PushService())->registerDevice($userId, $deviceId, $token, $platform);
+
+        $this->json(['status' => 'ok', 'events' => $events]);
+    }
+
+    /**
+     * GET /api/v1/push/devices?device_id=… — the caller's own devices.
+     * Not admin data: a user sees their devices and nobody else's.
+     */
+    public function listPushDevices(): void
+    {
+        $ctx = $this->requireApiAuth();
+        $current = substr(trim($_GET['device_id'] ?? ''), 0, 64);
+
+        $rows = $this->db->fetchAll(
+            "SELECT device_id, device_name, platform, events, enabled, created_at, updated_at
+             FROM push_tokens WHERE user_id = ? ORDER BY created_at",
+            [(int) $ctx['id']]
+        );
+
+        $devices = [];
+        foreach ($rows as $r) {
+            $devices[] = [
+                'device_id' => $r['device_id'],
+                'device_name' => $r['device_name'],
+                'platform' => $r['platform'],
+                'events' => json_decode($r['events'] ?? '{}', true) ?: (object) [],
+                'enabled' => (bool) $r['enabled'],
+                'created_at' => $r['created_at'],
+                'updated_at' => $r['updated_at'],
+                'is_current' => $current !== '' && $r['device_id'] === $current,
+            ];
+        }
+
+        // push_token is deliberately absent: nothing needs to read it back,
+        // and it is the one value here worth stealing.
+        $this->json(['devices' => $devices]);
+    }
+
+    /**
+     * PATCH /api/v1/push/devices/{deviceId} — event preferences, or the
+     * on/off switch. Disabling keeps the registration and stops delivery.
+     */
+    public function updatePushDevice(string $deviceId): void
+    {
+        $ctx = $this->requireApiAuth();
+        $input = $this->getJsonInput();
+        $userId = (int) $ctx['id'];
+
+        $row = $this->db->fetchOne(
+            "SELECT events FROM push_tokens WHERE device_id = ? AND user_id = ?",
+            [$deviceId, $userId]
+        );
+        if (!$row) {
+            $this->json(['error' => 'Device not found'], 404);
+        }
+
+        $data = [];
+        if (array_key_exists('enabled', $input)) {
+            $data['enabled'] = !empty($input['enabled']) ? 1 : 0;
+        }
+        if (isset($input['events']) && is_array($input['events'])) {
+            $events = json_decode($row['events'] ?? '{}', true) ?: [];
+            $events = array_merge(\BBS\Services\PushService::DEFAULT_EVENTS, $events);
+            foreach (\BBS\Services\PushService::DEFAULT_EVENTS as $key => $default) {
+                if (array_key_exists($key, $input['events'])) {
+                    $events[$key] = (bool) $input['events'][$key];
+                }
+            }
+            $data['events'] = json_encode($events);
+        }
+
+        if (!empty($data)) {
+            $this->db->update('push_tokens', $data, 'device_id = ? AND user_id = ?', [$deviceId, $userId]);
+        }
+
+        $updated = $this->db->fetchOne(
+            "SELECT device_id, device_name, platform, events, enabled, created_at, updated_at
+             FROM push_tokens WHERE device_id = ? AND user_id = ?",
+            [$deviceId, $userId]
+        );
+        $this->json(['device' => [
+            'device_id' => $updated['device_id'],
+            'device_name' => $updated['device_name'],
+            'platform' => $updated['platform'],
+            'events' => json_decode($updated['events'] ?? '{}', true) ?: (object) [],
+            'enabled' => (bool) $updated['enabled'],
+            'created_at' => $updated['created_at'],
+            'updated_at' => $updated['updated_at'],
+        ]]);
+    }
+
+    public function unregisterPush(): void
+    {
+        $ctx = $this->requireApiAuth();
+        $input = $this->getJsonInput();
+        $deviceId = substr(trim($input['device_id'] ?? ($_GET['device_id'] ?? '')), 0, 64);
+
+        if ($deviceId === '') {
+            $this->json(['error' => 'device_id is required'], 400);
+        }
+
+        $this->db->delete('push_tokens', 'user_id = ? AND device_id = ?', [(int) $ctx['id'], $deviceId]);
+        // Best-effort, short timeout: a sign-out must not hang on the relay.
+        (new \BBS\Services\PushService())->deleteDevice($deviceId);
+        http_response_code(204);
+        exit;
+    }
+
+    // ── Filesystem browse ────────────────────────────────
+    // The web's ClientController::browse()/browsePoll() under token auth:
+    // same list_dir job, same 15-minute params-keyed cache, same answers.
+    // Reading a directory listing is a read of the client, so visibility
+    // is the only gate; manage_plans is needed to save the plan afterwards.
+
+    /**
+     * POST /api/v1/clients/{id}/browse
+     * Body: {"path": "/", "depth": 1, "show_hidden": false, "show_all": false, "refresh": false}
+     */
+    public function browse(int $id): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        // Lists directories on the client; it is the folder picker for backup
+        // plans, so it needs the plan permission, not just access.
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::MANAGE_PLANS, $id);
+
+        $agent = $this->db->fetchOne("SELECT id, name, status FROM agents WHERE id = ?", [$id]);
+        if (!$agent) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        if (($agent['status'] ?? 'offline') !== 'online') {
+            $this->json(['error' => 'Agent is offline; cannot browse filesystem'], 409);
+        }
+
+        $input = $this->getJsonInput();
+        $path = trim((string) ($input['path'] ?? '/'));
+        if ($path === '') $path = '/';
+        $depth = max(0, min(5, (int) ($input['depth'] ?? 2)));
+        $showHidden = !empty($input['show_hidden']);
+        $showAll    = !empty($input['show_all']);
+
+        $cache = \BBS\Services\Cache::getInstance();
+        $cacheKey = sprintf(
+            'browse_tree:%d:%s',
+            $id,
+            md5("{$path}|{$depth}|" . ($showHidden ? '1' : '0') . '|' . ($showAll ? '1' : '0'))
+        );
+        // Absolute 15-minute TTL, not sliding — see ClientController::browse() (#429).
+        $cached = !empty($input['refresh']) ? null : $cache->get($cacheKey);
+        if (is_array($cached)) {
+            $this->json(['status' => 'completed', 'tree' => $cached, 'cached' => true]);
+        }
+
+        $jobId = $this->db->insert('backup_jobs', [
+            'agent_id' => $id,
+            'task_type' => 'list_dir',
+            'status' => 'queued',
+            'status_message' => json_encode([
+                'path' => $path,
+                'depth' => $depth,
+                'show_hidden' => $showHidden,
+                'show_all' => $showAll,
+                'cache_key' => $cacheKey,
+            ]),
+        ]);
+
+        $this->json(['status' => 'pending', 'task_id' => (int) $jobId]);
+    }
+
+    /**
+     * GET /api/v1/clients/{id}/browse/{taskId} — poll a browse() result.
+     */
+    public function browsePoll(int $id, int $taskId): void
+    {
+        $ctx = $this->requireApiAuth();
+        if (!$this->apiCanAccessAgent($ctx, $id)) {
+            $this->json(['error' => 'Client not found'], 404);
+        }
+        // Lists directories on the client; it is the folder picker for backup
+        // plans, so it needs the plan permission, not just access.
+        $this->apiRequirePermission($ctx, \BBS\Services\PermissionService::MANAGE_PLANS, $id);
+
+        $job = $this->db->fetchOne(
+            "SELECT id, status, status_message, error_log, task_result FROM backup_jobs WHERE id = ? AND agent_id = ? AND task_type = 'list_dir'",
+            [$taskId, $id]
+        );
+        if (!$job) {
+            $this->json(['error' => 'Task not found'], 404);
+        }
+
+        if ($job['status'] === 'failed') {
+            $this->json(['status' => 'failed', 'error' => $job['error_log'] ?? 'list_dir failed']);
+        }
+        if ($job['status'] !== 'completed') {
+            $this->json(['status' => 'pending']);
+        }
+
+        // task_result on the job row is the primary source; the per-task
+        // cache entry covers rows that completed before it was persisted.
+        $cache = \BBS\Services\Cache::getInstance();
+        $tree = null;
+        if (!empty($job['task_result'])) {
+            $decoded = json_decode($job['task_result'], true);
+            if (is_array($decoded)) $tree = $decoded;
+        }
+        if ($tree === null) {
+            $tree = $cache->get("browse_result:{$taskId}");
+        }
+        if (!is_array($tree)) {
+            $this->json(['status' => 'failed', 'error' => 'Result not available (may have expired)']);
+        }
+
+        $params = json_decode($job['status_message'] ?? '{}', true) ?: [];
+        if (!empty($params['cache_key'])) {
+            $cache->set($params['cache_key'], $tree, 900);
+        }
+        $this->json(['status' => 'completed', 'tree' => $tree]);
     }
 }

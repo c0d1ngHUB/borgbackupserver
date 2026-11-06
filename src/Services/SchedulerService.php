@@ -28,6 +28,31 @@ class SchedulerService
 
         $now = date('Y-m-d H:i:s');
 
+        // An enabled schedule with no next_run can never be selected below, and
+        // nothing else fills it in, so it is silently dead: shown as active,
+        // never queued, and only a manual run works. Give it one before the
+        // due-query runs (#420).
+        //
+        // Deliberately the *next* occurrence rather than "now" — a schedule
+        // that has been dead for a week should resume tonight, not fire a
+        // week's worth of catch-up backups the moment it is repaired.
+        $orphans = $this->db->fetchAll("
+            SELECT s.* FROM schedules s
+            JOIN backup_plans bp ON bp.id = s.backup_plan_id
+            WHERE s.enabled = 1 AND bp.enabled = 1 AND s.next_run IS NULL
+        ");
+        foreach ($orphans as $orphan) {
+            $repaired = $this->calculateNextRun($orphan);
+            if ($repaired === null) {
+                continue;
+            }
+            $this->db->update('schedules', ['next_run' => $repaired], 'id = ?', [$orphan['id']]);
+            $this->db->insert('server_log', [
+                'level' => 'warning',
+                'message' => "Schedule #{$orphan['id']} had no next run time and would never have fired; set to {$repaired}",
+            ]);
+        }
+
         // Find schedules that are due
         $notificationService = new NotificationService();
 
@@ -40,7 +65,8 @@ class SchedulerService
               AND s.next_run IS NOT NULL
               AND s.next_run <= ?
               AND bp.enabled = 1
-              AND a.status IN ('online', 'setup')
+              AND (a.status IN ('online', 'setup')
+                   OR (a.status = 'offline' AND a.wol_enabled = 1))
         ", [$now]);
 
         $created = [];
@@ -111,6 +137,7 @@ class SchedulerService
               AND s.next_run <= ?
               AND bp.enabled = 1
               AND a.status = 'offline'
+              AND a.wol_enabled = 0
         ", [$now]);
 
         foreach ($overdueSchedules as $sched) {
@@ -142,26 +169,71 @@ class SchedulerService
     }
 
     /**
-     * Update timezone and recalculate next_run for a batch of schedule IDs.
-     * Used when a user changes their profile timezone.
+     * Weekly schedule days as sorted ints, 0=Sunday (PHP's `w`). Takes the
+     * stored comma list, a single number, or an array. Invalid entries are
+     * dropped; nothing valid gives [].
      */
-    public function recalculateTimezone(array $scheduleIds, string $newTimezone): void
+    public static function parseDaysOfWeek($value): array
     {
-        foreach ($scheduleIds as $id) {
-            $schedule = $this->db->fetchOne("SELECT * FROM schedules WHERE id = ?", [$id]);
-            if (!$schedule || !$schedule['enabled']) continue;
-
-            $schedule['timezone'] = $newTimezone;
-            $nextRun = $this->calculateNextRun($schedule);
-
-            $this->db->update('schedules', [
-                'timezone' => $newTimezone,
-                'next_run' => $nextRun,
-            ], 'id = ?', [$id]);
+        $parts = is_array($value) ? $value : explode(',', (string) $value);
+        $days = [];
+        foreach ($parts as $d) {
+            $d = trim((string) $d);
+            if ($d !== '' && ctype_digit($d) && (int) $d <= 6) {
+                $days[(int) $d] = (int) $d;
+            }
         }
+        ksort($days);
+        return array_values($days);
     }
 
-    private function calculateNextRun(array $schedule): ?string
+    /** Stored form of weekly days: "1,3,5", or NULL when none are valid. */
+    public static function formatDaysOfWeek($value): ?string
+    {
+        $days = self::parseDaysOfWeek($value);
+        return $days ? implode(',', $days) : null;
+    }
+
+    /** "Mon, Wed, Fri" for a weekly schedule's days. */
+    public static function daysOfWeekLabel($value): string
+    {
+        $names = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+        $days = self::parseDaysOfWeek($value) ?: [1];
+        return implode(', ', array_map(fn($d) => $names[$d], $days));
+    }
+
+    /**
+     * Next run of a weekly schedule, in UTC: the first of its days, from
+     * today on, whose time is still ahead. No valid day falls back to Monday.
+     */
+    public static function nextWeeklyRun($daysOfWeek, string $time, \DateTimeZone $tz): string
+    {
+        $days = self::parseDaysOfWeek($daysOfWeek) ?: [1];
+        $parts = explode(':', trim($time));
+        $now = new \DateTime('now', $tz);
+        for ($offset = 0; $offset <= 7; $offset++) {
+            $candidate = new \DateTime('today', $tz);
+            if ($offset > 0) {
+                $candidate->modify("+{$offset} days");
+            }
+            $candidate->setTime((int) ($parts[0] ?? 0), (int) ($parts[1] ?? 0));
+            if ($candidate > $now && in_array((int) $candidate->format('w'), $days, true)) {
+                $candidate->setTimezone(new \DateTimeZone('UTC'));
+                return $candidate->format('Y-m-d H:i:s');
+            }
+        }
+        // Unreachable: 8 consecutive days always include every weekday.
+        return gmdate('Y-m-d H:i:s', time() + 7 * 86400);
+    }
+
+    /**
+     * The next time a schedule should fire, in UTC.
+     *
+     * Public because anything that rewrites a schedule's frequency, times or
+     * timezone has to recompute this at the same moment — leaving it stale is
+     * merely wrong, but leaving it NULL stops the schedule forever (#420).
+     */
+    public function calculateNextRun(array $schedule): ?string
     {
         $scheduleTz = new \DateTimeZone($schedule['timezone'] ?? 'UTC');
         $utcTz = new \DateTimeZone('UTC');
@@ -205,12 +277,7 @@ class SchedulerService
         }
 
         if ($schedule['frequency'] === 'weekly') {
-            $days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-            $dayName = $days[$schedule['day_of_week'] ?? 1] ?? 'Monday';
-            $firstTime = $timeList[0] ?? '01:00';
-            $next = new \DateTime("next {$dayName} {$firstTime}", $scheduleTz);
-            $next->setTimezone($utcTz);
-            return $next->format('Y-m-d H:i:s');
+            return self::nextWeeklyRun($schedule['day_of_week'] ?? null, $timeList[0] ?? '01:00', $scheduleTz);
         }
 
         if ($schedule['frequency'] === 'monthly') {

@@ -2,6 +2,8 @@
 #
 # Borg Backup Server Agent Installer
 # Usage: curl -s https://your-server/get-agent | sudo bash -s -- --server https://your-server --key API_KEY
+#        Behind a self-signed or private-CA certificate, add --cacert /path/to/ca.pem (or --insecure),
+#        and give curl the same flag (--cacert / -k) for the get-agent download itself.
 #
 set -e
 
@@ -9,6 +11,8 @@ INSTALL_DIR="/opt/bbs-agent"
 CONFIG_DIR="/etc/bbs-agent"
 SERVER_URL=""
 API_KEY=""
+CA_CERT=""
+CURL_INSECURE=""
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Colors and formatting
@@ -62,6 +66,11 @@ stop_spinner() {
 # this clears the spinner on any exit so at least the prompt is usable.
 trap stop_spinner EXIT
 
+# yum/dnf fail outright when any enabled repo is unreachable, which is common
+# on end-of-life systems (a CentOS 7 box with a removed MariaDB repo, say).
+# Skip repos that don't answer; the ones we need are checked by the result.
+RH_SKIP_DEAD="--setopt=*.skip_if_unavailable=1"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Output helpers
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -100,12 +109,42 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --server) SERVER_URL="$2"; shift 2 ;;
         --key)    API_KEY="$2";    shift 2 ;;
+        --cacert|--ca-cert) CA_CERT="$2"; shift 2 ;;
+        --insecure|-k) CURL_INSECURE="--insecure"; shift ;;
         *)        echo -e "${RED}Unknown option: $1${NC}"; exit 1 ;;
     esac
 done
 
+# TLS options for talking to the server: --cacert for a self-signed or
+# private-CA certificate (the secure choice), --insecure to skip verification
+# entirely. Both are opt-in; the default is normal certificate verification.
+# Without them an install behind a reverse proxy with a self-signed
+# certificate failed with no hint why (#476). The same settings are written
+# to the agent's config so the agent can reach the server afterwards.
+CURL_SSL_ARGS=()
+WGET_SSL_ARGS=()
+FETCH_SSL_ARGS=()
+if [ -n "$CA_CERT" ]; then
+    if [ ! -r "$CA_CERT" ]; then
+        echo -e "${RED}--cacert: cannot read $CA_CERT${NC}"
+        exit 1
+    fi
+    CA_CERT="$(cd "$(dirname "$CA_CERT")" && pwd)/$(basename "$CA_CERT")"
+    CURL_SSL_ARGS+=("--cacert" "$CA_CERT")
+    WGET_SSL_ARGS+=("--ca-certificate=$CA_CERT")
+    FETCH_SSL_ARGS+=("--ca-cert=$CA_CERT")
+fi
+if [ -n "$CURL_INSECURE" ]; then
+    CURL_SSL_ARGS+=("--insecure")
+    WGET_SSL_ARGS+=("--no-check-certificate")
+    FETCH_SSL_ARGS+=("--no-verify-peer" "--no-verify-hostname")
+    print_warning "Running with --insecure: certificate verification is disabled."
+    print_warning "This exposes the install and the agent to man-in-the-middle attacks."
+    print_warning "Prefer --cacert /path/to/ca.pem with your CA certificate."
+fi
+
 if [ -z "$SERVER_URL" ] || [ -z "$API_KEY" ]; then
-    echo -e "${RED}Usage: install.sh --server https://your-server --key API_KEY${NC}"
+    echo -e "${RED}Usage: install.sh --server https://your-server --key API_KEY [--cacert /path/to/ca.pem] [--insecure]${NC}"
     exit 1
 fi
 
@@ -172,6 +211,52 @@ except:
     fi
 
     print_success "Detected: ${BOLD}$os_pretty${NC}"
+
+    # Refuse to install on the BBS server itself — backups always run through
+    # an agent on the machine that owns the data; the server is never its own
+    # client (#370). Checked before the generic container guard so someone
+    # inside the BBS Docker container gets this more specific message.
+    if [ -f /var/www/bbs/config/.env ] || [ -d /var/www/bbs/src ]; then
+        print_error "This machine is running the BBS server itself — the agent can't be"
+        print_error "installed here. Agents run on the machines being backed up; the BBS"
+        print_error "server only coordinates. If the data you want to back up is on this"
+        print_error "host (or mounted into the BBS container), install the agent on the"
+        print_error "machine that owns the data, or run the agent as its own container:"
+        print_error "https://github.com/marcpope/borgbackupserver/wiki/Docker-Agent-Setup"
+        exit 1
+    fi
+
+    # Refuse to install inside a container with no service manager: the agent
+    # can't be kept running there, so it registers once and then drops offline
+    # permanently (#370). `command -v systemctl` is not enough — the binary can
+    # exist in containers where systemd isn't PID 1.
+    #
+    # But "no systemd" is not the same as "no init". LXC/LXD system containers
+    # commonly run sysvinit or OpenRC, and this installer has a working
+    # /etc/init.d path for exactly those — refusing them turned away hosts it
+    # was already serving. PID 1 is what actually answers the question: a real
+    # init supervises services, whereas a Docker container usually runs the
+    # payload itself as PID 1 and restarts nothing. tini and dumb-init are
+    # deliberately absent below; they reap zombies for one process, they do not
+    # start init scripts.
+    if [ ! -d /run/systemd/system ] && { [ -f /.dockerenv ] || grep -qE 'docker|containerd|kubepods|lxc' /proc/1/cgroup 2>/dev/null; }; then
+        pid1_comm="$(cat /proc/1/comm 2>/dev/null || echo unknown)"
+        case "$pid1_comm" in
+            systemd|init|sysvinit|openrc-init|runit|s6-svscan|supervisord|launchd) has_init=1 ;;
+            *) has_init=0 ;;
+        esac
+    else
+        has_init=1
+    fi
+
+    if [ "${has_init:-1}" -eq 0 ]; then
+        print_error "This looks like a container with no service manager (PID 1 is '${pid1_comm}')."
+        print_error "The agent needs a service manager to keep running — installing here"
+        print_error "would register the client once and then leave it permanently offline."
+        print_error "Install the agent on the host that owns the data, or run it as its own"
+        print_error "container: https://github.com/marcpope/borgbackupserver/wiki/Docker-Agent-Setup"
+        exit 1
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -199,6 +284,10 @@ install_borg() {
     print_info "Borg not found, installing via package manager..."
     start_spinner "Installing borgbackup and python3..."
 
+    # A failed install must not end the script: `set -e` with the output
+    # suppressed used to exit mid-spinner with no message (#304). Fall through
+    # instead; the python3 check below says what is missing.
+    set +e
     case "$OS" in
         ubuntu|debian|pop|linuxmint)
             apt-get update -qq >/dev/null 2>&1
@@ -206,19 +295,19 @@ install_borg() {
             ;;
         centos|rhel|rocky|almalinux)
             if command -v dnf &>/dev/null; then
-                dnf install -y epel-release >/dev/null 2>&1 || true
+                dnf install -y "$RH_SKIP_DEAD" epel-release >/dev/null 2>&1 || true
                 dnf config-manager --set-enabled powertools >/dev/null 2>&1 || \
                     dnf config-manager --set-enabled crb >/dev/null 2>&1 || \
                     dnf config-manager --set-enabled PowerTools >/dev/null 2>&1 || true
-                dnf install -y python3-packaging >/dev/null 2>&1 || true
-                dnf install -y borgbackup python3 >/dev/null 2>&1 || {
-                    dnf install -y python3 >/dev/null 2>&1
+                dnf install -y "$RH_SKIP_DEAD" python3-packaging >/dev/null 2>&1 || true
+                dnf install -y "$RH_SKIP_DEAD" borgbackup python3 >/dev/null 2>&1 || {
+                    dnf install -y "$RH_SKIP_DEAD" python3 >/dev/null 2>&1
                 }
             else
-                yum install -y epel-release >/dev/null 2>&1 || true
-                yum install -y python3-packaging >/dev/null 2>&1 || true
-                yum install -y borgbackup python3 >/dev/null 2>&1 || {
-                    yum install -y python3 >/dev/null 2>&1
+                yum install -y "$RH_SKIP_DEAD" epel-release >/dev/null 2>&1 || true
+                yum install -y "$RH_SKIP_DEAD" python3-packaging >/dev/null 2>&1 || true
+                yum install -y "$RH_SKIP_DEAD" borgbackup python3 >/dev/null 2>&1 || {
+                    yum install -y "$RH_SKIP_DEAD" python3 >/dev/null 2>&1
                 }
             fi
             ;;
@@ -226,7 +315,9 @@ install_borg() {
             dnf install -y borgbackup python3 >/dev/null 2>&1
             ;;
         arch|manjaro|endeavouros|cachyos)
-            pacman -Sy --noconfirm borg python >/dev/null 2>&1
+            # -Syu, not -Sy: installing against a refreshed DB without upgrading
+            # is a partial upgrade, which Arch doesn't support (#359)
+            pacman -Syu --noconfirm borg python >/dev/null 2>&1
             ;;
         opensuse*|sles)
             zypper install -y borgbackup python3 >/dev/null 2>&1
@@ -304,12 +395,31 @@ install_borg() {
                 "$brew_bin" install borgbackup python3 >/dev/null 2>&1 || true
             fi
             ;;
+        nixos)
+            # NixOS: packages are normally declared in configuration.nix
+            # (environment.systemPackages = [ pkgs.borgbackup pkgs.python3 ])
+            # but an imperative nix-env install keeps the one-line installer
+            # working. Channel attr is `nixos.` on NixOS, `nixpkgs.` on
+            # plain Nix — try both. Profile bins are added to PATH so the
+            # resolve step below finds what just landed.
+            nix-env -iA nixos.borgbackup nixos.python3 >/dev/null 2>&1 || \
+                nix-env -iA nixpkgs.borgbackup nixpkgs.python3 >/dev/null 2>&1 || true
+            export PATH="$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin:$PATH"
+            if ! command -v borg >/dev/null 2>&1; then
+                stop_spinner
+                print_error "Could not install borg via nix-env. Add borgbackup and python3 to"
+                print_error "your NixOS configuration, then re-run this installer:"
+                print_error "  environment.systemPackages = [ pkgs.borgbackup pkgs.python3 ];"
+                exit 1
+            fi
+            ;;
         *)
             stop_spinner
             print_error "Unsupported OS '$OS'. Install borg and python3 manually, then re-run."
             exit 1
             ;;
     esac
+    set -e
 
     stop_spinner
 
@@ -352,6 +462,12 @@ check_python3() {
             /usr/local/bin/python3.9
             /usr/bin/python3
         )
+        # Whatever python3 is in PATH goes last — catches NixOS (no FHS
+        # paths at all, everything under /nix/store) and other non-standard
+        # prefixes the fixed list above can't know about (#359).
+        local path_python
+        path_python=$(command -v python3 2>/dev/null || true)
+        [ -n "$path_python" ] && candidates+=("$path_python")
         for p in "${candidates[@]}"; do
             if [ -x "$p" ]; then
                 local ver
@@ -378,10 +494,10 @@ check_python3() {
             ;;
         centos|rhel|rocky|almalinux)
             if command -v dnf &>/dev/null; then
-                dnf install -y python3 >/dev/null 2>&1 || true
+                dnf install -y "$RH_SKIP_DEAD" python3 >/dev/null 2>&1 || true
             else
-                yum install -y epel-release >/dev/null 2>&1 || true
-                yum install -y python3 >/dev/null 2>&1 || true
+                yum install -y "$RH_SKIP_DEAD" epel-release >/dev/null 2>&1 || true
+                yum install -y "$RH_SKIP_DEAD" python3 >/dev/null 2>&1 || true
             fi
             ;;
         fedora)
@@ -401,6 +517,7 @@ check_python3() {
     else
         print_error "python3 >= 3.4 is required but could not be found."
         print_info "Install python3 manually, then re-run this installer."
+        print_info "If the package manager reports errors (a dead repo, for example), fix those first."
         exit 1
     fi
 }
@@ -440,11 +557,11 @@ install_agent() {
 
     # Download agent script from server
     if command -v curl &>/dev/null; then
-        curl -sf -o "$INSTALL_DIR/bbs-agent.py" "$SERVER_URL/api/agent/download?file=bbs-agent.py"
+        curl -sf "${CURL_SSL_ARGS[@]}" -o "$INSTALL_DIR/bbs-agent.py" "$SERVER_URL/api/agent/download?file=bbs-agent.py"
     elif command -v wget &>/dev/null; then
-        wget -q -O "$INSTALL_DIR/bbs-agent.py" "$SERVER_URL/api/agent/download?file=bbs-agent.py"
+        wget -q "${WGET_SSL_ARGS[@]}" -O "$INSTALL_DIR/bbs-agent.py" "$SERVER_URL/api/agent/download?file=bbs-agent.py"
     elif command -v fetch &>/dev/null; then
-        fetch -q -o "$INSTALL_DIR/bbs-agent.py" "$SERVER_URL/api/agent/download?file=bbs-agent.py"
+        fetch -q "${FETCH_SSL_ARGS[@]}" -o "$INSTALL_DIR/bbs-agent.py" "$SERVER_URL/api/agent/download?file=bbs-agent.py"
     else
         stop_spinner
         print_error "curl, wget, or fetch required"
@@ -455,21 +572,21 @@ install_agent() {
 
     # Download the startup wrapper (provides auto-recovery from bad updates)
     if command -v curl &>/dev/null; then
-        curl -sf -o "$INSTALL_DIR/bbs-agent-start.sh" "$SERVER_URL/api/agent/download?file=bbs-agent-start.sh" 2>/dev/null || true
+        curl -sf "${CURL_SSL_ARGS[@]}" -o "$INSTALL_DIR/bbs-agent-start.sh" "$SERVER_URL/api/agent/download?file=bbs-agent-start.sh" 2>/dev/null || true
     elif command -v wget &>/dev/null; then
-        wget -q -O "$INSTALL_DIR/bbs-agent-start.sh" "$SERVER_URL/api/agent/download?file=bbs-agent-start.sh" 2>/dev/null || true
+        wget -q "${WGET_SSL_ARGS[@]}" -O "$INSTALL_DIR/bbs-agent-start.sh" "$SERVER_URL/api/agent/download?file=bbs-agent-start.sh" 2>/dev/null || true
     elif command -v fetch &>/dev/null; then
-        fetch -q -o "$INSTALL_DIR/bbs-agent-start.sh" "$SERVER_URL/api/agent/download?file=bbs-agent-start.sh" 2>/dev/null || true
+        fetch -q "${FETCH_SSL_ARGS[@]}" -o "$INSTALL_DIR/bbs-agent-start.sh" "$SERVER_URL/api/agent/download?file=bbs-agent-start.sh" 2>/dev/null || true
     fi
     chmod +x "$INSTALL_DIR/bbs-agent-start.sh" 2>/dev/null || true
 
     # Download uninstaller
     if command -v curl &>/dev/null; then
-        curl -sf -o "$INSTALL_DIR/uninstall.sh" "$SERVER_URL/api/agent/download?file=uninstall.sh" 2>/dev/null || true
+        curl -sf "${CURL_SSL_ARGS[@]}" -o "$INSTALL_DIR/uninstall.sh" "$SERVER_URL/api/agent/download?file=uninstall.sh" 2>/dev/null || true
     elif command -v wget &>/dev/null; then
-        wget -q -O "$INSTALL_DIR/uninstall.sh" "$SERVER_URL/api/agent/download?file=uninstall.sh" 2>/dev/null || true
+        wget -q "${WGET_SSL_ARGS[@]}" -O "$INSTALL_DIR/uninstall.sh" "$SERVER_URL/api/agent/download?file=uninstall.sh" 2>/dev/null || true
     elif command -v fetch &>/dev/null; then
-        fetch -q -o "$INSTALL_DIR/uninstall.sh" "$SERVER_URL/api/agent/download?file=uninstall.sh" 2>/dev/null || true
+        fetch -q "${FETCH_SSL_ARGS[@]}" -o "$INSTALL_DIR/uninstall.sh" "$SERVER_URL/api/agent/download?file=uninstall.sh" 2>/dev/null || true
     fi
     chmod +x "$INSTALL_DIR/uninstall.sh" 2>/dev/null || true
 
@@ -481,6 +598,8 @@ install_agent() {
 [server]
 url = $SERVER_URL
 api_key = $API_KEY
+${CA_CERT:+ca_cert = $CA_CERT}
+${CURL_INSECURE:+insecure = true}
 
 [agent]
 poll_interval = 30
@@ -500,11 +619,11 @@ install_ssh_key() {
 
     local response
     if command -v curl &>/dev/null; then
-        response=$(curl -sf -H "Authorization: Bearer $API_KEY" "$SERVER_URL/api/agent/ssh-key" 2>/dev/null || echo "")
+        response=$(curl -sf "${CURL_SSL_ARGS[@]}" -H "Authorization: Bearer $API_KEY" "$SERVER_URL/api/agent/ssh-key" 2>/dev/null || echo "")
     elif command -v wget &>/dev/null; then
-        response=$(wget -q -O - --header="Authorization: Bearer $API_KEY" "$SERVER_URL/api/agent/ssh-key" 2>/dev/null || echo "")
+        response=$(wget -q "${WGET_SSL_ARGS[@]}" -O - --header="Authorization: Bearer $API_KEY" "$SERVER_URL/api/agent/ssh-key" 2>/dev/null || echo "")
     elif command -v fetch &>/dev/null; then
-        response=$(fetch -q -o - "$SERVER_URL/api/agent/ssh-key" 2>/dev/null || echo "")
+        response=$(fetch -q "${FETCH_SSL_ARGS[@]}" -o - "$SERVER_URL/api/agent/ssh-key" 2>/dev/null || echo "")
     fi
 
     stop_spinner
@@ -565,7 +684,7 @@ install_service() {
         start_spinner "Configuring launchd service..."
 
         # Download the compiled macOS wrapper binary (handles FDA permissions)
-        curl -sf -o "$INSTALL_DIR/bbs-mac-agent" \
+        curl -sf "${CURL_SSL_ARGS[@]}" -o "$INSTALL_DIR/bbs-mac-agent" \
             "$SERVER_URL/api/agent/download?file=bbs-mac-agent" 2>/dev/null || true
         chmod 755 "$INSTALL_DIR/bbs-mac-agent"
 
@@ -689,6 +808,21 @@ RCEOF
     elif [ -d /run/systemd/system ] || command -v systemctl &>/dev/null; then
         start_spinner "Configuring systemd service..."
 
+        # Resolve bash at install time — NixOS has no /bin/bash (only
+        # /bin/sh and /usr/bin/env exist there), so a hardcoded ExecStart
+        # path would fail on start (#359).
+        local bash_bin
+        bash_bin=$(command -v bash 2>/dev/null || echo /bin/bash)
+
+        # C.UTF-8 doesn't exist on older systems (CentOS 7); use a UTF-8
+        # locale that does, as the init.d script below does
+        local utf8_locale=C.UTF-8
+        if ! locale -a 2>/dev/null | grep -qi '^c\.utf-\?8$' && \
+           locale -a 2>/dev/null | grep -qi '^en_us\.utf-\?8$'; then
+            utf8_locale=en_US.UTF-8
+        fi
+
+        mkdir -p /etc/systemd/system
         cat > /etc/systemd/system/bbs-agent.service <<EOF
 [Unit]
 Description=Borg Backup Server Agent
@@ -698,8 +832,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-Environment=LC_ALL=C.UTF-8 LANG=C.UTF-8 BBS_AGENT_DIR=$INSTALL_DIR BBS_PYTHON=$PYTHON3
-ExecStart=/bin/bash $INSTALL_DIR/bbs-agent-start.sh
+Environment=LC_ALL=$utf8_locale LANG=$utf8_locale BBS_AGENT_DIR=$INSTALL_DIR BBS_PYTHON=$PYTHON3
+ExecStart=$bash_bin $INSTALL_DIR/bbs-agent-start.sh
 Restart=always
 RestartSec=10
 StandardOutput=journal
